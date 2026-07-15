@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -49,6 +50,16 @@ type Fingerprint struct {
 	UpdatedAt               int64 `json:",omitempty"` // Unix timestamp，用于判断是否需要续期TTL
 }
 
+// AccountIdentity contains the account-scoped fields used by metadata.user_id.
+// DeviceID and AccountUUID must remain stable for one OAuth account across
+// downstream clients and requests.
+type AccountIdentity struct {
+	DeviceID    string
+	AccountUUID string
+}
+
+var ErrIncompleteAccountIdentity = errors.New("incomplete account identity")
+
 // IdentityCache defines cache operations for identity service
 type IdentityCache interface {
 	GetFingerprint(ctx context.Context, accountID int64) (*Fingerprint, error)
@@ -78,8 +89,15 @@ func NewIdentityService(cache IdentityCache) *IdentityService {
 func (s *IdentityService) GetOrCreateFingerprint(ctx context.Context, accountID int64, headers http.Header) (*Fingerprint, error) {
 	// 尝试从缓存获取指纹
 	cached, err := s.cache.GetFingerprint(ctx, accountID)
-	if err == nil && cached != nil {
+	if err != nil {
+		return nil, fmt.Errorf("get fingerprint for account %d: %w", accountID, err)
+	}
+	if cached != nil {
 		needWrite := false
+		if strings.TrimSpace(cached.ClientID) == "" {
+			cached.ClientID = generateClientID()
+			needWrite = true
+		}
 
 		// 检查客户端的user-agent是否是更新版本
 		clientUA := headers.Get("User-Agent")
@@ -97,7 +115,7 @@ func (s *IdentityService) GetOrCreateFingerprint(ctx context.Context, accountID 
 		if needWrite {
 			cached.UpdatedAt = time.Now().Unix()
 			if err := s.cache.SetFingerprint(ctx, accountID, cached); err != nil {
-				logger.LegacyPrintf("service.identity", "Warning: failed to refresh fingerprint for account %d: %v", accountID, err)
+				return nil, fmt.Errorf("persist fingerprint for account %d: %w", accountID, err)
 			}
 		}
 		return cached, nil
@@ -112,11 +130,40 @@ func (s *IdentityService) GetOrCreateFingerprint(ctx context.Context, accountID 
 
 	// 保存到缓存（7天TTL，每24小时自动续期）
 	if err := s.cache.SetFingerprint(ctx, accountID, fp); err != nil {
-		logger.LegacyPrintf("service.identity", "Warning: failed to cache fingerprint for account %d: %v", accountID, err)
+		return nil, fmt.Errorf("persist fingerprint for account %d: %w", accountID, err)
 	}
 
 	logger.LegacyPrintf("service.identity", "Created new fingerprint for account %d with client_id: %s", accountID, fp.ClientID)
 	return fp, nil
+}
+
+// ResolveStableAccountIdentity resolves the account-scoped identity used for
+// generated metadata.user_id values. It refuses incomplete identities instead
+// of falling back to a request-local random device ID.
+func (s *IdentityService) ResolveStableAccountIdentity(ctx context.Context, account *Account, headers http.Header) (AccountIdentity, error) {
+	if account == nil {
+		return AccountIdentity{}, fmt.Errorf("%w: account is nil", ErrIncompleteAccountIdentity)
+	}
+
+	accountUUID := strings.TrimSpace(account.GetExtraString("account_uuid"))
+	if accountUUID == "" {
+		return AccountIdentity{}, fmt.Errorf("%w: account_uuid", ErrIncompleteAccountIdentity)
+	}
+
+	fp, err := s.GetOrCreateFingerprint(ctx, account.ID, headers)
+	if err != nil {
+		return AccountIdentity{}, err
+	}
+
+	deviceID := strings.TrimSpace(account.GetClaudeUserID())
+	if deviceID == "" && fp != nil {
+		deviceID = strings.TrimSpace(fp.ClientID)
+	}
+	if deviceID == "" {
+		return AccountIdentity{}, fmt.Errorf("%w: device_id", ErrIncompleteAccountIdentity)
+	}
+
+	return AccountIdentity{DeviceID: deviceID, AccountUUID: accountUUID}, nil
 }
 
 // createFingerprintFromHeaders 从请求头创建指纹

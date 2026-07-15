@@ -842,6 +842,7 @@ func TestGatewayService_AnthropicOAuth_ForwardPreservesBillingHeaderSystemBlock(
 				httpUpstream:         upstream,
 				rateLimitService:     &RateLimitService{},
 				deferredService:      &DeferredService{},
+				identityService:      NewIdentityService(&identityCacheStub{}),
 			}
 
 			account := &Account{
@@ -853,6 +854,7 @@ func TestGatewayService_AnthropicOAuth_ForwardPreservesBillingHeaderSystemBlock(
 				Credentials: map[string]any{
 					"access_token": "oauth-token",
 				},
+				Extra:       map[string]any{"account_uuid": "account-oauth-preserve"},
 				Status:      StatusActive,
 				Schedulable: true,
 			}
@@ -927,6 +929,7 @@ func TestGatewayService_AnthropicOAuth_SystemPromptInjectionCanBeDisabled(t *tes
 		rateLimitService:     &RateLimitService{},
 		deferredService:      &DeferredService{},
 		settingService:       settingService,
+		identityService:      NewIdentityService(&identityCacheStub{}),
 	}
 
 	account := &Account{
@@ -938,6 +941,7 @@ func TestGatewayService_AnthropicOAuth_SystemPromptInjectionCanBeDisabled(t *tes
 		Credentials: map[string]any{
 			"access_token": "oauth-token",
 		},
+		Extra:       map[string]any{"account_uuid": "account-oauth-no-system-injection"},
 		Status:      StatusActive,
 		Schedulable: true,
 	}

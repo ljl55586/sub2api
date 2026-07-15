@@ -42,9 +42,10 @@ func (s *GatewayService) replaceModelInBody(body []byte, newModel string) []byte
 }
 
 type claudeOAuthNormalizeOptions struct {
-	injectMetadata          bool
-	metadataUserID          string
-	stripSystemCacheControl bool
+	injectMetadata             bool
+	metadataUserID             string
+	stripSystemCacheControl    bool
+	alignClaudeCodeMainRequest bool
 }
 
 // sanitizeSystemText rewrites only the fixed OpenCode identity sentence (if present).
@@ -208,7 +209,7 @@ func ensureClaudeOAuthMetadataUserID(body []byte, userID string) ([]byte, bool) 
 	trimmedRaw := strings.TrimSpace(metadata.Raw)
 	if strings.HasPrefix(trimmedRaw, "{") {
 		existing := metadata.Get("user_id")
-		if existing.Exists() && existing.Type == gjson.String && existing.String() != "" {
+		if existing.Exists() && existing.Type == gjson.String && existing.String() == userID {
 			return body, false
 		}
 		return setJSONValueBytes(body, "metadata.user_id", userID)
@@ -219,6 +220,43 @@ func ensureClaudeOAuthMetadataUserID(body []byte, userID string) ([]byte, bool) 
 		return body, false
 	}
 	return setJSONRawBytes(body, "metadata", raw)
+}
+
+func alignClaudeCodeOpus48MainBody(body []byte, modelID string) ([]byte, bool) {
+	if claude.NormalizeModelID(modelID) != "claude-opus-4-8" {
+		return body, false
+	}
+
+	out := body
+	modified := false
+	if gjson.GetBytes(out, "temperature").Exists() {
+		if next, ok := deleteJSONPathBytes(out, "temperature"); ok {
+			out = next
+			modified = true
+		}
+	}
+	if next, ok := setJSONRawBytes(out, "thinking", []byte(`{"type":"adaptive"}`)); ok {
+		out = next
+		modified = true
+	}
+	outputConfig := gjson.GetBytes(out, "output_config")
+	if !outputConfig.Exists() || !strings.HasPrefix(strings.TrimSpace(outputConfig.Raw), "{") {
+		if next, ok := setJSONRawBytes(out, "output_config", []byte(`{}`)); ok {
+			out = next
+			modified = true
+		}
+	}
+	if next, ok := setJSONValueBytes(out, "output_config.effort", "high"); ok {
+		out = next
+		modified = true
+	}
+	const contextManagement = `{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]}`
+	if next, ok := setJSONRawBytes(out, "context_management", []byte(contextManagement)); ok {
+		out = next
+		modified = true
+	}
+
+	return out, modified
 }
 
 func normalizeClaudeOAuthRequestBody(body []byte, modelID string, opts claudeOAuthNormalizeOptions) ([]byte, string) {
@@ -261,19 +299,24 @@ func normalizeClaudeOAuthRequestBody(body []byte, modelID string, opts claudeOAu
 		}
 	}
 
-	// temperature：真实 Claude Code CLI 总是发送 temperature（默认 1，客户端可覆盖）。
-	// 之前的实现直接 delete 会导致 payload 缺字段，与真实 CLI 字节级不一致。
-	// 策略：客户端传了什么就透传；没传则补默认 1。
+	// Preserve the existing OAuth normalization defaults for all non-target
+	// paths. The explicit Opus 4.8 main-request alignment below removes
+	// temperature again while leaving a downstream max_tokens value intact.
 	if !gjson.GetBytes(out, "temperature").Exists() {
 		if next, ok := setJSONValueBytes(out, "temperature", 1); ok {
 			out = next
 			modified = true
 		}
 	}
-
-	// max_tokens：真实 CLI 的默认值是 128000。缺失时补齐以对齐指纹。
 	if !gjson.GetBytes(out, "max_tokens").Exists() {
 		if next, ok := setJSONValueBytes(out, "max_tokens", 128000); ok {
+			out = next
+			modified = true
+		}
+	}
+
+	if opts.alignClaudeCodeMainRequest {
+		if next, changed := alignClaudeCodeOpus48MainBody(out, modelID); changed {
 			out = next
 			modified = true
 		}
@@ -320,22 +363,20 @@ func normalizeClaudeOAuthRequestBody(body []byte, modelID string, opts claudeOAu
 	return out, modelID
 }
 
-func (s *GatewayService) buildOAuthMetadataUserID(parsed *ParsedRequest, account *Account, fp *Fingerprint) string {
+func (s *GatewayService) buildOAuthMetadataUserID(
+	parsed *ParsedRequest,
+	account *Account,
+	identity AccountIdentity,
+	uaVersion string,
+) (string, error) {
 	if parsed == nil || account == nil {
-		return ""
+		return "", fmt.Errorf("%w: request or account is nil", ErrIncompleteAccountIdentity)
 	}
-	if parsed.MetadataUserID != "" {
-		return ""
+	if strings.TrimSpace(identity.DeviceID) == "" {
+		return "", fmt.Errorf("%w: device_id", ErrIncompleteAccountIdentity)
 	}
-
-	userID := strings.TrimSpace(account.GetClaudeUserID())
-	if userID == "" && fp != nil {
-		userID = fp.ClientID
-	}
-	if userID == "" {
-		// Fall back to a random, well-formed client id so we can still satisfy
-		// Claude Code OAuth requirements when account metadata is incomplete.
-		userID = generateClientID()
+	if strings.TrimSpace(identity.AccountUUID) == "" {
+		return "", fmt.Errorf("%w: account_uuid", ErrIncompleteAccountIdentity)
 	}
 
 	// session_id 用"会话级稳定种子"派生（账号 + 客户端区分因子 + 首条 user 文本）：
@@ -348,13 +389,23 @@ func (s *GatewayService) buildOAuthMetadataUserID(parsed *ParsedRequest, account
 	seed := buildStableSessionSeed(account.ID, sessionContextDiscriminator(parsed.SessionContext), firstUserText)
 	sessionID := generateSessionUUID(seed)
 
-	// 根据指纹 UA 版本选择输出格式
-	var uaVersion string
-	if fp != nil {
-		uaVersion = ExtractCLIVersion(fp.UserAgent)
+	return FormatMetadataUserID(identity.DeviceID, identity.AccountUUID, sessionID, uaVersion), nil
+}
+
+func (s *GatewayService) buildOAuthMimicMetadataUserID(
+	ctx context.Context,
+	c *gin.Context,
+	parsed *ParsedRequest,
+	account *Account,
+) (string, error) {
+	if s == nil || s.identityService == nil || c == nil || c.Request == nil {
+		return "", fmt.Errorf("%w: identity service or downstream request is unavailable", ErrIncompleteAccountIdentity)
 	}
-	accountUUID := strings.TrimSpace(account.GetExtraString("account_uuid"))
-	return FormatMetadataUserID(userID, accountUUID, sessionID, uaVersion)
+	identity, err := s.identityService.ResolveStableAccountIdentity(ctx, account, c.Request.Header)
+	if err != nil {
+		return "", fmt.Errorf("resolve OAuth metadata identity: %w", err)
+	}
+	return s.buildOAuthMetadataUserID(parsed, account, identity, claude.CLICurrentVersion)
 }
 
 // applyClaudeCodeOAuthMimicryToBody 将"非 Claude Code 客户端 + Claude OAuth 账号"
@@ -395,7 +446,10 @@ func (s *GatewayService) applyClaudeCodeOAuthMimicryToBody(
 		systemRewritten = true
 	}
 
-	normalizeOpts := claudeOAuthNormalizeOptions{stripSystemCacheControl: !systemRewritten}
+	normalizeOpts := claudeOAuthNormalizeOptions{
+		stripSystemCacheControl:    !systemRewritten,
+		alignClaudeCodeMainRequest: true,
+	}
 
 	if s.identityService != nil && c != nil && c.Request != nil {
 		if fp, err := s.identityService.GetOrCreateFingerprint(ctx, account.ID, c.Request.Header); err == nil && fp != nil {
@@ -450,16 +504,16 @@ func (s *GatewayService) buildOAuthMetadataUserIDFromBody(
 	if account == nil {
 		return ""
 	}
-	if existing := gjson.GetBytes(body, "metadata.user_id").String(); existing != "" {
+	if existing := gjson.GetBytes(body, "metadata.user_id").String(); existing != "" && ParseMetadataUserID(existing) != nil {
 		return ""
 	}
 
 	userID := strings.TrimSpace(account.GetClaudeUserID())
 	if userID == "" && fp != nil {
-		userID = fp.ClientID
+		userID = strings.TrimSpace(fp.ClientID)
 	}
 	if userID == "" {
-		userID = generateClientID()
+		return ""
 	}
 
 	// 与 buildOAuthMetadataUserID 一致：用会话级稳定种子，避免整 body 哈希导致
@@ -476,6 +530,9 @@ func (s *GatewayService) buildOAuthMetadataUserIDFromBody(
 		uaVersion = ExtractCLIVersion(fp.UserAgent)
 	}
 	accountUUID := strings.TrimSpace(account.GetExtraString("account_uuid"))
+	if accountUUID == "" {
+		return ""
+	}
 	return FormatMetadataUserID(userID, accountUUID, sessionID, uaVersion)
 }
 

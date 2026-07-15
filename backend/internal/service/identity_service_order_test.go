@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -9,13 +10,25 @@ import (
 )
 
 type identityCacheStub struct {
-	maskedSessionID string
+	maskedSessionID    string
+	fingerprint        *Fingerprint
+	fingerprintErr     error
+	setFingerprintErr  error
+	setFingerprintCall int
 }
 
 func (s *identityCacheStub) GetFingerprint(_ context.Context, _ int64) (*Fingerprint, error) {
-	return nil, nil
+	if s.fingerprintErr != nil {
+		return nil, s.fingerprintErr
+	}
+	return s.fingerprint, nil
 }
-func (s *identityCacheStub) SetFingerprint(_ context.Context, _ int64, _ *Fingerprint) error {
+func (s *identityCacheStub) SetFingerprint(_ context.Context, _ int64, fp *Fingerprint) error {
+	s.setFingerprintCall++
+	if s.setFingerprintErr != nil {
+		return s.setFingerprintErr
+	}
+	s.fingerprint = fp
 	return nil
 }
 func (s *identityCacheStub) GetMaskedSessionID(_ context.Context, _ int64) (string, error) {
@@ -75,6 +88,36 @@ func TestIdentityService_RewriteUserIDWithMasking_PreservesTopLevelFieldOrder(t 
 	assertJSONTokenOrder(t, resultStr, `"alpha"`, `"messages"`, `"metadata"`, `"max_tokens"`, `"thinking"`, `"output_config"`, `"stream"`)
 	require.Contains(t, resultStr, cache.maskedSessionID)
 	require.True(t, strings.Contains(resultStr, `"metadata":{"user_id":"`))
+}
+
+func TestIdentityService_GetOrCreateFingerprint_ReturnsPersistenceError(t *testing.T) {
+	cacheErr := errors.New("redis unavailable")
+	svc := NewIdentityService(&identityCacheStub{setFingerprintErr: cacheErr})
+
+	_, err := svc.GetOrCreateFingerprint(context.Background(), 123, nil)
+
+	require.ErrorIs(t, err, cacheErr)
+}
+
+func TestIdentityService_GetOrCreateFingerprint_ReturnsReadError(t *testing.T) {
+	cacheErr := errors.New("redis read unavailable")
+	svc := NewIdentityService(&identityCacheStub{fingerprintErr: cacheErr})
+
+	_, err := svc.GetOrCreateFingerprint(context.Background(), 123, nil)
+
+	require.ErrorIs(t, err, cacheErr)
+}
+
+func TestIdentityService_GetOrCreateFingerprint_RepairsEmptyClientIDBeforeReturning(t *testing.T) {
+	cache := &identityCacheStub{fingerprint: &Fingerprint{UserAgent: "claude-cli/2.1.161 (external, cli)"}}
+	svc := NewIdentityService(cache)
+
+	fp, err := svc.GetOrCreateFingerprint(context.Background(), 123, nil)
+
+	require.NoError(t, err)
+	require.NotEmpty(t, fp.ClientID)
+	require.Equal(t, 1, cache.setFingerprintCall)
+	require.Equal(t, fp.ClientID, cache.fingerprint.ClientID)
 }
 
 func strconvQuote(v string) string {
