@@ -73,8 +73,12 @@ func (s *GatewayService) buildUpstreamRequest(ctx context.Context, c *gin.Contex
 			// 当 metadata 透传开启时跳过重写
 			if !enableMPT && mimicClaudeCode {
 				accountUUID := account.GetExtraString("account_uuid")
-				if accountUUID != "" && fp.ClientID != "" {
-					if newBody, err := s.identityService.RewriteUserIDWithMasking(ctx, body, account, accountUUID, fp.ClientID, claude.DefaultHeaders["User-Agent"]); err == nil && len(newBody) > 0 {
+				deviceID := strings.TrimSpace(account.GetClaudeUserID())
+				if deviceID == "" {
+					deviceID = strings.TrimSpace(fp.ClientID)
+				}
+				if accountUUID != "" && deviceID != "" {
+					if newBody, err := s.identityService.RewriteUserIDWithMasking(ctx, body, account, accountUUID, deviceID, claude.DefaultHeaders["User-Agent"]); err == nil && len(newBody) > 0 {
 						body = newBody
 					}
 				}

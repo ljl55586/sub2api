@@ -98,10 +98,13 @@ func TestBuildUpstreamRequest_MimicSessionHeaders(t *testing.T) {
 		ID:       123,
 		Platform: PlatformAnthropic,
 		Type:     AccountTypeOAuth,
-		Extra:    map[string]any{"account_uuid": "account-123"},
+		Extra: map[string]any{
+			"account_uuid":   "account-123",
+			"claude_user_id": "account-claude-device",
+		},
 	}
 	metadataUserID := FormatMetadataUserID(
-		"account-device-123",
+		"account-claude-device",
 		"account-123",
 		"11111111-2222-4333-8444-555555555555",
 		claude.CLICurrentVersion,
@@ -128,6 +131,7 @@ func TestBuildUpstreamRequest_MimicSessionHeaders(t *testing.T) {
 	parsedUserID := ParseMetadataUserID(gjson.GetBytes(outBody, "metadata.user_id").String())
 	require.NotNil(t, parsedUserID)
 	require.True(t, gjson.Valid(gjson.GetBytes(outBody, "metadata.user_id").String()), "the final 2.1.161 request must retain JSON metadata format")
+	require.Equal(t, "account-claude-device", parsedUserID.DeviceID)
 	require.Equal(t, parsedUserID.SessionID, getHeaderRaw(req.Header, "x-claude-code-session-id"))
 	require.Equal(t, claude.DefaultHeaders["User-Agent"], getHeaderRaw(req.Header, "User-Agent"))
 	require.ElementsMatch(t, claude.FullClaudeCodeMimicryBetas(), parseAnthropicBetaHeader(getHeaderRaw(req.Header, "anthropic-beta")))
