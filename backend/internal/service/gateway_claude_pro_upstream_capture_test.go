@@ -173,7 +173,7 @@ func assertAlignedCaptureRequest(t *testing.T, req *http.Request, body []byte) {
 	require.Empty(t, getHeaderRaw(req.Header, "x-client-request-id"))
 	require.Empty(t, getHeaderRaw(req.Header, "x-stainless-helper-method"))
 	require.NotEmpty(t, getHeaderRaw(req.Header, "x-claude-code-session-id"))
-	require.ElementsMatch(t, claude.FullClaudeCodeMimicryBetas(), parseAnthropicBetaHeader(getHeaderRaw(req.Header, "anthropic-beta")))
+	require.Equal(t, claude.ClaudeCodeOAuthMainMimicryBetas(), parseAnthropicBetaHeader(getHeaderRaw(req.Header, "anthropic-beta")))
 
 	userID := gjson.GetBytes(body, "metadata.user_id").String()
 	require.True(t, gjson.Valid(userID))

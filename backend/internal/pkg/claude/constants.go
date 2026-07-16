@@ -70,27 +70,6 @@ const DefaultCacheControlTTL = "5m"
 // 必须与 DefaultHeaders["User-Agent"] 中的版本号严格一致；不一致会被 Anthropic 判第三方。
 const CLICurrentVersion = "2.1.161"
 
-// FullClaudeCodeMimicryBetas 返回最"像"真实 Claude Code CLI 的完整 beta 列表，
-// 用于 OAuth 账号伪装成 Claude Code 时使用。
-// 顺序与真实 CLI 抓包一致。
-//
-// 使用建议：
-//   - OAuth 账号 + 非 haiku：追加这整份列表，再按需保留 client 带来的 beta。
-//   - OAuth 账号 + haiku：Anthropic 对 haiku 不做 third-party 判定，使用 HaikuBetaHeader 即可。
-//   - API-key 账号：不要使用本函数，参见 APIKeyBetaHeader。
-//   - 不默认加入 redact-thinking，避免上游抹除 thinking 内容；客户端显式传入时由合并逻辑保留。
-func FullClaudeCodeMimicryBetas() []string {
-	return []string{
-		BetaClaudeCode,
-		BetaOAuth,
-		BetaInterleavedThinking,
-		BetaPromptCachingScope,
-		BetaEffort,
-		BetaContextManagement,
-		BetaExtendedCacheTTL,
-	}
-}
-
 // ClaudeCodeOAuthMainMimicryBetas 返回 OAuth 模拟主 messages 请求使用的 beta 列表。
 // 每次调用均返回新切片，以免调用方的 append 或修改影响后续请求。
 func ClaudeCodeOAuthMainMimicryBetas() []string {

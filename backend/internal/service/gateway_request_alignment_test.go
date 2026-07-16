@@ -135,7 +135,7 @@ func TestBuildUpstreamRequest_MimicSessionHeaders(t *testing.T) {
 	require.Equal(t, "account-claude-device", parsedUserID.DeviceID)
 	require.Equal(t, parsedUserID.SessionID, getHeaderRaw(req.Header, "x-claude-code-session-id"))
 	require.Equal(t, claude.DefaultHeaders["User-Agent"], getHeaderRaw(req.Header, "User-Agent"))
-	require.ElementsMatch(t, claude.FullClaudeCodeMimicryBetas(), parseAnthropicBetaHeader(getHeaderRaw(req.Header, "anthropic-beta")))
+	require.Equal(t, claude.ClaudeCodeOAuthMainMimicryBetas(), parseAnthropicBetaHeader(getHeaderRaw(req.Header, "anthropic-beta")))
 	require.Equal(t, "clear_thinking_20251015", gjson.GetBytes(outBody, "context_management.edits.0.type").String())
 }
 
