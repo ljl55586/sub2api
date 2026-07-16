@@ -20,11 +20,14 @@ const (
 	BetaFastMode                 = "fast-mode-2026-02-01"
 
 	// 新增（对齐官方 CLI 2.1.9x 以来的流量）
-	BetaPromptCachingScope = "prompt-caching-scope-2026-01-05"
-	BetaEffort             = "effort-2025-11-24"
-	BetaRedactThinking     = "redact-thinking-2026-02-12"
-	BetaContextManagement  = "context-management-2025-06-27"
-	BetaExtendedCacheTTL   = "extended-cache-ttl-2025-04-11"
+	BetaPromptCachingScope    = "prompt-caching-scope-2026-01-05"
+	BetaEffort                = "effort-2025-11-24"
+	BetaRedactThinking        = "redact-thinking-2026-02-12"
+	BetaThinkingTokenCount    = "thinking-token-count-2026-05-13"
+	BetaContextManagement     = "context-management-2025-06-27"
+	BetaMidConversationSystem = "mid-conversation-system-2026-04-07"
+	BetaAdvisorTool           = "advisor-tool-2026-03-01"
+	BetaExtendedCacheTTL      = "extended-cache-ttl-2025-04-11"
 )
 
 // DroppedBetas 是转发时需要从 anthropic-beta header 中移除的 beta token 列表。
@@ -77,6 +80,38 @@ const CLICurrentVersion = "2.1.161"
 //   - API-key 账号：不要使用本函数，参见 APIKeyBetaHeader。
 //   - 不默认加入 redact-thinking，避免上游抹除 thinking 内容；客户端显式传入时由合并逻辑保留。
 func FullClaudeCodeMimicryBetas() []string {
+	return []string{
+		BetaClaudeCode,
+		BetaOAuth,
+		BetaInterleavedThinking,
+		BetaPromptCachingScope,
+		BetaEffort,
+		BetaContextManagement,
+		BetaExtendedCacheTTL,
+	}
+}
+
+// ClaudeCodeOAuthMainMimicryBetas 返回 OAuth 模拟主 messages 请求使用的 beta 列表。
+// 每次调用均返回新切片，以免调用方的 append 或修改影响后续请求。
+func ClaudeCodeOAuthMainMimicryBetas() []string {
+	return []string{
+		BetaClaudeCode,
+		BetaOAuth,
+		BetaInterleavedThinking,
+		BetaRedactThinking,
+		BetaThinkingTokenCount,
+		BetaContextManagement,
+		BetaPromptCachingScope,
+		BetaMidConversationSystem,
+		BetaAdvisorTool,
+		BetaEffort,
+		BetaExtendedCacheTTL,
+	}
+}
+
+// ClaudeCodeOAuthCountTokensMimicryBetas 返回 OAuth 模拟 count_tokens 请求使用的 beta 列表。
+// 它与主 messages 请求独立，保持 count_tokens 的既有 profile。
+func ClaudeCodeOAuthCountTokensMimicryBetas() []string {
 	return []string{
 		BetaClaudeCode,
 		BetaOAuth,

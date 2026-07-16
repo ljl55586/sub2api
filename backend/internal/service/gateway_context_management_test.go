@@ -136,24 +136,42 @@ func newTestGatewayServiceForBeta(injectBetaForAPIKey bool) *GatewayService {
 	return &GatewayService{cfg: cfg}
 }
 
-func TestComputeFinalAnthropicBeta_OAuthMimic_NonHaiku_IncludesContextManagement(t *testing.T) {
+func TestComputeFinalAnthropicBeta_OAuthMimic_NonHaiku_UsesExactMainProfileOrder(t *testing.T) {
 	s := newTestGatewayServiceForBeta(false)
 	final, ok := s.computeFinalAnthropicBeta("oauth", true, "claude-sonnet-4-6", http.Header{}, []byte(`{}`), nil)
 	require.True(t, ok)
-	require.True(t, anthropicBetaTokensContains(final, claude.BetaContextManagement),
-		"OAuth mimic non-haiku 必须注入完整 CC mimicry beta，含 context-management-2025-06-27")
-	require.True(t, anthropicBetaTokensContains(final, claude.BetaOAuth))
-	require.True(t, anthropicBetaTokensContains(final, claude.BetaClaudeCode))
+	require.Equal(t,
+		"claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,"+
+			"redact-thinking-2026-02-12,thinking-token-count-2026-05-13,"+
+			"context-management-2025-06-27,prompt-caching-scope-2026-01-05,"+
+			"mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,"+
+			"effort-2025-11-24,extended-cache-ttl-2025-04-11",
+		final,
+	)
+}
+
+func TestComputeFinalAnthropicBeta_OAuthMimic_AccountBetaPolicyFilterPreservesProfileOrder(t *testing.T) {
+	s := newTestGatewayServiceForBeta(false)
+	final, ok := s.computeFinalAnthropicBeta(
+		"oauth", true, "claude-sonnet-4-6", http.Header{}, []byte(`{}`),
+		map[string]struct{}{claude.BetaPromptCachingScope: {}},
+	)
+	require.True(t, ok)
+	require.Equal(t,
+		"claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,"+
+			"redact-thinking-2026-02-12,thinking-token-count-2026-05-13,"+
+			"context-management-2025-06-27,mid-conversation-system-2026-04-07,"+
+			"advisor-tool-2026-03-01,effort-2025-11-24,extended-cache-ttl-2025-04-11",
+		final,
+	)
 }
 
 func TestComputeFinalAnthropicBeta_OAuthMimic_Haiku_ExcludesContextManagement(t *testing.T) {
 	s := newTestGatewayServiceForBeta(false)
 	final, ok := s.computeFinalAnthropicBeta("oauth", true, "claude-haiku-4-5", http.Header{}, []byte(`{}`), nil)
 	require.True(t, ok)
-	require.False(t, anthropicBetaTokensContains(final, claude.BetaContextManagement),
-		"OAuth mimic haiku 仅注入 oauth + interleaved-thinking，不含 context-management")
-	require.True(t, anthropicBetaTokensContains(final, claude.BetaOAuth))
-	require.True(t, anthropicBetaTokensContains(final, claude.BetaInterleavedThinking))
+	require.Equal(t, "oauth-2025-04-20,interleaved-thinking-2025-05-14", final,
+		"OAuth mimic haiku 仅注入 oauth + interleaved-thinking")
 }
 
 func TestComputeFinalAnthropicBeta_OAuthMimic_IgnoresClientBeta(t *testing.T) {
@@ -210,15 +228,26 @@ func TestComputeFinalAnthropicBeta_APIKey_NoClientBetaInjectOff_ShouldNotSet(t *
 // computeFinalCountTokensAnthropicBeta
 // ============================================================================
 
-func TestComputeFinalCountTokensAnthropicBeta_OAuthMimic_AlwaysIncludesContextManagement(t *testing.T) {
-	// count_tokens 路径下 mimic 不按 haiku 排除：始终注入完整 mimicry beta
+func TestComputeFinalCountTokensAnthropicBeta_OAuthMimic_UsesCountTokensProfileExactOrder(t *testing.T) {
+	// count_tokens 路径下 mimic 不按 haiku 排除：始终注入独立的 count-tokens profile。
 	s := newTestGatewayServiceForBeta(false)
 	final, ok := s.computeFinalCountTokensAnthropicBeta("oauth", true, "claude-haiku-4-5", http.Header{}, []byte(`{}`), nil)
 	require.True(t, ok)
-	require.True(t, anthropicBetaTokensContains(final, claude.BetaContextManagement),
-		"count_tokens + mimic 即使 haiku 也注入 context-management beta（与 messages 不同）")
-	require.True(t, anthropicBetaTokensContains(final, claude.BetaTokenCounting),
-		"count_tokens 路径必须含 token-counting beta")
+	require.Equal(t,
+		"claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,"+
+			"prompt-caching-scope-2026-01-05,effort-2025-11-24,"+
+			"context-management-2025-06-27,extended-cache-ttl-2025-04-11,"+
+			"token-counting-2024-11-01",
+		final,
+	)
+	for _, mainOnlyBeta := range []string{
+		"thinking-token-count-2026-05-13",
+		"mid-conversation-system-2026-04-07",
+		"advisor-tool-2026-03-01",
+	} {
+		require.False(t, anthropicBetaTokensContains(final, mainOnlyBeta),
+			"count_tokens OAuth mimic 不应获得主请求专属 beta %q", mainOnlyBeta)
+	}
 }
 
 // 重构等价性回归：
@@ -236,7 +265,7 @@ func TestComputeFinalCountTokensAnthropicBeta_OAuthMimic_PreservesClientBeta(t *
 	require.True(t, anthropicBetaTokensContains(final, "context-1m-2025-08-07"),
 		"客户端透传的其他 beta token 同样需要保留")
 	require.True(t, anthropicBetaTokensContains(final, claude.BetaContextManagement),
-		"同时 FullClaudeCodeMimicryBetas 不打折扣")
+		"同时 count-tokens mimicry profile 保留 context-management")
 	require.True(t, anthropicBetaTokensContains(final, claude.BetaTokenCounting),
 		"同时补齐 token-counting beta")
 }
@@ -452,7 +481,7 @@ func TestBuildUpstreamRequest_OAuthMimicNonHaiku_PreservesContextManagementEndTo
 		Status:      StatusActive,
 		Schedulable: true,
 	}
-	// sonnet + mimic CC → final beta = FullClaudeCodeMimicryBetas（含 context-management）→
+	// sonnet + mimic CC → final beta = ClaudeCodeOAuthMainMimicryBetas（含 context-management）→
 	// body 保留。
 	body := []byte(`{"model":"claude-sonnet-4-6","context_management":{"edits":[{"type":"clear_thinking_20251015"}]},"messages":[]}`)
 	svc := &GatewayService{cfg: &config.Config{}}

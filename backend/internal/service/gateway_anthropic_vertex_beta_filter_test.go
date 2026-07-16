@@ -6,9 +6,11 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
@@ -43,11 +45,9 @@ func newVertexServiceAccount(id int64) *Account {
 // thinking-token-count）。Vertex builder 必须剥掉它们，否则上游 HTTP 400（issue #3358）。
 // 本用例在 Commit 1 之前 FAIL、之后 PASS。
 func TestVertexBetaFilter_StripsUnsupportedClaudeCodeTokens(t *testing.T) {
-	c := newVertexBetaTestContext(t,
-		"claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,"+
-			"advisor-tool-2026-03-01,prompt-caching-scope-2026-01-05,"+
-			"redact-thinking-2026-02-12,thinking-token-count-2026-05-13,"+
-			"context-management-2025-06-27")
+	mainProfile := claude.ClaudeCodeOAuthMainMimicryBetas()
+	require.Len(t, mainProfile, 11)
+	c := newVertexBetaTestContext(t, strings.Join(mainProfile, ","))
 
 	body := []byte(`{"model":"claude-opus-4-7","max_tokens":32,"messages":[{"role":"user","content":"hi"}]}`)
 
@@ -66,6 +66,7 @@ func TestVertexBetaFilter_StripsUnsupportedClaudeCodeTokens(t *testing.T) {
 		"prompt-caching-scope-2026-01-05",
 		"redact-thinking-2026-02-12",
 		"thinking-token-count-2026-05-13",
+		"mid-conversation-system-2026-04-07",
 		// 客户端身份 beta：Vertex service_account 不需要，亦不在白名单。
 		"claude-code-20250219",
 		"oauth-2025-04-20",

@@ -124,22 +124,31 @@ func TestMergeAnthropicBetaDropping_DroppedBetas(t *testing.T) {
 	require.Contains(t, got, "fast-mode-2026-02-01")
 }
 
-func TestFullClaudeCodeMimicryBetas_DoesNotDefaultRedactThinking(t *testing.T) {
-	required := claude.FullClaudeCodeMimicryBetas()
-
-	require.NotContains(t, required, claude.BetaRedactThinking)
-	require.Contains(t, required, claude.BetaClaudeCode)
-	require.Contains(t, required, claude.BetaOAuth)
-	require.Contains(t, required, claude.BetaInterleavedThinking)
+func TestClaudeCodeOAuthMainMimicryBetas_Exact21161Order(t *testing.T) {
+	require.Equal(t, []string{
+		"claude-code-20250219",
+		"oauth-2025-04-20",
+		"interleaved-thinking-2025-05-14",
+		"redact-thinking-2026-02-12",
+		"thinking-token-count-2026-05-13",
+		"context-management-2025-06-27",
+		"prompt-caching-scope-2026-01-05",
+		"mid-conversation-system-2026-04-07",
+		"advisor-tool-2026-03-01",
+		"effort-2025-11-24",
+		"extended-cache-ttl-2025-04-11",
+	}, claude.ClaudeCodeOAuthMainMimicryBetas())
 }
 
-func TestMergeAnthropicBetaDropping_PreservesIncomingRedactThinking(t *testing.T) {
-	required := claude.FullClaudeCodeMimicryBetas()
-	incoming := claude.BetaRedactThinking
+func TestClaudeCodeOAuthMimicryBetas_ReturnFreshIndependentSlices(t *testing.T) {
+	main := claude.ClaudeCodeOAuthMainMimicryBetas()
+	countTokens := claude.ClaudeCodeOAuthCountTokensMimicryBetas()
 
-	got := mergeAnthropicBetaDropping(required, incoming, droppedBetaSet())
+	main[0] = "mutated-main"
+	countTokens[0] = "mutated-count-tokens"
 
-	require.Contains(t, got, claude.BetaRedactThinking)
+	require.Equal(t, claude.BetaClaudeCode, claude.ClaudeCodeOAuthMainMimicryBetas()[0])
+	require.Equal(t, claude.BetaClaudeCode, claude.ClaudeCodeOAuthCountTokensMimicryBetas()[0])
 }
 
 func TestDroppedBetaSet(t *testing.T) {
