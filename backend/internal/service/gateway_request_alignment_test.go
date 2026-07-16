@@ -13,6 +13,10 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func billingSystemText(body []byte) string {
+	return gjson.GetBytes(body, "system.0.text").String()
+}
+
 func TestNormalizeClaudeOAuthRequestBody_AlignsOpus48MimicMainRequest(t *testing.T) {
 	input := []byte(`{"model":"claude-opus-4-8","max_tokens":1024,"temperature":1,"stream":true,"messages":[{"role":"user","content":"Hello"}]}`)
 
@@ -137,6 +141,151 @@ func TestBuildUpstreamRequest_MimicSessionHeaders(t *testing.T) {
 	require.Equal(t, claude.DefaultHeaders["User-Agent"], getHeaderRaw(req.Header, "User-Agent"))
 	require.Equal(t, claude.ClaudeCodeOAuthMainMimicryBetas(), parseAnthropicBetaHeader(getHeaderRaw(req.Header, "anthropic-beta")))
 	require.Equal(t, "clear_thinking_20251015", gjson.GetBytes(outBody, "context_management.edits.0.type").String())
+}
+
+func TestBuildUpstreamRequest_MimicUsesMacOSAndFinalBillingVersion(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	c.Request.Header.Set("User-Agent", "curl/8.4.0")
+
+	const originalClientID = "stable-device-id"
+	cachedFingerprint := &Fingerprint{
+		ClientID:    originalClientID,
+		UserAgent:   "claude-cli/2.1.160 (external, cli)",
+		StainlessOS: "Linux",
+		UpdatedAt:   time.Now().Unix(),
+	}
+	cache := &identityCacheStub{fingerprint: cachedFingerprint}
+	svc := &GatewayService{identityService: NewIdentityService(cache)}
+	account := &Account{
+		ID:       456,
+		Platform: PlatformAnthropic,
+		Type:     AccountTypeOAuth,
+		Extra:    map[string]any{"account_uuid": "account-456"},
+	}
+	metadataUserID := FormatMetadataUserID(
+		originalClientID,
+		"account-456",
+		"11111111-2222-4333-8444-555555555555",
+		claude.CLICurrentVersion,
+	)
+	body := []byte(`{
+		"model":"claude-opus-4-8",
+		"system":[
+			{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.161.abc; cc_entrypoint=cli;"},
+			{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},
+			{"type":"text","text":"default expansion"}
+		],
+		"metadata":{"user_id":` + strconvQuote(metadataUserID) + `},
+		"messages":[{"role":"user","content":"Hello"}]
+	}`)
+
+	req, outBody, err := svc.buildUpstreamRequest(
+		context.Background(), c, account, body,
+		"synthetic-token", "oauth", "claude-opus-4-8", true, true,
+	)
+
+	require.NoError(t, err)
+	require.Contains(t, billingSystemText(outBody), "cc_version=2.1.161.")
+	require.Contains(t, billingSystemText(outBody), "cc_entrypoint=cli;")
+	require.NotContains(t, billingSystemText(outBody), "cch=")
+	require.Equal(t, "MacOS", getHeaderRaw(req.Header, "x-stainless-os"))
+	require.Equal(t, claude.DefaultHeaders["User-Agent"], getHeaderRaw(req.Header, "user-agent"))
+	require.Equal(t, originalClientID, cachedFingerprint.ClientID)
+	require.Equal(t, "Linux", cache.fingerprint.StainlessOS)
+	require.Zero(t, cache.setFingerprintCall)
+	parsedUserID := ParseMetadataUserID(gjson.GetBytes(outBody, "metadata.user_id").String())
+	require.NotNil(t, parsedUserID)
+	require.Equal(t, originalClientID, parsedUserID.DeviceID)
+	require.Equal(t, "account-456", parsedUserID.AccountUUID)
+	require.Empty(t, getHeaderRaw(req.Header, "x-client-request-id"))
+	require.Empty(t, getHeaderRaw(req.Header, "x-stainless-helper-method"))
+}
+
+func TestBuildUpstreamRequest_MimicMaskedSessionHeaderUsesFinalMetadata(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	c.Request.Header.Set("User-Agent", "curl/8.4.0")
+
+	const (
+		originalClientID = "stable-device-id"
+		maskedSessionID  = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+	)
+	cache := &identityCacheStub{
+		maskedSessionID: maskedSessionID,
+		fingerprint: &Fingerprint{
+			ClientID:  originalClientID,
+			UserAgent: "claude-cli/2.1.160 (external, cli)",
+			UpdatedAt: time.Now().Unix(),
+		},
+	}
+	svc := &GatewayService{identityService: NewIdentityService(cache)}
+	account := &Account{
+		ID:       789,
+		Platform: PlatformAnthropic,
+		Type:     AccountTypeOAuth,
+		Extra: map[string]any{
+			"account_uuid":               "account-789",
+			"session_id_masking_enabled": true,
+		},
+	}
+	metadataUserID := FormatMetadataUserID(
+		originalClientID,
+		"account-789",
+		"11111111-2222-4333-8444-555555555555",
+		claude.CLICurrentVersion,
+	)
+	body := []byte(`{"model":"claude-opus-4-8","metadata":{"user_id":` + strconvQuote(metadataUserID) + `},"messages":[{"role":"user","content":"Hello"}]}`)
+
+	req, outBody, err := svc.buildUpstreamRequest(
+		context.Background(), c, account, body,
+		"synthetic-token", "oauth", "claude-opus-4-8", true, true,
+	)
+
+	require.NoError(t, err)
+	parsedUserID := ParseMetadataUserID(gjson.GetBytes(outBody, "metadata.user_id").String())
+	require.NotNil(t, parsedUserID)
+	require.Equal(t, originalClientID, parsedUserID.DeviceID)
+	require.Equal(t, "account-789", parsedUserID.AccountUUID)
+	require.Equal(t, maskedSessionID, parsedUserID.SessionID)
+	require.Equal(t, maskedSessionID, getHeaderRaw(req.Header, "x-claude-code-session-id"))
+	require.Empty(t, getHeaderRaw(req.Header, "x-client-request-id"))
+	require.Empty(t, getHeaderRaw(req.Header, "x-stainless-helper-method"))
+}
+
+func TestBuildUpstreamRequest_MimicRejectsMissingMetadataSession(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	c.Request.Header.Set("User-Agent", "curl/8.4.0")
+
+	cache := &identityCacheStub{fingerprint: &Fingerprint{
+		ClientID:  "stable-device-id",
+		UserAgent: "claude-cli/2.1.160 (external, cli)",
+		UpdatedAt: time.Now().Unix(),
+	}}
+	svc := &GatewayService{identityService: NewIdentityService(cache)}
+	account := &Account{
+		ID:       999,
+		Platform: PlatformAnthropic,
+		Type:     AccountTypeOAuth,
+		Extra:    map[string]any{"account_uuid": "account-999"},
+	}
+	body := []byte(`{"model":"claude-opus-4-8","metadata":{"user_id":"invalid"},"messages":[{"role":"user","content":"Hello"}]}`)
+
+	req, outBody, err := svc.buildUpstreamRequest(
+		context.Background(), c, account, body,
+		"synthetic-token", "oauth", "claude-opus-4-8", true, true,
+	)
+
+	require.ErrorContains(t, err, "OAuth mimic request is missing a valid metadata session")
+	require.Nil(t, req)
+	require.Nil(t, outBody)
 }
 
 func TestBuildOAuthMimicMetadataUserID_UsesOutboundCLIVersionForCurl(t *testing.T) {

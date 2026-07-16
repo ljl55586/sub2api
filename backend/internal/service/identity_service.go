@@ -31,7 +31,7 @@ var defaultFingerprint = Fingerprint{
 	UserAgent:               "claude-cli/" + claude.CLICurrentVersion + " (external, cli)",
 	StainlessLang:           "js",
 	StainlessPackageVersion: "0.94.0",
-	StainlessOS:             "Linux",
+	StainlessOS:             claude.DefaultStainlessOS,
 	StainlessArch:           "arm64",
 	StainlessRuntime:        "node",
 	StainlessRuntimeVersion: "v24.3.0",

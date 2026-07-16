@@ -120,6 +120,14 @@ func TestIdentityService_GetOrCreateFingerprint_RepairsEmptyClientIDBeforeReturn
 	require.Equal(t, fp.ClientID, cache.fingerprint.ClientID)
 }
 
+func TestIdentityService_CreateFingerprintDefaultsToMacOS(t *testing.T) {
+	svc := NewIdentityService(&identityCacheStub{})
+
+	fp := svc.createFingerprintFromHeaders(nil)
+
+	require.Equal(t, "MacOS", fp.StainlessOS)
+}
+
 func strconvQuote(v string) string {
 	return `"` + strings.ReplaceAll(strings.ReplaceAll(v, `\`, `\\`), `"`, `\"`) + `"`
 }

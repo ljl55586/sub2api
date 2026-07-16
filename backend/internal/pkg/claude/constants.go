@@ -70,6 +70,11 @@ const DefaultCacheControlTTL = "5m"
 // 必须与 DefaultHeaders["User-Agent"] 中的版本号严格一致；不一致会被 Anthropic 判第三方。
 const CLICurrentVersion = "2.1.161"
 
+// DefaultStainlessOS is the operating system declared by the Claude Code OAuth
+// mimic profile. Cached account fingerprints may retain their historical value;
+// mimic requests apply this final profile immediately before they are sent.
+const DefaultStainlessOS = "MacOS"
+
 // ClaudeCodeOAuthMainMimicryBetas 返回 OAuth 模拟主 messages 请求使用的 beta 列表。
 // 每次调用均返回新切片，以免调用方的 append 或修改影响后续请求。
 func ClaudeCodeOAuthMainMimicryBetas() []string {
@@ -110,7 +115,7 @@ var DefaultHeaders = map[string]string{
 	"User-Agent":                                "claude-cli/" + CLICurrentVersion + " (external, cli)",
 	"X-Stainless-Lang":                          "js",
 	"X-Stainless-Package-Version":               "0.94.0",
-	"X-Stainless-OS":                            "Linux",
+	"X-Stainless-OS":                            DefaultStainlessOS,
 	"X-Stainless-Arch":                          "arm64",
 	"X-Stainless-Runtime":                       "node",
 	"X-Stainless-Runtime-Version":               "v24.3.0",
