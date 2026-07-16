@@ -507,3 +507,49 @@ func TestRewriteSystemForNonClaudeCodeWithPromptBlocks_UsesConfiguredBlocks(t *t
 	require.Equal(t, "tail", arr[2].Get("text").String())
 	require.Equal(t, "1h", arr[2].Get("cache_control.ttl").String())
 }
+
+func TestClaudeOAuthNoToolsMainProfile_ProtectsDefaultSystemBlocksAndNoToolsExpansion(t *testing.T) {
+	const expectedExpansion = "You are an interactive assistant that helps users with software engineering tasks. " +
+		"Follow the conversation instructions, give concise and accurate answers, " +
+		"and do not claim that you can run tools or take actions outside this conversation."
+	require.Equal(t, expectedExpansion, claudeOAuthNoToolsMainExpansion)
+	require.Contains(t, claudeOAuthNoToolsMainExpansion, "do not claim that you can run tools")
+	require.NotContains(t, claudeOAuthNoToolsMainExpansion, "tools available to you")
+	require.NotContains(t, claudeOAuthNoToolsMainExpansion, "call tools")
+
+	raw := []byte(`{"model":"claude-opus-4-8","stream":true,"messages":[{"role":"user","content":"Hello"}]}`)
+	defaultBody := rewriteSystemForNonClaudeCodeWithPromptBlocks(raw, nil, "", "")
+	defaultBody, modelID := normalizeClaudeOAuthRequestBody(defaultBody, "claude-opus-4-8", claudeOAuthNormalizeOptions{
+		alignClaudeCodeMainRequest: true,
+	})
+
+	out, applied := applyClaudeOAuthNoToolsMainProfile(defaultBody, modelID, false)
+	require.False(t, applied)
+	require.Equal(t, defaultBody, out)
+
+	customPromptBody := rewriteSystemForNonClaudeCodeWithPromptBlocks(raw, nil, "administrator custom expansion", "")
+	customPromptBody, modelID = normalizeClaudeOAuthRequestBody(customPromptBody, "claude-opus-4-8", claudeOAuthNormalizeOptions{
+		alignClaudeCodeMainRequest: true,
+	})
+	out, applied = applyClaudeOAuthNoToolsMainProfile(customPromptBody, modelID, true)
+	require.False(t, applied)
+	require.Equal(t, customPromptBody, out)
+
+	malformedDefault, ok := setJSONValueBytes(defaultBody, "system.2.text", "unexpected expansion")
+	require.True(t, ok)
+	out, applied = applyClaudeOAuthNoToolsMainProfile(malformedDefault, modelID, true)
+	require.False(t, applied)
+	require.Equal(t, malformedDefault, out)
+}
+
+func TestClaudeOAuthNoToolsMainProfile_RequiresTheFinalMessageToBeUser(t *testing.T) {
+	raw := []byte(`{"model":"claude-opus-4-8","stream":true,"messages":[{"role":"user","content":"Hello"},{"role":"assistant","content":"Done"}]}`)
+	body := rewriteSystemForNonClaudeCodeWithPromptBlocks(raw, nil, "", "")
+	body, modelID := normalizeClaudeOAuthRequestBody(body, "claude-opus-4-8", claudeOAuthNormalizeOptions{
+		alignClaudeCodeMainRequest: true,
+	})
+
+	out, applied := applyClaudeOAuthNoToolsMainProfile(body, modelID, true)
+	require.False(t, applied)
+	require.Equal(t, body, out)
+}

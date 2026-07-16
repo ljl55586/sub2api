@@ -221,3 +221,53 @@ func TestGatewayCacheTTLGlobalSetting_RequestInjectionScope(t *testing.T) {
 	gatewayForwardingCache.Store(&cachedGatewayForwardingSettings{})
 	require.False(t, svc.shouldInjectAnthropicCacheTTL1h(context.Background(), &Account{Platform: PlatformAnthropic, Type: AccountTypeOAuth}))
 }
+
+func TestEnforceCacheControlLimit_PreservesClaudeOAuthNoToolsMainProfile(t *testing.T) {
+	raw := []byte(`{"alpha":1,"model":"claude-opus-4-8","stream":true,"messages":[{"role":"user","content":"Hello"}],"omega":2}`)
+	body := rewriteSystemForNonClaudeCodeWithPromptBlocks(raw, nil, "", "")
+	body, modelID := normalizeClaudeOAuthRequestBody(body, "claude-opus-4-8", claudeOAuthNormalizeOptions{
+		alignClaudeCodeMainRequest: true,
+	})
+	body, applied := applyClaudeOAuthNoToolsMainProfile(body, modelID, true)
+	require.True(t, applied)
+
+	out := enforceCacheControlLimit(body)
+	require.Equal(t, 3, strings.Count(string(out), `"cache_control"`))
+	require.True(t, gjson.GetBytes(out, "system.1.cache_control").Exists())
+	require.True(t, gjson.GetBytes(out, "system.2.cache_control").Exists())
+	require.True(t, gjson.GetBytes(out, "messages.0.content.0.cache_control").Exists())
+	require.Equal(t, cacheTTLTarget1h, gjson.GetBytes(out, "system.1.cache_control.ttl").String())
+	require.Equal(t, cacheTTLTarget1h, gjson.GetBytes(out, "system.2.cache_control.ttl").String())
+	require.Equal(t, cacheTTLTarget1h, gjson.GetBytes(out, "messages.0.content.0.cache_control.ttl").String())
+	require.True(t, gjson.GetBytes(out, "tools").IsArray())
+	require.Empty(t, gjson.GetBytes(out, "tools").Array())
+	require.False(t, gjson.GetBytes(out, "tool_choice").Exists())
+	assertJSONTokenOrder(t, string(out), `"alpha"`, `"model"`, `"stream"`, `"messages"`, `"omega"`)
+}
+
+func TestEnforceCacheControlLimit_PreservesClaudeOAuthNoToolsProfileWithHistoricalAnchors(t *testing.T) {
+	raw := []byte(`{
+		"model":"claude-opus-4-8",
+		"stream":true,
+		"messages":[
+			{"role":"user","content":[{"type":"text","text":"oldest","cache_control":{"type":"ephemeral","ttl":"5m"}}]},
+			{"role":"assistant","content":"Acknowledged"},
+			{"role":"user","content":[{"type":"text","text":"recent","cache_control":{"type":"ephemeral","ttl":"5m"}}]},
+			{"role":"assistant","content":"Acknowledged"},
+			{"role":"user","content":"Hello"}
+		]
+	}`)
+	body := rewriteSystemForNonClaudeCodeWithPromptBlocks(raw, nil, "", "")
+	body, modelID := normalizeClaudeOAuthRequestBody(body, "claude-opus-4-8", claudeOAuthNormalizeOptions{
+		alignClaudeCodeMainRequest: true,
+	})
+	body, applied := applyClaudeOAuthNoToolsMainProfile(body, modelID, true)
+	require.True(t, applied)
+
+	out := enforceCacheControlLimit(body)
+	require.LessOrEqual(t, strings.Count(string(out), `"cache_control"`), maxCacheControlBlocks)
+	require.True(t, gjson.GetBytes(out, "system.1.cache_control").Exists())
+	require.True(t, gjson.GetBytes(out, "system.2.cache_control").Exists())
+	require.True(t, gjson.GetBytes(out, "messages.4.content.0.cache_control").Exists())
+	require.Equal(t, cacheTTLTarget1h, gjson.GetBytes(out, "messages.4.content.0.cache_control.ttl").String())
+}

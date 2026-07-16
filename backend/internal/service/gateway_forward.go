@@ -173,15 +173,24 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 	shouldMimicClaudeCode := account.IsOAuth() && !isClaudeCode
 
 	if shouldMimicClaudeCode {
+		// The normalizer removes tool_choice when tools is empty. Preserve the
+		// raw request verdict before that loss of information so an explicit
+		// tool_choice can never be mistaken for the narrow no-tools profile.
+		profileCandidateBeforeNormalize := isClaudeOAuthNoToolsMainCandidate(body, reqModel)
+
 		// 与 Parrot 对齐：OAuth 账号无条件重写 system（即使客户端已发了 Claude Code
 		// 风格的 system prompt）。原因：第三方工具（opencode 等）会发 "You are Claude
 		// Code..." system prompt 但缺少 billing attribution block，导致 Anthropic
 		// 检测到"有 CC prompt 但无 billing block"的不一致而判为 third-party。
 		// Parrot 的 transform_request 从不检查客户端 system 内容，直接覆盖。
 		systemRewritten := false
+		systemPrompt := ""
+		systemPromptBlocks := ""
 		if !strings.Contains(strings.ToLower(reqModel), "haiku") {
 			systemRaw, _ := parsed.SystemValue()
-			systemPromptInjectionEnabled, systemPrompt, systemPromptBlocks := s.claudeOAuthSystemPromptInjectionSettings(ctx)
+			systemPromptInjectionEnabled, configuredSystemPrompt, configuredSystemPromptBlocks := s.claudeOAuthSystemPromptInjectionSettings(ctx)
+			systemPrompt = configuredSystemPrompt
+			systemPromptBlocks = configuredSystemPromptBlocks
 			if systemPromptInjectionEnabled {
 				if err := replaceBody(rewriteSystemForNonClaudeCodeWithPromptBlocks(body, systemRaw, systemPrompt, systemPromptBlocks)); err != nil {
 					return nil, err
@@ -215,6 +224,16 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 		// 原生 /v1/messages 路径也走同一套可配置字段级改写。
 		if err := replaceBody(s.rewriteMessageCacheControlIfEnabled(ctx, body)); err != nil {
 			return nil, err
+		}
+		if profileCandidateBeforeNormalize {
+			useDefaultSystemBlocks := systemRewritten &&
+				strings.TrimSpace(systemPrompt) == "" &&
+				strings.TrimSpace(systemPromptBlocks) == ""
+			if profiledBody, applied := applyClaudeOAuthNoToolsMainProfile(body, reqModel, useDefaultSystemBlocks); applied {
+				if err := replaceBody(profiledBody); err != nil {
+					return nil, err
+				}
+			}
 		}
 		if rw := buildToolNameRewriteFromBody(body); rw != nil {
 			if err := replaceBody(applyToolNameRewriteToBody(body, rw)); err != nil {
