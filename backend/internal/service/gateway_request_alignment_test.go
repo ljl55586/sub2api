@@ -449,7 +449,6 @@ func claudeOAuthNoToolsProfileResponseForTest(stream bool) *http.Response {
 			"event: message_stop",
 			`data: {"type":"message_stop"}`,
 			"",
-			"data: [DONE]",
 			"",
 		}, "\n")
 		return &http.Response{
