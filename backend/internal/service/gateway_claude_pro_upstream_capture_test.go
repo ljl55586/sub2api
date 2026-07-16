@@ -171,6 +171,7 @@ func assertAlignedCaptureRequest(t *testing.T, req *http.Request, body []byte) {
 	require.Equal(t, claudeAPIURL, req.URL.String())
 	require.Equal(t, claude.DefaultHeaders["User-Agent"], getHeaderRaw(req.Header, "User-Agent"))
 	require.Empty(t, getHeaderRaw(req.Header, "x-client-request-id"))
+	require.Empty(t, getHeaderRaw(req.Header, "x-stainless-helper-method"))
 	require.NotEmpty(t, getHeaderRaw(req.Header, "x-claude-code-session-id"))
 	require.ElementsMatch(t, claude.FullClaudeCodeMimicryBetas(), parseAnthropicBetaHeader(getHeaderRaw(req.Header, "anthropic-beta")))
 

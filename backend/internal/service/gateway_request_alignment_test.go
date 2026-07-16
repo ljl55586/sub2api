@@ -128,6 +128,7 @@ func TestBuildUpstreamRequest_MimicSessionHeaders(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Empty(t, getHeaderRaw(req.Header, "x-client-request-id"))
+	require.Empty(t, getHeaderRaw(req.Header, "x-stainless-helper-method"))
 	parsedUserID := ParseMetadataUserID(gjson.GetBytes(outBody, "metadata.user_id").String())
 	require.NotNil(t, parsedUserID)
 	require.True(t, gjson.Valid(gjson.GetBytes(outBody, "metadata.user_id").String()), "the final 2.1.161 request must retain JSON metadata format")
