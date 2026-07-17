@@ -62,6 +62,7 @@ type claudeOAuthCompanionOutputFormat struct {
 }
 
 type claudeOAuthCompanionOutputConfig struct {
+	Effort string                           `json:"effort,omitempty"`
 	Format claudeOAuthCompanionOutputFormat `json:"format"`
 }
 
@@ -84,6 +85,10 @@ func buildClaudeOAuthQuotaCompanionBody(modelID, metadataUserID string) ([]byte,
 }
 
 func buildClaudeOAuthTitleCompanionBody(modelID, metadataUserID, firstUserText string) ([]byte, error) {
+	return buildClaudeOAuthTitleCompanionBodyWithEffort(modelID, metadataUserID, firstUserText, true)
+}
+
+func buildClaudeOAuthTitleCompanionBodyWithEffort(modelID, metadataUserID, firstUserText string, includeEffort bool) ([]byte, error) {
 	messages := []claudeOAuthCompanionMessage{{
 		Role: "user",
 		Content: []claudeOAuthCompanionTextBlock{{
@@ -100,6 +105,10 @@ func buildClaudeOAuthTitleCompanionBody(modelID, metadataUserID, firstUserText s
 	billingText, err := buildBillingAttributionText(temporaryBody, claude.CLICurrentVersion)
 	if err != nil {
 		return nil, err
+	}
+	effort := ""
+	if includeEffort {
+		effort = "high"
 	}
 
 	body := struct {
@@ -123,17 +132,20 @@ func buildClaudeOAuthTitleCompanionBody(modelID, metadataUserID, firstUserText s
 		},
 		Tools:    []struct{}{},
 		Metadata: claudeOAuthCompanionMetadata{UserID: metadataUserID},
-		OutputConfig: claudeOAuthCompanionOutputConfig{Format: claudeOAuthCompanionOutputFormat{
-			Type: "json_schema",
-			Schema: claudeOAuthCompanionJSONSchema{
-				Type: "object",
-				Properties: map[string]claudeOAuthCompanionSchemaType{
-					"title": {Type: "string"},
+		OutputConfig: claudeOAuthCompanionOutputConfig{
+			Effort: effort,
+			Format: claudeOAuthCompanionOutputFormat{
+				Type: "json_schema",
+				Schema: claudeOAuthCompanionJSONSchema{
+					Type: "object",
+					Properties: map[string]claudeOAuthCompanionSchemaType{
+						"title": {Type: "string"},
+					},
+					Required:             []string{"title"},
+					AdditionalProperties: false,
 				},
-				Required:             []string{"title"},
-				AdditionalProperties: false,
 			},
-		}},
+		},
 	}
 	return json.Marshal(body)
 }
@@ -206,7 +218,12 @@ func (s *GatewayService) dispatchClaudeOAuthSessionCompanions(ctx context.Contex
 		logger.LegacyPrintf("service.gateway", "Claude OAuth title companion skipped by beta policy")
 		return
 	}
-	titleBody, err := buildClaudeOAuthTitleCompanionBody(in.modelID, in.metadataUserID, in.firstUserText)
+	titleBody, err := buildClaudeOAuthTitleCompanionBodyWithEffort(
+		in.modelID,
+		in.metadataUserID,
+		in.firstUserText,
+		containsBetaToken(titleBetaHeader, claude.BetaEffort),
+	)
 	if err != nil {
 		logger.LegacyPrintf("service.gateway", "Claude OAuth title companion body build failed: %v", err)
 		return

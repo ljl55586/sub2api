@@ -600,6 +600,30 @@ func TestGatewayServiceForward_OAuthMimicCompanionBetaPolicyFiltersQuotaAndSkips
 	require.NotContains(t, getHeaderRaw(quota.header, "anthropic-beta"), "structured-outputs-2025-12-15")
 }
 
+func TestGatewayServiceForward_OAuthMimicCompanionBetaPolicyFiltersEffortFromTitleBodyAndHeader(t *testing.T) {
+	svc, c, account, parsed, upstream := newClaudeOAuthCompanionForwardHarness(t)
+	policyJSON, err := json.Marshal(BetaPolicySettings{Rules: []BetaPolicyRule{{
+		BetaToken: claude.BetaEffort,
+		Action:    BetaPolicyActionFilter,
+		Scope:     BetaPolicyScopeOAuth,
+	}}})
+	require.NoError(t, err)
+	settings := claudeOAuthNoToolsProfileSettingsForTest(map[string]string{
+		SettingKeyBetaPolicySettings: string(policyJSON),
+	})
+	svc.settingService = NewSettingService(&gatewayTTLSettingRepo{data: settings}, svc.cfg)
+
+	result, err := svc.Forward(context.Background(), c, account, parsed)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Eventually(t, func() bool { return upstream.Count() == 3 }, time.Second, 10*time.Millisecond)
+
+	title := upstream.Find(t, "title")
+	require.NotContains(t, getHeaderRaw(title.header, "anthropic-beta"), claude.BetaEffort)
+	require.False(t, gjson.GetBytes(title.body, "output_config.effort").Exists())
+	require.Equal(t, "json_schema", gjson.GetBytes(title.body, "output_config.format.type").String())
+}
+
 func TestGatewayServiceForward_OAuthMimicCompanionBetaPolicyBlockSkipsGeneratedProfiles(t *testing.T) {
 	svc, c, account, parsed, upstream := newClaudeOAuthCompanionForwardHarness(t)
 	policyJSON, err := json.Marshal(BetaPolicySettings{Rules: []BetaPolicyRule{{
@@ -686,6 +710,7 @@ func assertClaudeOAuthTitleWireShape(t *testing.T, req claudeOAuthCompanionRecor
 	require.False(t, gjson.GetBytes(req.body, "thinking").Exists())
 	require.False(t, gjson.GetBytes(req.body, "context_management").Exists())
 	require.False(t, gjson.GetBytes(req.body, "temperature").Exists())
+	require.Equal(t, "high", gjson.GetBytes(req.body, "output_config.effort").String())
 	require.Equal(t, "json_schema", gjson.GetBytes(req.body, "output_config.format.type").String())
 	require.Equal(t, "object", gjson.GetBytes(req.body, "output_config.format.schema.type").String())
 	require.Equal(t, "string", gjson.GetBytes(req.body, "output_config.format.schema.properties.title.type").String())
