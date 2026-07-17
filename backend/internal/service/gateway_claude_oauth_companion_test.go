@@ -166,12 +166,15 @@ Bad (wrong case): {"title": "Fix Login Button On Mobile"}
 Bad (refusal): {"title": "I can't access that URL"}`
 
 type claudeOAuthCompanionUpstreamRecorder struct {
-	mu             sync.Mutex
-	requests       []claudeOAuthCompanionRecordedRequest
-	quotaStatus    int
-	titleErr       error
-	titleStarted   chan struct{}
-	titleStartOnce sync.Once
+	mu              sync.Mutex
+	requests        []claudeOAuthCompanionRecordedRequest
+	quotaStatus     int
+	titleErr        error
+	titleStarted    chan struct{}
+	titleStartOnce  sync.Once
+	titleRelease    <-chan struct{}
+	titleFinished   chan struct{}
+	titleFinishOnce sync.Once
 }
 
 func (u *claudeOAuthCompanionUpstreamRecorder) Do(req *http.Request, proxyURL string, accountID int64, accountConcurrency int) (*http.Response, error) {
@@ -195,6 +198,8 @@ func (u *claudeOAuthCompanionUpstreamRecorder) DoWithTLS(req *http.Request, _ st
 	})
 	quotaStatus := u.quotaStatus
 	titleErr := u.titleErr
+	titleRelease := u.titleRelease
+	titleFinished := u.titleFinished
 	u.mu.Unlock()
 
 	switch kind {
@@ -209,6 +214,12 @@ func (u *claudeOAuthCompanionUpstreamRecorder) DoWithTLS(req *http.Request, _ st
 				close(u.titleStarted)
 			}
 		})
+		if titleFinished != nil {
+			defer u.titleFinishOnce.Do(func() { close(titleFinished) })
+		}
+		if titleRelease != nil {
+			<-titleRelease
+		}
 		if titleErr != nil {
 			return nil, titleErr
 		}
@@ -264,6 +275,17 @@ func (u *claudeOAuthCompanionUpstreamRecorder) Count() int {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	return len(u.requests)
+}
+
+func (u *claudeOAuthCompanionUpstreamRecorder) HasKind(kind string) bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	for _, req := range u.requests {
+		if req.kind == kind {
+			return true
+		}
+	}
+	return false
 }
 
 func (u *claudeOAuthCompanionUpstreamRecorder) Find(t *testing.T, kind string) claudeOAuthCompanionRecordedRequest {
@@ -362,6 +384,69 @@ func TestGatewayServiceForward_InitialOAuthMimicSendsQuotaTitleAndMain(t *testin
 	assertExistingClaudeOAuthMainWireShape(t, main)
 	require.Equal(t, parseClaudeOAuthCompanionWireSession(t, quota), parseClaudeOAuthCompanionWireSession(t, title))
 	require.Equal(t, parseClaudeOAuthCompanionWireSession(t, quota), parseClaudeOAuthCompanionWireSession(t, main))
+}
+
+func TestGatewayServiceForward_OAuthMimicTitleCompanionDoesNotBlockMain(t *testing.T) {
+	svc, c, account, parsed, upstream := newClaudeOAuthCompanionForwardHarness(t)
+	titleRelease := make(chan struct{})
+	titleFinished := make(chan struct{})
+	upstream.titleRelease = titleRelease
+	upstream.titleFinished = titleFinished
+
+	var releaseTitleOnce sync.Once
+	releaseTitle := func() {
+		releaseTitleOnce.Do(func() { close(titleRelease) })
+	}
+	titleStarted := false
+	t.Cleanup(func() {
+		releaseTitle()
+		if !titleStarted {
+			return
+		}
+		select {
+		case <-titleFinished:
+		case <-time.After(time.Second):
+			t.Error("blocked title companion did not finish after test cleanup released it")
+		}
+	})
+
+	type forwardOutcome struct {
+		result *ForwardResult
+		err    error
+	}
+	forwardDone := make(chan forwardOutcome, 1)
+	go func() {
+		result, err := svc.Forward(context.Background(), c, account, parsed)
+		forwardDone <- forwardOutcome{result: result, err: err}
+	}()
+
+	select {
+	case <-upstream.titleStarted:
+		titleStarted = true
+	case <-time.After(time.Second):
+		t.Fatal("title companion did not start")
+	}
+
+	select {
+	case outcome := <-forwardDone:
+		require.NoError(t, outcome.err)
+		require.NotNil(t, outcome.result)
+	case <-time.After(time.Second):
+		t.Fatal("Forward waited for the blocked title companion")
+	}
+	require.True(t, upstream.HasKind("main"), "main request must reach the upstream while title is blocked")
+	select {
+	case <-titleFinished:
+		t.Fatal("title companion finished before the test released it")
+	default:
+	}
+
+	releaseTitle()
+	select {
+	case <-titleFinished:
+	case <-time.After(time.Second):
+		t.Fatal("title companion did not finish after release")
+	}
 }
 
 func TestGatewayServiceForward_OAuthMimicCompanionsOnlyOncePerSession(t *testing.T) {
