@@ -16,6 +16,7 @@ type companionClaimStoreForTest struct {
 	mu       sync.Mutex
 	claimed  map[string]struct{}
 	claimErr error
+	claimTTL time.Duration
 }
 
 func newCompanionClaimStoreForTest() *companionClaimStoreForTest {
@@ -38,10 +39,11 @@ func (s *companionClaimStoreForTest) DeleteSessionAccountID(context.Context, int
 	return nil
 }
 
-func (s *companionClaimStoreForTest) TryClaimClaudeOAuthSessionCompanions(_ context.Context, accountID int64, sessionID string, _ time.Duration) (bool, error) {
+func (s *companionClaimStoreForTest) TryClaimClaudeOAuthSessionCompanions(_ context.Context, accountID int64, sessionID string, ttl time.Duration) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	s.claimTTL = ttl
 	if s.claimErr != nil {
 		return false, s.claimErr
 	}
@@ -101,6 +103,14 @@ func TestClaimClaudeOAuthSessionCompanions_DifferentAccountsCanEachClaim(t *test
 
 	require.True(t, svc.claimClaudeOAuthSessionCompanions(context.Background(), 1001, "session-a"))
 	require.True(t, svc.claimClaudeOAuthSessionCompanions(context.Background(), 1002, "session-a"))
+}
+
+func TestClaimClaudeOAuthSessionCompanions_UsesStickySessionTTL(t *testing.T) {
+	store := newCompanionClaimStoreForTest()
+	svc := &GatewayService{cache: store}
+
+	require.True(t, svc.claimClaudeOAuthSessionCompanions(context.Background(), 1001, "session-a"))
+	require.Equal(t, stickySessionTTL, store.claimTTL)
 }
 
 func TestClaimClaudeOAuthSessionCompanions_UnsupportedOrFailingStoreDoesNotClaim(t *testing.T) {

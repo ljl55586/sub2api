@@ -111,6 +111,9 @@ func (s *GatewayCacheSuite) TestTryClaimClaudeOAuthSessionCompanions() {
 	claimed, err := store.TryClaimClaudeOAuthSessionCompanions(s.ctx, 99, "session-a", time.Minute)
 	require.NoError(s.T(), err)
 	require.True(s.T(), claimed)
+	claimTTL, err := s.rdb.TTL(s.ctx, buildClaudeOAuthSessionCompanionKey(99, "session-a")).Result()
+	require.NoError(s.T(), err)
+	s.AssertTTLWithin(claimTTL, time.Second, time.Minute)
 
 	claimed, err = store.TryClaimClaudeOAuthSessionCompanions(s.ctx, 99, "session-a", time.Minute)
 	require.NoError(s.T(), err)
