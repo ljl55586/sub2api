@@ -108,6 +108,20 @@ func TestIdentityService_GetOrCreateFingerprint_ReturnsReadError(t *testing.T) {
 	require.ErrorIs(t, err, cacheErr)
 }
 
+func TestIdentityService_GetOrCreateFingerprint_CacheMissCreatesAndPersistsFingerprint(t *testing.T) {
+	cache := &identityCacheStub{}
+	svc := NewIdentityService(cache)
+
+	fp, err := svc.GetOrCreateFingerprint(context.Background(), 123, nil)
+
+	require.NoError(t, err)
+	require.NotNil(t, fp)
+	require.NotEmpty(t, fp.ClientID)
+	require.NotZero(t, fp.UpdatedAt)
+	require.Equal(t, 1, cache.setFingerprintCall)
+	require.Same(t, fp, cache.fingerprint)
+}
+
 func TestIdentityService_GetOrCreateFingerprint_RepairsEmptyClientIDBeforeReturning(t *testing.T) {
 	cache := &identityCacheStub{fingerprint: &Fingerprint{UserAgent: "claude-cli/2.1.161 (external, cli)"}}
 	svc := NewIdentityService(cache)

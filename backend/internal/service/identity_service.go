@@ -62,6 +62,9 @@ var ErrIncompleteAccountIdentity = errors.New("incomplete account identity")
 
 // IdentityCache defines cache operations for identity service
 type IdentityCache interface {
+	// GetFingerprint returns (nil, nil) when the account has no cached fingerprint
+	// or its cached fingerprint has expired. Infrastructure and decode errors are
+	// returned as errors.
 	GetFingerprint(ctx context.Context, accountID int64) (*Fingerprint, error)
 	SetFingerprint(ctx context.Context, accountID int64, fp *Fingerprint) error
 	// GetMaskedSessionID 获取固定的会话ID（用于会话ID伪装功能）
@@ -121,7 +124,7 @@ func (s *IdentityService) GetOrCreateFingerprint(ctx context.Context, accountID 
 		return cached, nil
 	}
 
-	// 缓存不存在或解析失败，创建新指纹
+	// 缓存不存在，创建新指纹
 	fp := s.createFingerprintFromHeaders(headers)
 
 	// 生成随机ClientID
