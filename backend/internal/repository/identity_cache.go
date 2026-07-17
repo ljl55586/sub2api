@@ -32,6 +32,8 @@ type identityCache struct {
 	rdb *redis.Client
 }
 
+var _ service.MaskedSessionIDAtomicClaimStore = (*identityCache)(nil)
+
 func NewIdentityCache(rdb *redis.Client) service.IdentityCache {
 	return &identityCache{rdb: rdb}
 }
@@ -76,4 +78,11 @@ func (c *identityCache) GetMaskedSessionID(ctx context.Context, accountID int64)
 func (c *identityCache) SetMaskedSessionID(ctx context.Context, accountID int64, sessionID string) error {
 	key := maskedSessionKey(accountID)
 	return c.rdb.Set(ctx, key, sessionID, maskedSessionTTL).Err()
+}
+
+// TryClaimMaskedSessionID atomically initializes an account-scoped session
+// mask. SET NX ensures concurrent cold-cache callers converge on one value.
+func (c *identityCache) TryClaimMaskedSessionID(ctx context.Context, accountID int64, sessionID string) (bool, error) {
+	key := maskedSessionKey(accountID)
+	return c.rdb.SetNX(ctx, key, sessionID, maskedSessionTTL).Result()
 }

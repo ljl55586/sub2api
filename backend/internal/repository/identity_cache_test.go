@@ -14,10 +14,16 @@ import (
 
 func newIdentityCacheForUnitTest(t *testing.T) *identityCache {
 	t.Helper()
+	cache, _ := newIdentityCacheWithMiniRedisForUnitTest(t)
+	return cache
+}
+
+func newIdentityCacheWithMiniRedisForUnitTest(t *testing.T) (*identityCache, *miniredis.Miniredis) {
+	t.Helper()
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
-	return &identityCache{rdb: rdb}
+	return &identityCache{rdb: rdb}, mr
 }
 
 func TestFingerprintKey(t *testing.T) {
@@ -85,5 +91,35 @@ func TestIdentityCacheGetFingerprint_PreservesRedisErrors(t *testing.T) {
 	fp, err := cache.GetFingerprint(ctx, 123)
 
 	require.Nil(t, fp)
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestIdentityCacheTryClaimMaskedSessionID_OnlyFirstClaimWinsAndSetsTTL(t *testing.T) {
+	cache, mr := newIdentityCacheWithMiniRedisForUnitTest(t)
+	ctx := context.Background()
+	const accountID = int64(123)
+
+	claimed, err := cache.TryClaimMaskedSessionID(ctx, accountID, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.Equal(t, maskedSessionTTL, mr.TTL(maskedSessionKey(accountID)))
+
+	claimed, err = cache.TryClaimMaskedSessionID(ctx, accountID, "ffffffff-eeee-4ddd-8ccc-bbbbbbbbbbbb")
+	require.NoError(t, err)
+	require.False(t, claimed)
+
+	stored, err := cache.GetMaskedSessionID(ctx, accountID)
+	require.NoError(t, err)
+	require.Equal(t, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", stored)
+}
+
+func TestIdentityCacheTryClaimMaskedSessionID_PropagatesRedisErrors(t *testing.T) {
+	cache := newIdentityCacheForUnitTest(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	claimed, err := cache.TryClaimMaskedSessionID(ctx, 123, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+
+	require.False(t, claimed)
 	require.ErrorIs(t, err, context.Canceled)
 }

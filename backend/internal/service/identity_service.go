@@ -76,6 +76,16 @@ type IdentityCache interface {
 	SetMaskedSessionID(ctx context.Context, accountID int64, sessionID string) error
 }
 
+// MaskedSessionIDAtomicClaimStore is an optional IdentityCache capability for
+// atomically creating an account-scoped masked session ID with the normal mask
+// TTL. It intentionally stays separate from IdentityCache so existing cache
+// implementations remain compatible.
+type MaskedSessionIDAtomicClaimStore interface {
+	// TryClaimMaskedSessionID stores sessionID only when the account has no
+	// current mask. It returns true to the single winning caller.
+	TryClaimMaskedSessionID(ctx context.Context, accountID int64, sessionID string) (bool, error)
+}
+
 // IdentityService 管理OAuth账号的请求身份指纹
 type IdentityService struct {
 	cache IdentityCache
@@ -391,7 +401,36 @@ func (s *IdentityService) GetOrCreateMaskedSessionID(ctx context.Context, accoun
 		return "", fmt.Errorf("get masked session ID for account %d: %w", accountID, err)
 	}
 	if maskedSessionID == "" {
-		maskedSessionID = generateRandomUUID()
+		candidate := generateRandomUUID()
+		if claimer, ok := s.cache.(MaskedSessionIDAtomicClaimStore); ok {
+			claimed, claimErr := claimer.TryClaimMaskedSessionID(ctx, accountID, candidate)
+			if claimErr != nil {
+				return "", fmt.Errorf("claim masked session ID for account %d: %w", accountID, claimErr)
+			}
+			if claimed {
+				logger.LegacyPrintf("service.identity", "Claimed new masked session ID for account %d: %s", accountID, candidate)
+				return candidate, nil
+			}
+
+			// A concurrent caller won the cold-cache race. Re-read its value and
+			// refresh its TTL; never overwrite it with this request's candidate.
+			maskedSessionID, err = s.cache.GetMaskedSessionID(ctx, accountID)
+			if err != nil {
+				return "", fmt.Errorf("get winning masked session ID for account %d: %w", accountID, err)
+			}
+			if maskedSessionID == "" {
+				return "", fmt.Errorf("winning masked session ID for account %d is unavailable", accountID)
+			}
+			if err := s.cache.SetMaskedSessionID(ctx, accountID, maskedSessionID); err != nil {
+				return "", fmt.Errorf("refresh masked session ID for account %d: %w", accountID, err)
+			}
+			return maskedSessionID, nil
+		}
+
+		// Legacy IdentityCache implementations do not support atomic claims.
+		// Keep their historical behavior rather than making the new capability a
+		// breaking interface requirement.
+		maskedSessionID = candidate
 		logger.LegacyPrintf("service.identity", "Generated new masked session ID for account %d: %s", accountID, maskedSessionID)
 	}
 	if err := s.cache.SetMaskedSessionID(ctx, accountID, maskedSessionID); err != nil {
