@@ -151,17 +151,18 @@ func buildClaudeOAuthTitleCompanionBodyWithEffort(modelID, metadataUserID, first
 }
 
 type claudeOAuthCompanionDispatchInput struct {
-	c               *gin.Context
-	account         *Account
-	modelID         string
-	token           string
-	tokenType       string
-	reqStream       bool
-	mimicClaudeCode bool
-	metadataUserID  string
-	firstUserText   string
-	proxyURL        string
-	tlsProfile      *tlsfingerprint.Profile
+	c                          *gin.Context
+	account                    *Account
+	modelID                    string
+	token                      string
+	tokenType                  string
+	reqStream                  bool
+	mimicClaudeCode            bool
+	metadataUserID             string
+	firstUserText              string
+	metadataPassthroughEnabled bool
+	proxyURL                   string
+	tlsProfile                 *tlsfingerprint.Profile
 }
 
 type claudeOAuthCompanionPendingRequest struct {
@@ -173,7 +174,7 @@ type claudeOAuthCompanionPendingRequest struct {
 func (s *GatewayService) dispatchClaudeOAuthSessionCompanions(ctx context.Context, in claudeOAuthCompanionDispatchInput) {
 	if s == nil || in.account == nil || !in.mimicClaudeCode || in.tokenType != "oauth" ||
 		claude.NormalizeModelID(in.modelID) != "claude-opus-4-8" || !in.reqStream ||
-		strings.TrimSpace(in.firstUserText) == "" {
+		strings.TrimSpace(in.firstUserText) == "" || in.metadataPassthroughEnabled {
 		return
 	}
 	metadata := ParseMetadataUserID(in.metadataUserID)
@@ -198,9 +199,11 @@ func (s *GatewayService) dispatchClaudeOAuthSessionCompanions(ctx context.Contex
 		quotaReq, _, buildErr := s.buildUpstreamRequestWithOptions(
 			baseCtx, in.c, in.account, quotaBody, in.token, in.tokenType, in.modelID, false, true,
 			upstreamRequestBuildOptions{
-				finalAnthropicBetaOverride: &quotaBetaHeader,
-				debugSnapshotTag:           "UPSTREAM_SESSION_COMPANION_QUOTA",
-				oauthMimicMetadataFinal:    true,
+				finalAnthropicBetaOverride:         &quotaBetaHeader,
+				debugSnapshotTag:                   "UPSTREAM_SESSION_COMPANION_QUOTA",
+				oauthMimicMetadataFinal:            true,
+				oauthMimicMetadataPassthrough:      in.metadataPassthroughEnabled,
+				oauthMimicMetadataPassthroughKnown: true,
 			},
 		)
 		if buildErr != nil {
@@ -231,9 +234,11 @@ func (s *GatewayService) dispatchClaudeOAuthSessionCompanions(ctx context.Contex
 	} else if titleReq, _, err := s.buildUpstreamRequestWithOptions(
 		baseCtx, in.c, in.account, titleBody, in.token, in.tokenType, in.modelID, true, true,
 		upstreamRequestBuildOptions{
-			finalAnthropicBetaOverride: &titleBetaHeader,
-			debugSnapshotTag:           "UPSTREAM_SESSION_COMPANION_TITLE",
-			oauthMimicMetadataFinal:    true,
+			finalAnthropicBetaOverride:         &titleBetaHeader,
+			debugSnapshotTag:                   "UPSTREAM_SESSION_COMPANION_TITLE",
+			oauthMimicMetadataFinal:            true,
+			oauthMimicMetadataPassthrough:      in.metadataPassthroughEnabled,
+			oauthMimicMetadataPassthroughKnown: true,
 		},
 	); err != nil {
 		logger.LegacyPrintf("service.gateway", "Claude OAuth title companion request build failed: %v", err)

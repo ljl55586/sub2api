@@ -371,6 +371,68 @@ func (s *HTTPUpstreamSuite) TestClaudeOAuthCompanionProfileDoesNotBlockMainAccou
 	}
 }
 
+func (s *HTTPUpstreamSuite) TestClaudeOAuthCompanionTLSProfileDoesNotBlockMainAccountPool() {
+	t := s.T()
+	s.cfg.Gateway = config.GatewayConfig{
+		ConnectionPoolIsolation: config.ConnectionPoolIsolationAccount,
+	}
+	svc := s.newService()
+	titleStarted := make(chan struct{})
+	releaseTitle := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Header.Get("X-Test-Role") == "title" {
+			close(titleStarted)
+			<-releaseTitle
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	tlsProfile := &tlsfingerprint.Profile{Name: "test"}
+	titleReq, err := http.NewRequest(http.MethodPost, server.URL, nil)
+	require.NoError(t, err)
+	titleReq.Header.Set("X-Test-Role", "title")
+	titleReq = titleReq.WithContext(service.WithHTTPUpstreamProfile(titleReq.Context(), service.HTTPUpstreamProfileClaudeOAuthCompanion))
+	titleDone := make(chan error, 1)
+	go func() {
+		resp, doErr := svc.DoWithTLS(titleReq, "", 405, 1, tlsProfile)
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		titleDone <- doErr
+	}()
+	select {
+	case <-titleStarted:
+	case <-time.After(time.Second):
+		t.Fatal("TLS title request did not reach the upstream")
+	}
+
+	mainReq, err := http.NewRequest(http.MethodPost, server.URL, nil)
+	require.NoError(t, err)
+	mainDone := make(chan error, 1)
+	go func() {
+		resp, doErr := svc.DoWithTLS(mainReq, "", 405, 1, tlsProfile)
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		mainDone <- doErr
+	}()
+	select {
+	case doErr := <-mainDone:
+		require.NoError(t, doErr)
+	case <-time.After(time.Second):
+		t.Fatal("TLS main request waited behind the companion connection")
+	}
+
+	close(releaseTitle)
+	select {
+	case doErr := <-titleDone:
+		require.NoError(t, doErr)
+	case <-time.After(time.Second):
+		t.Fatal("TLS title request did not finish after release")
+	}
+}
+
 func (s *HTTPUpstreamSuite) TestOpenAIProfileHTTP2DisabledUsesHTTP1Transport() {
 	s.cfg.Gateway = config.GatewayConfig{
 		OpenAIHTTP2: config.GatewayOpenAIHTTP2Config{Enabled: false},

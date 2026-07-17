@@ -6,7 +6,9 @@ import (
 	"context"
 	"math"
 	"testing"
+	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
@@ -111,6 +113,64 @@ func TestIdentityCacheTryClaimMaskedSessionID_OnlyFirstClaimWinsAndSetsTTL(t *te
 	stored, err := cache.GetMaskedSessionID(ctx, accountID)
 	require.NoError(t, err)
 	require.Equal(t, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", stored)
+}
+
+func TestIdentityCacheGetAndRefreshMaskedSessionID_RenewsTTLAtomically(t *testing.T) {
+	cache, mr := newIdentityCacheWithMiniRedisForUnitTest(t)
+	ctx := context.Background()
+	const accountID = int64(124)
+	const sessionID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+	require.NoError(t, cache.rdb.Set(ctx, maskedSessionKey(accountID), sessionID, time.Minute).Err())
+	mr.FastForward(30 * time.Second)
+
+	got, err := cache.GetAndRefreshMaskedSessionID(ctx, accountID)
+
+	require.NoError(t, err)
+	require.Equal(t, sessionID, got)
+	require.Equal(t, maskedSessionTTL, mr.TTL(maskedSessionKey(accountID)))
+}
+
+func TestIdentityCacheTryClaimFingerprint_OnlyFirstClaimWinsAndSetsTTL(t *testing.T) {
+	cache, mr := newIdentityCacheWithMiniRedisForUnitTest(t)
+	ctx := context.Background()
+	const accountID = int64(125)
+	first := &service.Fingerprint{ClientID: "first-client", UserAgent: "claude-cli/2.1.161"}
+	second := &service.Fingerprint{ClientID: "second-client", UserAgent: "claude-cli/2.1.161"}
+
+	claimed, err := cache.TryClaimFingerprint(ctx, accountID, first)
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.Equal(t, fingerprintTTL, mr.TTL(fingerprintKey(accountID)))
+
+	claimed, err = cache.TryClaimFingerprint(ctx, accountID, second)
+	require.NoError(t, err)
+	require.False(t, claimed)
+
+	stored, err := cache.GetFingerprint(ctx, accountID)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	require.Equal(t, first.ClientID, stored.ClientID)
+}
+
+func TestIdentityCacheEnsureFingerprintClientID_RepairsOnlyOnceAndPreservesTTL(t *testing.T) {
+	cache, mr := newIdentityCacheWithMiniRedisForUnitTest(t)
+	ctx := context.Background()
+	const accountID = int64(126)
+	initial := &service.Fingerprint{UserAgent: "claude-cli/2.1.161"}
+	require.NoError(t, cache.SetFingerprint(ctx, accountID, initial))
+	mr.FastForward(time.Hour)
+	ttlBefore := mr.TTL(fingerprintKey(accountID))
+
+	first, err := cache.EnsureFingerprintClientID(ctx, accountID, "first-client")
+	require.NoError(t, err)
+	require.NotNil(t, first)
+	require.Equal(t, "first-client", first.ClientID)
+	require.Equal(t, ttlBefore, mr.TTL(fingerprintKey(accountID)))
+
+	second, err := cache.EnsureFingerprintClientID(ctx, accountID, "second-client")
+	require.NoError(t, err)
+	require.NotNil(t, second)
+	require.Equal(t, "first-client", second.ClientID)
 }
 
 func TestIdentityCacheTryClaimMaskedSessionID_PropagatesRedisErrors(t *testing.T) {

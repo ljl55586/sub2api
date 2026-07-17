@@ -18,18 +18,27 @@ import (
 )
 
 type upstreamRequestBuildOptions struct {
-	finalAnthropicBetaOverride *string
-	debugSnapshotTag           string
-	oauthMimicMetadataFinal    bool
+	finalAnthropicBetaOverride         *string
+	debugSnapshotTag                   string
+	oauthMimicMetadataFinal            bool
+	oauthMimicMetadataPassthrough      bool
+	oauthMimicMetadataPassthroughKnown bool
 }
 
-const oauthMimicMetadataFinalContextKey = "oauthMimicMetadataFinal"
+const (
+	oauthMimicMetadataFinalContextKey       = "oauthMimicMetadataFinal"
+	oauthMimicMetadataPassthroughContextKey = "oauthMimicMetadataPassthrough"
+)
 
 func (s *GatewayService) buildUpstreamRequest(ctx context.Context, c *gin.Context, account *Account, body []byte, token, tokenType, modelID string, reqStream bool, mimicClaudeCode bool) (*http.Request, []byte, error) {
 	opts := upstreamRequestBuildOptions{}
 	if c != nil {
 		if value, ok := c.Get(oauthMimicMetadataFinalContextKey); ok {
 			opts.oauthMimicMetadataFinal, _ = value.(bool)
+		}
+		if value, ok := c.Get(oauthMimicMetadataPassthroughContextKey); ok {
+			opts.oauthMimicMetadataPassthrough, _ = value.(bool)
+			opts.oauthMimicMetadataPassthroughKnown = true
 		}
 	}
 	return s.buildUpstreamRequestWithOptions(ctx, c, account, body, token, tokenType, modelID, reqStream, mimicClaudeCode, opts)
@@ -74,6 +83,9 @@ func (s *GatewayService) buildUpstreamRequestWithOptions(ctx context.Context, c 
 	enableFP, enableMPT := true, false
 	if s.settingService != nil {
 		enableFP, enableMPT, _ = s.settingService.GetGatewayForwardingSettings(ctx)
+	}
+	if opts.oauthMimicMetadataPassthroughKnown {
+		enableMPT = opts.oauthMimicMetadataPassthrough
 	}
 	if account.IsOAuth() && s.identityService != nil {
 		// 1. 获取或创建指纹（包含随机生成的ClientID）

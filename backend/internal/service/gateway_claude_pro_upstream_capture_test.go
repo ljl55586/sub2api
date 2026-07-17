@@ -27,6 +27,11 @@ import (
 )
 
 const (
+	// captureOptInEnv keeps the developer-machine trace comparison out of the
+	// normal unit suite. The test reads absolute local trace paths and writes
+	// timestamped artifacts, so it must be explicitly requested.
+	captureOptInEnv = "SUB2API_RUN_CLAUDE_TRACE_CAPTURE"
+
 	captureLogDir = "/Users/ling/Demo/PacketCapture/sub2api/claude"
 
 	captureTrace20260715 = "/Users/ling/Demo/PacketCapture/.claude-trace/log-2026-07-15-03-02-52.json"
@@ -379,6 +384,10 @@ type captureCacheControl struct {
 // path through a local HTTPUpstream recorder. The recorder captures the final
 // wire request without opening a network connection.
 func TestCaptureClaudeProUpstreamRequest(t *testing.T) {
+	if os.Getenv(captureOptInEnv) != "1" {
+		t.Skipf("set %s=1 to run the developer-local trace capture", captureOptInEnv)
+	}
+
 	gin.SetMode(gin.TestMode)
 	ctx := context.Background()
 	clientBody := []byte(`{` +
@@ -1115,6 +1124,7 @@ func buildSessionCompanionsAlignmentCaptureReport(now time.Time, trace15, trace1
 	report.WriteString("## 证据边界与脱敏\n\n")
 	report.WriteString("- 两份真实 trace 仅在进程内读取并按结构分类；报告不保留原始 header、metadata、CCH、认证值、首问或 title system prompt。\n")
 	report.WriteString("- 合成 capture 完整调用 `GatewayService.Forward`，但 HTTPUpstream 是进程内 fake recorder；不会建立网络连接或使用真实账号。\n")
+	report.WriteString("- 原始 `.log` 是仅供本地调试的合成请求快照，可能含未脱敏的合成 body/metadata；它仅在显式 opt-in capture 时以 `0600` 创建，不能替换为真实凭证或真实 prompt 后再共享。\n")
 	report.WriteString("- 下文只列角色、字段存在性、固定 header 的预期匹配状态、公开 beta 名称及顺序、block 类型/数量/长度、以及脱敏的一致性布尔值。\n\n")
 
 	report.WriteString("## 会话角色观察\n\n")
@@ -1170,7 +1180,7 @@ func buildSessionCompanionsAlignmentCaptureReport(now time.Time, trace15, trace1
 	report.WriteString("- tools 仍保持现有策略；本轮不伪造真实 CLI 的完整 tools schema、tool_choice 或 prompt 原文。\n\n")
 
 	report.WriteString("## 上游识别风险\n\n")
-	report.WriteString("不能把本离线结果视为不可识别的证明。合成请求仍不生成 CCH，而真实 trace 存在 CCH；这是明确保留的高风险差异。system/messages 布局差异仍然存在，且真实 CLI 的 tools schema/count 差异以及 tool_choice 与合成请求不同；即使报告只列结构摘要、不输出原始 prompt 或工具内容，这些差异仍可成为上游识别线索。quota/title 现在在独立受限连接池的后台 worker 中按逻辑顺序执行，回归测试覆盖它们不阻塞主请求；但 title 与 main 的实际写线微秒级先后仍不保证，离线 fake recorder 也不能证明真实网络中的调度、连接复用或上游观察顺序。TLS 指纹、HTTP/2、IP/ASN、代理、连接复用以及真实 Claude Code 进程状态均未模拟。伴生请求 claim 的 TTL 为 1 小时；curl 若缺少稳定的会话输入，可能重复发送或漏发首问伴生请求。最后，首问额外增加 quota 与 title 上游流量及其可观察的失败/限流行为。\n")
+	report.WriteString("不能把本离线结果视为不可识别的证明。合成请求仍不生成 CCH，而真实 trace 存在 CCH；这是明确保留的高风险差异。system/messages 布局差异仍然存在，且真实 CLI 的 tools schema/count 差异以及 tool_choice 与合成请求不同；即使报告只列结构摘要、不输出原始 prompt 或工具内容，这些差异仍可成为上游识别线索。quota/title 现在在独立受限连接池的后台 worker 中按逻辑顺序执行，回归测试覆盖它们不阻塞主请求；但 quota、title 与 main 的相对写线顺序均不保证，离线 fake recorder 也不能证明真实网络中的调度、连接复用或上游观察顺序。TLS 指纹、HTTP/2、IP/ASN、代理、连接复用以及真实 Claude Code 进程状态均未模拟。伴生请求 claim 的 TTL 为 1 小时；curl 若缺少稳定的会话输入，可能重复发送或漏发首问伴生请求。最后，首问额外增加 quota 与 title 上游流量及其可观察的失败/限流行为。\n")
 
 	return report.String()
 }
@@ -1747,6 +1757,7 @@ func TestBuildSessionCompanionsAlignmentCaptureReportListsRolesAndRisks(t *testi
 		"system/messages 布局差异",
 		"tools schema/count 差异",
 		"独立受限连接池",
+		"显式 opt-in capture",
 	} {
 		require.Contains(t, report, section)
 	}

@@ -40,6 +40,24 @@ func (s *GatewayService) ForwardCountTokens(ctx context.Context, c *gin.Context,
 		return nil
 	}
 
+	// Match /v1/messages: reject a blocked beta supplied by the downstream
+	// before any account override or filter can replace/remove it, then cache
+	// the filter set for final-header construction below. The final-token check
+	// in buildCountTokensRequest remains necessary for generated OAuth betas and
+	// account overrides.
+	if account.Platform == PlatformAnthropic && c != nil {
+		policy := s.evaluateBetaPolicy(ctx, c.GetHeader("anthropic-beta"), account, parsed.Model)
+		if policy.blockErr != nil {
+			s.countTokensError(c, http.StatusBadRequest, "invalid_request_error", policy.blockErr.Message)
+			return policy.blockErr
+		}
+		filterSet := policy.filterSet
+		if filterSet == nil {
+			filterSet = map[string]struct{}{}
+		}
+		c.Set(betaPolicyFilterSetKey, filterSet)
+	}
+
 	body := parsed.Body.Bytes()
 	replaceBody := func(next []byte) error {
 		if err := parsed.ReplaceBody(next); err != nil {
@@ -127,6 +145,11 @@ func (s *GatewayService) ForwardCountTokens(ctx context.Context, c *gin.Context,
 	// 构建上游请求
 	upstreamReq, wireBody, err := s.buildCountTokensRequest(ctx, c, account, body, token, tokenType, reqModel, shouldMimicClaudeCode)
 	if err != nil {
+		var betaBlockedErr *BetaBlockedError
+		if errors.As(err, &betaBlockedErr) {
+			s.countTokensError(c, http.StatusBadRequest, "invalid_request_error", betaBlockedErr.Message)
+			return err
+		}
 		s.countTokensError(c, http.StatusInternalServerError, "api_error", "Failed to build request")
 		return err
 	}
@@ -494,6 +517,13 @@ func (s *GatewayService) buildCountTokensRequest(ctx context.Context, c *gin.Con
 	// 账号覆写了 anthropic-beta 时，覆写值即最终上游值：净化以覆写值为准
 	if beta, ok := account.HeaderOverrideValue("anthropic-beta"); ok {
 		finalBetaHeader, finalBetaShouldSet = beta, true
+	}
+
+	// 最终 block 校验必须在自动注入、客户端透传、账号覆写都收敛之后执行。
+	// getBetaPolicyFilterSet 只负责筛除 token；若不在此复验，count_tokens
+	// 会绕过 messages 路径对最终 wire beta 的管理员 block 策略。
+	if blockErr := s.checkBetaPolicyBlockForTokens(ctx, parseAnthropicBetaHeader(finalBetaHeader), account, modelID); blockErr != nil {
+		return nil, nil, blockErr
 	}
 
 	// 能力维度 body sanitize：与最终 anthropic-beta header 对称

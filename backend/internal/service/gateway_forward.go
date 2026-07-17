@@ -177,6 +177,12 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 	if shouldMimicClaudeCode && s.settingService != nil {
 		_, metadataPassthroughEnabled, _ = s.settingService.GetGatewayForwardingSettings(ctx)
 	}
+	if shouldMimicClaudeCode && c != nil {
+		// Snapshot this setting for every request build in the lifecycle. A hot
+		// settings update must not turn one Forward call into a mixed mode where
+		// metadata is generated but the session header is treated as passthrough.
+		c.Set(oauthMimicMetadataPassthroughContextKey, metadataPassthroughEnabled)
+	}
 
 	if shouldMimicClaudeCode {
 		// The normalizer removes tool_choice when tools is empty. Preserve the
@@ -377,23 +383,10 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 		}
 	}
 
-	s.dispatchClaudeOAuthSessionCompanions(ctx, claudeOAuthCompanionDispatchInput{
-		c:               c,
-		account:         account,
-		modelID:         reqModel,
-		token:           token,
-		tokenType:       tokenType,
-		reqStream:       reqStream,
-		mimicClaudeCode: shouldMimicClaudeCode,
-		metadataUserID:  oauthMimicMetadataUserID,
-		firstUserText:   firstUserTextBeforeMimic,
-		proxyURL:        proxyURL,
-		tlsProfile:      tlsProfile,
-	})
-
 	// 重试循环
 	var resp *http.Response
 	lastWireBody := body
+	companionsDispatched := false
 	retryStart := time.Now()
 	for attempt := 1; attempt <= maxRetryAttempts; attempt++ {
 		// 构建上游请求（每次重试需要重新构建，因为请求体需要重新读取）
@@ -405,6 +398,28 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 		}
 		// 记录本次实际发送的 wire body；只有请求成功后才写回 ParsedRequest，避免 400 retry 基于已签名 CCH 再改写。
 		lastWireBody = wireBody
+
+		// 仅当主请求已完成最终 body/header 构造和 beta 策略校验后，才允许
+		// 初始会话伴生请求入队。这样主请求因最终 profile（例如仅主请求
+		// 携带的 extended-cache-ttl）被策略拒绝时，不会留下 quota/title
+		// 副作用；重试也不会重复发伴生请求。
+		if !companionsDispatched {
+			s.dispatchClaudeOAuthSessionCompanions(ctx, claudeOAuthCompanionDispatchInput{
+				c:                          c,
+				account:                    account,
+				modelID:                    reqModel,
+				token:                      token,
+				tokenType:                  tokenType,
+				reqStream:                  reqStream,
+				mimicClaudeCode:            shouldMimicClaudeCode,
+				metadataUserID:             oauthMimicMetadataUserID,
+				firstUserText:              firstUserTextBeforeMimic,
+				metadataPassthroughEnabled: metadataPassthroughEnabled,
+				proxyURL:                   proxyURL,
+				tlsProfile:                 tlsProfile,
+			})
+			companionsDispatched = true
+		}
 
 		// 发送请求
 		resp, err = s.httpUpstream.DoWithTLS(upstreamReq, proxyURL, account.ID, account.Concurrency, tlsProfile)

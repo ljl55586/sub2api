@@ -597,7 +597,7 @@ func TestBuildUpstreamRequest_OAuthMimicHaiku_StripsContextManagementEndToEnd(t 
 	}
 	// haiku + mimic CC → final beta = HaikuBetaHeader（不含 context-management）→
 	// body 必须 strip。
-	body := []byte(`{"model":"claude-haiku-4-5","context_management":{"edits":[{"type":"clear_thinking_20251015"}]},"messages":[]}`)
+	body := []byte(`{"model":"claude-haiku-4-5","metadata":{"user_id":` + oauthMimicMetadataForBetaTest(t) + `},"context_management":{"edits":[{"type":"clear_thinking_20251015"}]},"messages":[]}`)
 	svc := &GatewayService{cfg: &config.Config{}}
 	req, _, err := svc.buildUpstreamRequest(
 		context.Background(), c, account, body,
@@ -627,7 +627,7 @@ func TestBuildUpstreamRequest_OAuthMimicNonHaiku_PreservesContextManagementEndTo
 	}
 	// sonnet + mimic CC → final beta = ClaudeCodeOAuthMainMimicryBetas（含 context-management）→
 	// body 保留。
-	body := []byte(`{"model":"claude-sonnet-4-6","context_management":{"edits":[{"type":"clear_thinking_20251015"}]},"messages":[]}`)
+	body := []byte(`{"model":"claude-sonnet-4-6","metadata":{"user_id":` + oauthMimicMetadataForBetaTest(t) + `},"context_management":{"edits":[{"type":"clear_thinking_20251015"}]},"messages":[]}`)
 	svc := &GatewayService{cfg: &config.Config{}}
 	req, _, err := svc.buildUpstreamRequest(
 		context.Background(), c, account, body,
@@ -642,6 +642,28 @@ func TestBuildUpstreamRequest_OAuthMimicNonHaiku_PreservesContextManagementEndTo
 		"OAuth mimic + non-haiku：outgoing body 必须保留 context_management。")
 	require.True(t, anthropicBetaTokensContains(outBeta, claude.BetaContextManagement),
 		"对称约束：outgoing anthropic-beta header 同时含 context-management beta")
+}
+
+func TestBuildUpstreamRequest_OAuthMimicMetadataPassthroughSnapshotSkipsSessionHeader(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	// Simulates Forward's one-time setting snapshot even if the live setting is
+	// changed between normalization and request construction.
+	c.Set(oauthMimicMetadataPassthroughContextKey, true)
+
+	account := &Account{ID: 403, Platform: PlatformAnthropic, Type: AccountTypeOAuth}
+	body := []byte(`{"model":"claude-opus-4-8","metadata":{"user_id":` + oauthMimicMetadataForBetaTest(t) + `},"messages":[]}`)
+	svc := &GatewayService{cfg: &config.Config{}}
+	req, _, err := svc.buildUpstreamRequest(
+		context.Background(), c, account, body,
+		"oauth-tok", "oauth", "claude-opus-4-8", false, true,
+	)
+
+	require.NoError(t, err)
+	require.Empty(t, getHeaderRaw(req.Header, "x-claude-code-session-id"),
+		"MPT snapshot must retain its legacy no-forced-session-header contract")
 }
 
 func TestBuildUpstreamRequest_OAuthTransparentHaikuWithRealCCBeta_PreservesField(t *testing.T) {
@@ -705,6 +727,135 @@ func TestBuildCountTokensRequest_OAuthMimicHaiku_PreservesContextManagementEndTo
 		"对称约束：final beta 含 token 时 body 字段保留")
 	require.True(t, anthropicBetaTokensContains(outBeta, claude.BetaTokenCounting),
 		"count_tokens 路径必须含 token-counting beta")
+}
+
+// count_tokens 也必须以最终 wire beta 为准执行 block 策略。OAuth mimic 会在
+// 客户端未传 beta 时自动注入多个 token；只在输入 header 上检查会留下绕过路径。
+func TestBuildCountTokensRequest_OAuthMimicGeneratedBetaBlockFailsBeforeWireRequest(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", nil)
+
+	svc := newTestGatewayServiceWithBetaPolicy(t, []BetaPolicyRule{{
+		BetaToken:    claude.BetaEffort,
+		Action:       BetaPolicyActionBlock,
+		Scope:        BetaPolicyScopeOAuth,
+		ErrorMessage: "generated effort is blocked",
+	}})
+	account := &Account{ID: 413, Platform: PlatformAnthropic, Type: AccountTypeOAuth}
+	body := []byte(`{"model":"claude-opus-4-8","metadata":{"user_id":` + oauthMimicMetadataForBetaTest(t) + `},"messages":[]}`)
+
+	req, wireBody, err := svc.buildCountTokensRequest(
+		context.Background(), c, account, body,
+		"oauth-tok", "oauth", "claude-opus-4-8", true,
+	)
+
+	require.Nil(t, req)
+	require.Nil(t, wireBody)
+	var blocked *BetaBlockedError
+	require.ErrorAs(t, err, &blocked)
+	require.Equal(t, "generated effort is blocked", err.Error())
+}
+
+// 除 OAuth 自动注入外，count_tokens 还必须拒绝 API-key 客户端直接透传的
+// 被禁 beta；否则端点会绕开 messages 的管理员策略。
+func TestBuildCountTokensRequest_APIKeyClientBetaBlockFailsBeforeWireRequest(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", nil)
+	c.Request.Header.Set("Anthropic-Beta", claude.BetaEffort)
+
+	svc := newTestGatewayServiceWithBetaPolicy(t, []BetaPolicyRule{{
+		BetaToken:    claude.BetaEffort,
+		Action:       BetaPolicyActionBlock,
+		Scope:        BetaPolicyScopeAPIKey,
+		ErrorMessage: "client effort is blocked",
+	}})
+	account := &Account{ID: 414, Platform: PlatformAnthropic, Type: AccountTypeAPIKey}
+	body := []byte(`{"model":"claude-opus-4-8","messages":[]}`)
+
+	req, wireBody, err := svc.buildCountTokensRequest(
+		context.Background(), c, account, body,
+		"api-key", "apikey", "claude-opus-4-8", false,
+	)
+
+	require.Nil(t, req)
+	require.Nil(t, wireBody)
+	var blocked *BetaBlockedError
+	require.ErrorAs(t, err, &blocked)
+	require.Equal(t, "client effort is blocked", err.Error())
+}
+
+func TestForwardCountTokens_BetaBlockReturnsClientErrorBeforeWireRequest(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", nil)
+	c.Request.Header.Set("Anthropic-Beta", claude.BetaEffort)
+
+	body := []byte(`{"model":"claude-opus-4-8","messages":[]}`)
+	parsed, err := ParseGatewayRequest(NewRequestBodyRef(body), PlatformAnthropic)
+	require.NoError(t, err)
+	svc := newTestGatewayServiceWithBetaPolicy(t, []BetaPolicyRule{{
+		BetaToken:    claude.BetaEffort,
+		Action:       BetaPolicyActionBlock,
+		Scope:        BetaPolicyScopeAPIKey,
+		ErrorMessage: "client effort is blocked",
+	}})
+	account := &Account{
+		ID:       415,
+		Platform: PlatformAnthropic,
+		Type:     AccountTypeAPIKey,
+		Credentials: map[string]any{
+			"api_key": "api-key",
+		},
+	}
+
+	err = svc.ForwardCountTokens(context.Background(), c, account, parsed)
+
+	var blocked *BetaBlockedError
+	require.ErrorAs(t, err, &blocked)
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Contains(t, rec.Body.String(), "client effort is blocked")
+}
+
+func TestForwardCountTokens_BetaBlockRejectsClientHeaderBeforeAllowedAccountOverride(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", nil)
+	c.Request.Header.Set("Anthropic-Beta", claude.BetaEffort)
+
+	body := []byte(`{"model":"claude-opus-4-8","messages":[]}`)
+	parsed, err := ParseGatewayRequest(NewRequestBodyRef(body), PlatformAnthropic)
+	require.NoError(t, err)
+	upstream := &anthropicHTTPUpstreamRecorder{resp: claudeOAuthCompanionJSONResponse(http.StatusOK, `{"input_tokens":1}`)}
+	svc := newTestGatewayServiceWithBetaPolicy(t, []BetaPolicyRule{{
+		BetaToken:    claude.BetaEffort,
+		Action:       BetaPolicyActionBlock,
+		Scope:        BetaPolicyScopeAPIKey,
+		ErrorMessage: "client effort is blocked",
+	}})
+	svc.httpUpstream = upstream
+	account := &Account{
+		ID:       416,
+		Platform: PlatformAnthropic,
+		Type:     AccountTypeAPIKey,
+		Credentials: map[string]any{
+			"api_key":                    "api-key",
+			credKeyHeaderOverrideEnabled: true,
+			credKeyHeaderOverrides:       map[string]any{"anthropic-beta": claude.BetaContextManagement},
+		},
+	}
+
+	err = svc.ForwardCountTokens(context.Background(), c, account, parsed)
+
+	var blocked *BetaBlockedError
+	require.ErrorAs(t, err, &blocked)
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Nil(t, upstream.lastReq, "blocked client beta must not be hidden by an account override")
 }
 
 func TestBuildCountTokensRequest_APIKeyHaiku_StripsContextManagementEndToEnd(t *testing.T) {

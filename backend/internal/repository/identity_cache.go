@@ -32,7 +32,9 @@ type identityCache struct {
 	rdb *redis.Client
 }
 
-var _ service.MaskedSessionIDAtomicClaimStore = (*identityCache)(nil)
+var _ service.FingerprintAtomicClaimStore = (*identityCache)(nil)
+var _ service.FingerprintAtomicRepairStore = (*identityCache)(nil)
+var _ service.MaskedSessionIDAtomicStore = (*identityCache)(nil)
 
 func NewIdentityCache(rdb *redis.Client) service.IdentityCache {
 	return &identityCache{rdb: rdb}
@@ -63,6 +65,70 @@ func (c *identityCache) SetFingerprint(ctx context.Context, accountID int64, fp 
 	return c.rdb.Set(ctx, key, val, fingerprintTTL).Err()
 }
 
+// TryClaimFingerprint atomically writes a new account fingerprint only when
+// the cache key is absent. This makes concurrent cache misses converge on one
+// ClientID instead of allowing the last normal SET to win.
+func (c *identityCache) TryClaimFingerprint(ctx context.Context, accountID int64, fp *service.Fingerprint) (bool, error) {
+	key := fingerprintKey(accountID)
+	val, err := json.Marshal(fp)
+	if err != nil {
+		return false, err
+	}
+	return c.rdb.SetNX(ctx, key, val, fingerprintTTL).Result()
+}
+
+// EnsureFingerprintClientID atomically repairs a legacy fingerprint record
+// whose ClientID is empty. WATCH prevents two concurrent repairers from
+// returning different fallback device IDs; SET with KeepTTL preserves the
+// record's existing expiry rather than turning a repair into a TTL change.
+func (c *identityCache) EnsureFingerprintClientID(ctx context.Context, accountID int64, candidate string) (*service.Fingerprint, error) {
+	key := fingerprintKey(accountID)
+	for attempt := 0; attempt < 3; attempt++ {
+		var repaired *service.Fingerprint
+		err := c.rdb.Watch(ctx, func(tx *redis.Tx) error {
+			val, err := tx.Get(ctx, key).Result()
+			if errors.Is(err, redis.Nil) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+
+			var fp service.Fingerprint
+			if err := json.Unmarshal([]byte(val), &fp); err != nil {
+				return err
+			}
+			if fp.ClientID != "" {
+				repaired = &fp
+				return nil
+			}
+
+			fp.ClientID = candidate
+			fp.UpdatedAt = time.Now().Unix()
+			encoded, err := json.Marshal(&fp)
+			if err != nil {
+				return err
+			}
+			if _, err := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+				pipe.Set(ctx, key, encoded, redis.KeepTTL)
+				return nil
+			}); err != nil {
+				return err
+			}
+			repaired = &fp
+			return nil
+		}, key)
+		if errors.Is(err, redis.TxFailedErr) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		return repaired, nil
+	}
+	return nil, redis.TxFailedErr
+}
+
 func (c *identityCache) GetMaskedSessionID(ctx context.Context, accountID int64) (string, error) {
 	key := maskedSessionKey(accountID)
 	val, err := c.rdb.Get(ctx, key).Result()
@@ -70,6 +136,21 @@ func (c *identityCache) GetMaskedSessionID(ctx context.Context, accountID int64)
 		if err == redis.Nil {
 			return "", nil
 		}
+		return "", err
+	}
+	return val, nil
+}
+
+// GetAndRefreshMaskedSessionID uses Redis GETEX so a reader never observes a
+// nearly-expired value and later overwrites a newer claimant while refreshing
+// the TTL. GETEX performs the read and renewal as one Redis command.
+func (c *identityCache) GetAndRefreshMaskedSessionID(ctx context.Context, accountID int64) (string, error) {
+	key := maskedSessionKey(accountID)
+	val, err := c.rdb.GetEx(ctx, key, maskedSessionTTL).Result()
+	if errors.Is(err, redis.Nil) {
+		return "", nil
+	}
+	if err != nil {
 		return "", err
 	}
 	return val, nil

@@ -86,6 +86,37 @@ type MaskedSessionIDAtomicClaimStore interface {
 	TryClaimMaskedSessionID(ctx context.Context, accountID int64, sessionID string) (bool, error)
 }
 
+// MaskedSessionIDAtomicReadRefreshStore atomically reads an existing mask and
+// refreshes its TTL. A separate GET followed by SET is unsafe at the expiry
+// boundary: a newly claimed value could be overwritten by a stale reader.
+type MaskedSessionIDAtomicReadRefreshStore interface {
+	GetAndRefreshMaskedSessionID(ctx context.Context, accountID int64) (string, error)
+}
+
+// MaskedSessionIDAtomicStore provides both operations required to keep an
+// account-scoped mask stable through concurrent cold starts and TTL renewal.
+// It remains optional so existing IdentityCache implementations are source
+// compatible, while production Redis uses the full atomic path.
+type MaskedSessionIDAtomicStore interface {
+	MaskedSessionIDAtomicClaimStore
+	MaskedSessionIDAtomicReadRefreshStore
+}
+
+// FingerprintAtomicClaimStore atomically persists a newly generated account
+// fingerprint only when no fingerprint exists. It prevents concurrent cache
+// misses from assigning more than one fallback device/client identity.
+type FingerprintAtomicClaimStore interface {
+	TryClaimFingerprint(ctx context.Context, accountID int64, fp *Fingerprint) (bool, error)
+}
+
+// FingerprintAtomicRepairStore atomically assigns a ClientID to a legacy
+// fingerprint record that exists but has an empty ClientID. It returns the
+// canonical stored fingerprint so concurrent repairers converge before using
+// a fallback device identity on the wire.
+type FingerprintAtomicRepairStore interface {
+	EnsureFingerprintClientID(ctx context.Context, accountID int64, candidate string) (*Fingerprint, error)
+}
+
 // IdentityService 管理OAuth账号的请求身份指纹
 type IdentityService struct {
 	cache IdentityCache
@@ -100,38 +131,17 @@ func NewIdentityService(cache IdentityCache) *IdentityService {
 // 如果缓存存在，检测user-agent版本，新版本则更新
 // 如果缓存不存在，生成随机ClientID并从请求头创建指纹，然后缓存
 func (s *IdentityService) GetOrCreateFingerprint(ctx context.Context, accountID int64, headers http.Header) (*Fingerprint, error) {
+	if s == nil || s.cache == nil {
+		return nil, errors.New("identity cache is unavailable")
+	}
+
 	// 尝试从缓存获取指纹
 	cached, err := s.cache.GetFingerprint(ctx, accountID)
 	if err != nil {
 		return nil, fmt.Errorf("get fingerprint for account %d: %w", accountID, err)
 	}
 	if cached != nil {
-		needWrite := false
-		if strings.TrimSpace(cached.ClientID) == "" {
-			cached.ClientID = generateClientID()
-			needWrite = true
-		}
-
-		// 检查客户端的user-agent是否是更新版本
-		clientUA := headers.Get("User-Agent")
-		if clientUA != "" && isNewerVersion(clientUA, cached.UserAgent) {
-			// 版本升级：merge 语义 — 仅更新请求中实际携带的字段，保留缓存值
-			// 避免缺失的头被硬编码默认值覆盖（如新 CLI 版本 + 旧 SDK 默认值的不一致）
-			mergeHeadersIntoFingerprint(cached, headers)
-			needWrite = true
-			logger.LegacyPrintf("service.identity", "Updated fingerprint for account %d: %s (merge update)", accountID, clientUA)
-		} else if time.Since(time.Unix(cached.UpdatedAt, 0)) > 24*time.Hour {
-			// 距上次写入超过24小时，续期TTL
-			needWrite = true
-		}
-
-		if needWrite {
-			cached.UpdatedAt = time.Now().Unix()
-			if err := s.cache.SetFingerprint(ctx, accountID, cached); err != nil {
-				return nil, fmt.Errorf("persist fingerprint for account %d: %w", accountID, err)
-			}
-		}
-		return cached, nil
+		return s.refreshCachedFingerprint(ctx, accountID, cached, headers)
 	}
 
 	// 缓存不存在，创建新指纹
@@ -141,13 +151,101 @@ func (s *IdentityService) GetOrCreateFingerprint(ctx context.Context, accountID 
 	fp.ClientID = generateClientID()
 	fp.UpdatedAt = time.Now().Unix()
 
-	// 保存到缓存（7天TTL，每24小时自动续期）
+	// 有原子 claim 能力时，cold-cache 并发调用必须收敛到单个持久指纹。
+	if claimer, ok := s.cache.(FingerprintAtomicClaimStore); ok {
+		claimed, claimErr := claimer.TryClaimFingerprint(ctx, accountID, fp)
+		if claimErr != nil {
+			return nil, fmt.Errorf("claim fingerprint for account %d: %w", accountID, claimErr)
+		}
+		if claimed {
+			logger.LegacyPrintf("service.identity", "Created new fingerprint for account %d with client_id: %s", accountID, fp.ClientID)
+			return fp, nil
+		}
+
+		// A concurrent caller won the cold-cache race. Always use its persisted
+		// value instead of returning this request's random candidate.
+		cached, err = s.cache.GetFingerprint(ctx, accountID)
+		if err != nil {
+			return nil, fmt.Errorf("get winning fingerprint for account %d: %w", accountID, err)
+		}
+		if cached == nil {
+			return nil, fmt.Errorf("winning fingerprint for account %d is unavailable", accountID)
+		}
+		return s.refreshCachedFingerprint(ctx, accountID, cached, headers)
+	}
+
+	// 保存到缓存（7天TTL，每24小时自动续期）。Legacy IdentityCache
+	// implementations keep their historical non-atomic behavior for source
+	// compatibility; the production Redis cache implements the atomic claim.
 	if err := s.cache.SetFingerprint(ctx, accountID, fp); err != nil {
 		return nil, fmt.Errorf("persist fingerprint for account %d: %w", accountID, err)
 	}
 
 	logger.LegacyPrintf("service.identity", "Created new fingerprint for account %d with client_id: %s", accountID, fp.ClientID)
 	return fp, nil
+}
+
+func (s *IdentityService) refreshCachedFingerprint(ctx context.Context, accountID int64, cached *Fingerprint, headers http.Header) (*Fingerprint, error) {
+	needWrite := false
+	if strings.TrimSpace(cached.ClientID) == "" {
+		if repairer, ok := s.cache.(FingerprintAtomicRepairStore); ok {
+			repaired, err := repairer.EnsureFingerprintClientID(ctx, accountID, generateClientID())
+			if err != nil {
+				return nil, fmt.Errorf("repair fingerprint client ID for account %d: %w", accountID, err)
+			}
+			if repaired == nil || strings.TrimSpace(repaired.ClientID) == "" {
+				return nil, fmt.Errorf("repaired fingerprint for account %d is unavailable", accountID)
+			}
+			cached = repaired
+		} else {
+			// Legacy cache implementations cannot compare-and-set a partially
+			// initialized record. Use a deterministic repair value so concurrent
+			// callers still converge even if their normal Set operations race.
+			cached.ClientID = generateStableFallbackClientID(accountID, cached)
+			needWrite = true
+		}
+	}
+
+	// 检查客户端的user-agent是否是更新版本
+	clientUA := headers.Get("User-Agent")
+	if clientUA != "" && isNewerVersion(clientUA, cached.UserAgent) {
+		// 版本升级：merge 语义 — 仅更新请求中实际携带的字段，保留缓存值
+		// 避免缺失的头被硬编码默认值覆盖（如新 CLI 版本 + 旧 SDK 默认值的不一致）
+		mergeHeadersIntoFingerprint(cached, headers)
+		needWrite = true
+		logger.LegacyPrintf("service.identity", "Updated fingerprint for account %d: %s (merge update)", accountID, clientUA)
+	} else if time.Since(time.Unix(cached.UpdatedAt, 0)) > 24*time.Hour {
+		// 距上次写入超过24小时，续期TTL
+		needWrite = true
+	}
+
+	if needWrite {
+		cached.UpdatedAt = time.Now().Unix()
+		if err := s.cache.SetFingerprint(ctx, accountID, cached); err != nil {
+			return nil, fmt.Errorf("persist fingerprint for account %d: %w", accountID, err)
+		}
+	}
+	return cached, nil
+}
+
+func generateStableFallbackClientID(accountID int64, fp *Fingerprint) string {
+	if fp == nil {
+		hash := sha256.Sum256([]byte(fmt.Sprintf("legacy-fingerprint:%d", accountID)))
+		return hex.EncodeToString(hash[:])
+	}
+	seed := strings.Join([]string{
+		"legacy-fingerprint",
+		strconv.FormatInt(accountID, 10),
+		fp.UserAgent,
+		fp.StainlessLang,
+		fp.StainlessPackageVersion,
+		fp.StainlessOS,
+		fp.StainlessArch,
+		fp.StainlessRuntime,
+		fp.StainlessRuntimeVersion,
+	}, "\x00")
+	hash := sha256.Sum256([]byte(seed))
+	return hex.EncodeToString(hash[:])
 }
 
 // ResolveStableAccountIdentity resolves the account-scoped identity used for
@@ -396,47 +494,85 @@ func (s *IdentityService) GetOrCreateMaskedSessionID(ctx context.Context, accoun
 	if s == nil || s.cache == nil {
 		return "", errors.New("identity cache is unavailable")
 	}
+	if atomicStore, ok := s.cache.(MaskedSessionIDAtomicStore); ok {
+		return s.getOrCreateMaskedSessionIDAtomically(ctx, accountID, atomicStore)
+	}
+	if claimer, ok := s.cache.(MaskedSessionIDAtomicClaimStore); ok {
+		return s.getOrCreateMaskedSessionIDWithAtomicClaim(ctx, accountID, claimer)
+	}
+
 	maskedSessionID, err := s.cache.GetMaskedSessionID(ctx, accountID)
 	if err != nil {
 		return "", fmt.Errorf("get masked session ID for account %d: %w", accountID, err)
 	}
 	if maskedSessionID == "" {
-		candidate := generateRandomUUID()
-		if claimer, ok := s.cache.(MaskedSessionIDAtomicClaimStore); ok {
-			claimed, claimErr := claimer.TryClaimMaskedSessionID(ctx, accountID, candidate)
-			if claimErr != nil {
-				return "", fmt.Errorf("claim masked session ID for account %d: %w", accountID, claimErr)
-			}
-			if claimed {
-				logger.LegacyPrintf("service.identity", "Claimed new masked session ID for account %d: %s", accountID, candidate)
-				return candidate, nil
-			}
-
-			// A concurrent caller won the cold-cache race. Re-read its value and
-			// refresh its TTL; never overwrite it with this request's candidate.
-			maskedSessionID, err = s.cache.GetMaskedSessionID(ctx, accountID)
-			if err != nil {
-				return "", fmt.Errorf("get winning masked session ID for account %d: %w", accountID, err)
-			}
-			if maskedSessionID == "" {
-				return "", fmt.Errorf("winning masked session ID for account %d is unavailable", accountID)
-			}
-			if err := s.cache.SetMaskedSessionID(ctx, accountID, maskedSessionID); err != nil {
-				return "", fmt.Errorf("refresh masked session ID for account %d: %w", accountID, err)
-			}
-			return maskedSessionID, nil
-		}
-
 		// Legacy IdentityCache implementations do not support atomic claims.
 		// Keep their historical behavior rather than making the new capability a
 		// breaking interface requirement.
-		maskedSessionID = candidate
+		maskedSessionID = generateRandomUUID()
 		logger.LegacyPrintf("service.identity", "Generated new masked session ID for account %d: %s", accountID, maskedSessionID)
 	}
 	if err := s.cache.SetMaskedSessionID(ctx, accountID, maskedSessionID); err != nil {
 		return "", fmt.Errorf("persist masked session ID for account %d: %w", accountID, err)
 	}
 	return maskedSessionID, nil
+}
+
+// getOrCreateMaskedSessionIDWithAtomicClaim preserves the old SETNX-only
+// extension contract without reintroducing a stale GET → SET TTL refresh. A
+// cache that cannot atomically refresh may let the original TTL expire; that
+// is preferable to overwriting a newer winner and splitting a live session.
+func (s *IdentityService) getOrCreateMaskedSessionIDWithAtomicClaim(ctx context.Context, accountID int64, claimer MaskedSessionIDAtomicClaimStore) (string, error) {
+	maskedSessionID, err := s.cache.GetMaskedSessionID(ctx, accountID)
+	if err != nil {
+		return "", fmt.Errorf("get masked session ID for account %d: %w", accountID, err)
+	}
+	if maskedSessionID != "" {
+		return maskedSessionID, nil
+	}
+
+	candidate := generateRandomUUID()
+	claimed, claimErr := claimer.TryClaimMaskedSessionID(ctx, accountID, candidate)
+	if claimErr != nil {
+		return "", fmt.Errorf("claim masked session ID for account %d: %w", accountID, claimErr)
+	}
+	if claimed {
+		logger.LegacyPrintf("service.identity", "Claimed new masked session ID for account %d: %s", accountID, candidate)
+		return candidate, nil
+	}
+
+	maskedSessionID, err = s.cache.GetMaskedSessionID(ctx, accountID)
+	if err != nil {
+		return "", fmt.Errorf("get winning masked session ID for account %d: %w", accountID, err)
+	}
+	if maskedSessionID == "" {
+		return "", fmt.Errorf("winning masked session ID for account %d is unavailable", accountID)
+	}
+	return maskedSessionID, nil
+}
+
+func (s *IdentityService) getOrCreateMaskedSessionIDAtomically(ctx context.Context, accountID int64, store MaskedSessionIDAtomicStore) (string, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		maskedSessionID, err := store.GetAndRefreshMaskedSessionID(ctx, accountID)
+		if err != nil {
+			return "", fmt.Errorf("get and refresh masked session ID for account %d: %w", accountID, err)
+		}
+		if maskedSessionID != "" {
+			return maskedSessionID, nil
+		}
+
+		candidate := generateRandomUUID()
+		claimed, claimErr := store.TryClaimMaskedSessionID(ctx, accountID, candidate)
+		if claimErr != nil {
+			return "", fmt.Errorf("claim masked session ID for account %d: %w", accountID, claimErr)
+		}
+		if claimed {
+			logger.LegacyPrintf("service.identity", "Claimed new masked session ID for account %d: %s", accountID, candidate)
+			return candidate, nil
+		}
+	}
+
+	return "", fmt.Errorf("winning masked session ID for account %d is unavailable", accountID)
 }
 
 // generateRandomUUID 生成随机 UUID v4 格式字符串

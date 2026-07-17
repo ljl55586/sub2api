@@ -790,6 +790,29 @@ func TestGatewayServiceForward_OAuthMimicCompanionBetaPolicyBlockRejectsGenerate
 	require.Never(t, func() bool { return upstream.Count() > 0 }, 100*time.Millisecond, 10*time.Millisecond)
 }
 
+// 伴生请求只能在主请求完成最终 beta 策略校验后才有资格发出。extended-cache-ttl
+// 只存在于主请求 profile，用它能覆盖“伴生自身并未被 block”的错误顺序。
+func TestGatewayServiceForward_OAuthMimicMainOnlyBetaBlockSendsNoCompanions(t *testing.T) {
+	svc, c, account, parsed, upstream := newClaudeOAuthCompanionForwardHarness(t)
+	policyJSON, err := json.Marshal(BetaPolicySettings{Rules: []BetaPolicyRule{{
+		BetaToken:    claude.BetaExtendedCacheTTL,
+		Action:       BetaPolicyActionBlock,
+		Scope:        BetaPolicyScopeOAuth,
+		ErrorMessage: "main-only beta is blocked",
+	}}})
+	require.NoError(t, err)
+	settings := claudeOAuthNoToolsProfileSettingsForTest(map[string]string{
+		SettingKeyBetaPolicySettings: string(policyJSON),
+	})
+	svc.settingService = NewSettingService(&gatewayTTLSettingRepo{data: settings}, svc.cfg)
+
+	result, err := svc.Forward(context.Background(), c, account, parsed)
+	var blockErr *BetaBlockedError
+	require.ErrorAs(t, err, &blockErr)
+	require.Nil(t, result)
+	require.Never(t, func() bool { return upstream.Count() > 0 }, 100*time.Millisecond, 10*time.Millisecond)
+}
+
 func TestGatewayServiceForward_OAuthMimicCompanionBetaPolicyBlockSkipsOnlyTitleForTitleOnlyBeta(t *testing.T) {
 	svc, c, account, parsed, upstream := newClaudeOAuthCompanionForwardHarness(t)
 	policyJSON, err := json.Marshal(BetaPolicySettings{Rules: []BetaPolicyRule{{
