@@ -3,15 +3,18 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,6 +34,10 @@ const (
 
 	captureArtifactMode = 0o600
 )
+
+var expectedCaptureQuotaBetas = claude.ClaudeCodeOAuthQuotaMimicryBetas()
+
+var expectedCaptureTitleBetas = claude.ClaudeCodeOAuthTitleMimicryBetas()
 
 var expectedCaptureMainBetas = []string{
 	"claude-code-20250219",
@@ -80,10 +87,14 @@ func captureExpectedFixedHeaders() []captureExpectedFixedHeader {
 var captureReportBeforePublishHook func()
 
 type captureIdentityCache struct {
+	mu          sync.Mutex
 	fingerprint *Fingerprint
+	claimed     map[string]struct{}
 }
 
 func (c *captureIdentityCache) GetFingerprint(context.Context, int64) (*Fingerprint, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.fingerprint == nil {
 		return nil, nil
 	}
@@ -92,6 +103,8 @@ func (c *captureIdentityCache) GetFingerprint(context.Context, int64) (*Fingerpr
 }
 
 func (c *captureIdentityCache) SetFingerprint(_ context.Context, _ int64, fp *Fingerprint) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	copy := *fp
 	c.fingerprint = &copy
 	return nil
@@ -105,21 +118,180 @@ func (c *captureIdentityCache) SetMaskedSessionID(context.Context, int64, string
 	return nil
 }
 
-// captureOfflineUpstreamRecorder delegates to the in-process Anthropic test
-// recorder. It records the final wire request without ever opening a socket.
+func (c *captureIdentityCache) GetSessionAccountID(context.Context, int64, string) (int64, error) {
+	return 0, nil
+}
+
+func (c *captureIdentityCache) SetSessionAccountID(context.Context, int64, string, int64, time.Duration) error {
+	return nil
+}
+
+func (c *captureIdentityCache) RefreshSessionTTL(context.Context, int64, string, time.Duration) error {
+	return nil
+}
+
+func (c *captureIdentityCache) DeleteSessionAccountID(context.Context, int64, string) error {
+	return nil
+}
+
+func (c *captureIdentityCache) TryClaimClaudeOAuthSessionCompanions(_ context.Context, accountID int64, sessionID string, ttl time.Duration) (bool, error) {
+	if accountID <= 0 || strings.TrimSpace(sessionID) == "" || ttl <= 0 {
+		return false, nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.claimed == nil {
+		c.claimed = make(map[string]struct{})
+	}
+	key := fmt.Sprintf("%d:%s", accountID, strings.TrimSpace(sessionID))
+	if _, claimed := c.claimed[key]; claimed {
+		return false, nil
+	}
+	c.claimed[key] = struct{}{}
+	return true, nil
+}
+
+var _ GatewayCache = (*captureIdentityCache)(nil)
+var _ ClaudeOAuthSessionCompanionClaimStore = (*captureIdentityCache)(nil)
+
+type captureWireSnapshot struct {
+	Role           string
+	Request        *http.Request
+	Body           []byte
+	ResponseStatus int
+}
+
+// captureOfflineUpstreamRecorder records a deep copy of each final wire
+// request and returns a new in-process response. It never opens a socket.
 type captureOfflineUpstreamRecorder struct {
-	*anthropicHTTPUpstreamRecorder
-	calls int
+	mu        sync.Mutex
+	snapshots []captureWireSnapshot
+	notify    chan struct{}
+}
+
+func newCaptureOfflineUpstreamRecorder() *captureOfflineUpstreamRecorder {
+	return &captureOfflineUpstreamRecorder{notify: make(chan struct{}, 1)}
 }
 
 func (u *captureOfflineUpstreamRecorder) Do(req *http.Request, proxyURL string, accountID int64, accountConcurrency int) (*http.Response, error) {
-	u.calls++
-	return u.anthropicHTTPUpstreamRecorder.Do(req, proxyURL, accountID, accountConcurrency)
+	return u.DoWithTLS(req, proxyURL, accountID, accountConcurrency, nil)
 }
 
-func (u *captureOfflineUpstreamRecorder) DoWithTLS(req *http.Request, proxyURL string, accountID int64, accountConcurrency int, profile *tlsfingerprint.Profile) (*http.Response, error) {
-	u.calls++
-	return u.anthropicHTTPUpstreamRecorder.DoWithTLS(req, proxyURL, accountID, accountConcurrency, profile)
+func (u *captureOfflineUpstreamRecorder) DoWithTLS(req *http.Request, _ string, _ int64, _ int, _ *tlsfingerprint.Profile) (*http.Response, error) {
+	if req == nil {
+		return nil, fmt.Errorf("capture upstream received nil request")
+	}
+	var body []byte
+	if req.Body != nil {
+		var err error
+		body, err = io.ReadAll(req.Body)
+		if err != nil {
+			return nil, fmt.Errorf("read capture request body: %w", err)
+		}
+		_ = req.Body.Close()
+	}
+
+	role := classifyCaptureWireRequest(body)
+	response := captureOfflineResponse(role)
+	snapshot := captureWireSnapshot{
+		Role:           role,
+		Request:        cloneCaptureWireRequest(req, body),
+		Body:           bytes.Clone(body),
+		ResponseStatus: response.StatusCode,
+	}
+	u.mu.Lock()
+	u.snapshots = append(u.snapshots, snapshot)
+	u.mu.Unlock()
+	select {
+	case u.notify <- struct{}{}:
+	default:
+	}
+	return response, nil
+}
+
+func (u *captureOfflineUpstreamRecorder) WaitForCalls(want int, timeout time.Duration) bool {
+	if want <= 0 {
+		return true
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		u.mu.Lock()
+		count := len(u.snapshots)
+		u.mu.Unlock()
+		if count >= want {
+			return true
+		}
+		select {
+		case <-u.notify:
+		case <-timer.C:
+			return false
+		}
+	}
+}
+
+func (u *captureOfflineUpstreamRecorder) Snapshots() []captureWireSnapshot {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	clones := make([]captureWireSnapshot, len(u.snapshots))
+	for index, snapshot := range u.snapshots {
+		clones[index] = captureWireSnapshot{
+			Role:           snapshot.Role,
+			Request:        cloneCaptureWireRequest(snapshot.Request, snapshot.Body),
+			Body:           bytes.Clone(snapshot.Body),
+			ResponseStatus: snapshot.ResponseStatus,
+		}
+	}
+	return clones
+}
+
+func cloneCaptureWireRequest(req *http.Request, body []byte) *http.Request {
+	clone := req.Clone(req.Context())
+	clone.Header = req.Header.Clone()
+	clone.Body = io.NopCloser(bytes.NewReader(bytes.Clone(body)))
+	clone.GetBody = nil
+	clone.ContentLength = int64(len(body))
+	return clone
+}
+
+func classifyCaptureWireRequest(body []byte) string {
+	if gjson.GetBytes(body, "max_tokens").Int() == 1 &&
+		gjson.GetBytes(body, "messages.0.content").String() == "quota" {
+		return "quota"
+	}
+	if gjson.GetBytes(body, "output_config.format.type").String() == "json_schema" {
+		return "title"
+	}
+	if gjson.GetBytes(body, "stream").Bool() && gjson.GetBytes(body, "thinking.type").String() == "adaptive" {
+		return "main"
+	}
+	return "other"
+}
+
+func captureOfflineResponse(role string) *http.Response {
+	switch role {
+	case "quota":
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"type":"error","error":{"type":"rate_limit_error","message":"offline quota response"}}`)),
+		}
+	case "title":
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body: io.NopCloser(strings.NewReader(strings.Join([]string{
+				`data: {"type":"message_start","message":{"usage":{"input_tokens":10}}}`,
+				"",
+				`event: message_stop`,
+				`data: {"type":"message_stop"}`,
+				"",
+				"",
+			}, "\n"))),
+		}
+	default:
+		return claudeOAuthNoToolsProfileResponseForTest(true)
+	}
 }
 
 type captureTraceEntry struct {
@@ -139,6 +311,7 @@ type captureRequestSummary struct {
 	Source             string
 	Index              int
 	TraceRequestCount  int
+	Role               string
 	Method             string
 	Path               string
 	Model              string
@@ -147,6 +320,7 @@ type captureRequestSummary struct {
 	MaxTokensPresent   bool
 	ThinkingType       string
 	OutputFormat       bool
+	OutputFormatType   string
 	OutputEffort       string
 	TemperaturePresent bool
 
@@ -156,6 +330,7 @@ type captureRequestSummary struct {
 	ContextEditKeep          string
 
 	BetaTokenCount         int
+	BetaTokens             []string
 	BetaMatchesMainProfile bool
 	StainlessOS            string
 	UserAgentVersion       string
@@ -249,13 +424,10 @@ func TestCaptureClaudeProUpstreamRequest(t *testing.T) {
 		SettingKeyEnableAnthropicCacheTTL1hInjection:     "false",
 	}
 	cache := &captureIdentityCache{}
-	upstream := &captureOfflineUpstreamRecorder{
-		anthropicHTTPUpstreamRecorder: &anthropicHTTPUpstreamRecorder{
-			resp: claudeOAuthNoToolsProfileResponseForTest(parsed.Stream),
-		},
-	}
+	upstream := newCaptureOfflineUpstreamRecorder()
 	cfg := &config.Config{Gateway: config.GatewayConfig{MaxLineSize: defaultMaxLineSize}}
 	svc := &GatewayService{
+		cache:                cache,
 		cfg:                  cfg,
 		responseHeaderFilter: compileResponseHeaderFilter(cfg),
 		httpUpstream:         upstream,
@@ -265,16 +437,16 @@ func TestCaptureClaudeProUpstreamRequest(t *testing.T) {
 		identityService:      NewIdentityService(cache),
 	}
 
-	trace20260715, err := selectUniqueCaptureTraceMainRequest(captureTrace20260715)
+	trace20260715, err := selectCaptureTraceSessionRequests(captureTrace20260715)
 	require.NoError(t, err)
-	trace20260716, err := selectUniqueCaptureTraceMainRequest(captureTrace20260716)
+	trace20260716, err := selectCaptureTraceSessionRequests(captureTrace20260716)
 	require.NoError(t, err)
 
 	shanghai := time.FixedZone("Asia/Shanghai", 8*60*60)
 	now := time.Now().In(shanghai)
 	runID := now.Format("20060102_150405")
 	logPath := filepath.Join(captureLogDir, "log_"+runID+".log")
-	reportPath := filepath.Join(captureLogDir, "same_version_comparison_after_no_tools_alignment_"+runID+".md")
+	reportPath := filepath.Join(captureLogDir, "same_version_comparison_after_session_companions_alignment_"+runID+".md")
 	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, captureArtifactMode)
 	require.NoError(t, err, "capture log name must be new; never append to an existing artifact")
 	t.Cleanup(func() {
@@ -295,10 +467,19 @@ func TestCaptureClaudeProUpstreamRequest(t *testing.T) {
 	require.Equal(t, 9, result.Usage.InputTokens)
 	require.Equal(t, 3, result.Usage.OutputTokens)
 	require.False(t, result.ClientDisconnect)
-	require.Equal(t, 1, upstream.calls, "the capture must call only the local fake HTTPUpstream once")
-	require.NotNil(t, upstream.lastReq)
-	require.NotEmpty(t, upstream.lastBody)
-	assertAlignedCaptureRequest(t, upstream.lastReq, upstream.lastBody)
+	require.True(t, upstream.WaitForCalls(3, time.Second), "the first OAuth mimic session must capture quota, title, and main through the local fake HTTPUpstream")
+	snapshots := upstream.Snapshots()
+	require.Len(t, snapshots, 3)
+	quota := findCaptureWireSnapshot(t, snapshots, "quota")
+	title := findCaptureWireSnapshot(t, snapshots, "title")
+	main := findCaptureWireSnapshot(t, snapshots, "main")
+	require.Equal(t, http.StatusTooManyRequests, quota.ResponseStatus)
+	require.Equal(t, http.StatusOK, title.ResponseStatus)
+	require.Equal(t, http.StatusOK, main.ResponseStatus)
+	assertAlignedCaptureQuotaRequest(t, quota.Request, quota.Body)
+	assertAlignedCaptureTitleRequest(t, title.Request, title.Body)
+	assertAlignedCaptureMainRequest(t, main.Request, main.Body)
+	assertCaptureWireSessionsMatch(t, quota, title, main)
 	require.Equal(t, http.StatusOK, recorder.Code)
 	require.Contains(t, recorder.Body.String(), "message_start")
 	require.Contains(t, recorder.Body.String(), "event: message_stop")
@@ -307,6 +488,8 @@ func TestCaptureClaudeProUpstreamRequest(t *testing.T) {
 	logBytes, err := os.ReadFile(logPath)
 	require.NoError(t, err)
 	require.NotEmpty(t, logBytes)
+	require.Contains(t, string(logBytes), "UPSTREAM_SESSION_COMPANION_QUOTA")
+	require.Contains(t, string(logBytes), "UPSTREAM_SESSION_COMPANION_TITLE")
 	require.Contains(t, string(logBytes), "UPSTREAM_FORWARD")
 	require.Contains(t, string(logBytes), `"thinking": {`)
 	require.Contains(t, string(logBytes), `"output_config": {`)
@@ -318,22 +501,19 @@ func TestCaptureClaudeProUpstreamRequest(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, os.FileMode(captureArtifactMode), logInfo.Mode().Perm())
 
-	synthetic, err := summarizeCaptureRequest("offline synthetic capture", -1, upstream.lastReq.Method, upstream.lastReq.URL.String(), upstream.lastReq.Header, upstream.lastBody)
+	synthetic, err := summarizeCaptureSessionSnapshots("offline synthetic capture", snapshots)
 	require.NoError(t, err)
-	report := buildNoToolsAlignmentCaptureReport(now, []captureRequestSummary{trace20260715, trace20260716}, synthetic)
+	report := buildSessionCompanionsAlignmentCaptureReport(now, trace20260715, trace20260716, synthetic)
 	require.Contains(t, report, "Bearer [redacted]")
 	require.Contains(t, report, "device_id=[redacted]")
 	require.Contains(t, report, "## 上游识别风险")
-	require.Contains(t, report, "部分对齐；仍有结构差异")
-	require.Contains(t, report, "| `model` / `stream` |")
-	require.Contains(t, report, "| `max_tokens` |")
-	require.Contains(t, report, "不同；下游显式值已保留")
-	require.Contains(t, report, "| `thinking.type` |")
-	require.Contains(t, report, "| `output_config` |")
-	require.Contains(t, report, "effort=high；format=缺失")
-	require.Contains(t, report, "| `context_management.edits[0]` |")
-	require.Contains(t, report, "edits=1；type=clear_thinking_20251015；keep=all")
-	require.Contains(t, report, "| `temperature` |")
+	require.Contains(t, report, "## quota：trace15 与合成 capture")
+	require.Contains(t, report, "## title：trace15 与合成 capture")
+	require.Contains(t, report, "## main：trace15 与合成 capture")
+	require.Contains(t, report, "有序 `anthropic-beta`")
+	require.Contains(t, report, "output_config.effort=high")
+	require.Contains(t, report, "trace16")
+	require.Contains(t, report, "仅为观察事实")
 	require.Contains(t, report, "## 固定 Header profile")
 	require.Contains(t, report, "| `accept` |")
 	require.Contains(t, report, "| `x-claude-code-session-id` |")
@@ -342,8 +522,10 @@ func TestCaptureClaudeProUpstreamRequest(t *testing.T) {
 	require.NotContains(t, report, "11111111-2222-4333-8444-555555555555")
 	require.NotContains(t, report, "cch=")
 	require.NotContains(t, report, "Hello, please introduce yourself.")
-	_, err = writeCaptureReportAtomically(reportPath, []byte(report))
+	require.NotContains(t, report, claudeOAuthCompanionTitleSystemPrompt)
+	published, err := writeCaptureReportAtomically(reportPath, []byte(report))
 	require.NoError(t, err)
+	require.True(t, published)
 	reportInfo, err := os.Stat(reportPath)
 	require.NoError(t, err)
 	require.Equal(t, os.FileMode(captureArtifactMode), reportInfo.Mode().Perm())
@@ -351,29 +533,118 @@ func TestCaptureClaudeProUpstreamRequest(t *testing.T) {
 	t.Logf("COMPARISON_REPORT=%s", reportPath)
 }
 
-func assertAlignedCaptureRequest(t *testing.T, req *http.Request, body []byte) {
+func findCaptureWireSnapshot(t *testing.T, snapshots []captureWireSnapshot, role string) captureWireSnapshot {
 	t.Helper()
+	for _, snapshot := range snapshots {
+		if snapshot.Role == role {
+			return snapshot
+		}
+	}
+	require.FailNow(t, "captured upstream snapshot not found", "role=%s", role)
+	return captureWireSnapshot{}
+}
+
+func assertCaptureWireSessionsMatch(t *testing.T, quota, title, main captureWireSnapshot) {
+	t.Helper()
+	quotaSession := captureWireSession(t, quota.Request, quota.Body)
+	require.Equal(t, quotaSession, captureWireSession(t, title.Request, title.Body), "title session must match quota")
+	require.Equal(t, quotaSession, captureWireSession(t, main.Request, main.Body), "main session must match quota")
+}
+
+func captureWireSession(t *testing.T, req *http.Request, body []byte) string {
+	t.Helper()
+	require.NotNil(t, req)
+	userID := gjson.GetBytes(body, "metadata.user_id").String()
+	require.True(t, gjson.Valid(userID))
+	metadata := ParseMetadataUserID(userID)
+	require.NotNil(t, metadata)
+	require.NotEmpty(t, metadata.SessionID)
+	require.Equal(t, metadata.SessionID, getHeaderRaw(req.Header, "x-claude-code-session-id"))
+	return metadata.SessionID
+}
+
+func assertAlignedCaptureCommonRequest(t *testing.T, req *http.Request, body []byte, expectedBetas []string) {
+	t.Helper()
+	require.NotNil(t, req)
 	require.Equal(t, claudeAPIURL, req.URL.String())
 	require.Equal(t, claude.DefaultHeaders["User-Agent"], getHeaderRaw(req.Header, "User-Agent"))
-	require.Equal(t, "MacOS", getHeaderRaw(req.Header, "x-stainless-os"))
+	require.Equal(t, claude.DefaultStainlessOS, getHeaderRaw(req.Header, "x-stainless-os"))
 	require.Empty(t, getHeaderRaw(req.Header, "x-client-request-id"))
 	require.Empty(t, getHeaderRaw(req.Header, "x-stainless-helper-method"))
 	require.NotEmpty(t, getHeaderRaw(req.Header, "x-claude-code-session-id"))
-	require.Equal(t, expectedCaptureMainBetas, parseAnthropicBetaHeader(getHeaderRaw(req.Header, "anthropic-beta")))
+	require.Equal(t, expectedBetas, parseAnthropicBetaHeader(getHeaderRaw(req.Header, "anthropic-beta")))
+	captureWireSession(t, req, body)
+}
+
+func assertCaptureTopLevelKeys(t *testing.T, body []byte, expected ...string) {
+	t.Helper()
+	var object map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(body, &object))
+	require.Len(t, object, len(expected))
+	for _, key := range expected {
+		require.Contains(t, object, key)
+	}
+}
+
+func assertAlignedCaptureQuotaRequest(t *testing.T, req *http.Request, body []byte) {
+	t.Helper()
+	assertAlignedCaptureCommonRequest(t, req, body, expectedCaptureQuotaBetas)
+	assertCaptureTopLevelKeys(t, body, "max_tokens", "messages", "metadata", "model")
+	require.Equal(t, "claude-opus-4-8", gjson.GetBytes(body, "model").String())
+	require.Equal(t, int64(1), gjson.GetBytes(body, "max_tokens").Int())
+	require.Equal(t, "user", gjson.GetBytes(body, "messages.0.role").String())
+	require.Equal(t, "quota", gjson.GetBytes(body, "messages.0.content").String())
+}
+
+func assertAlignedCaptureTitleRequest(t *testing.T, req *http.Request, body []byte) {
+	t.Helper()
+	assertAlignedCaptureCommonRequest(t, req, body, expectedCaptureTitleBetas)
+	assertCaptureTopLevelKeys(t, body, "max_tokens", "messages", "metadata", "model", "output_config", "stream", "system", "tools")
+	require.Equal(t, "claude-opus-4-8", gjson.GetBytes(body, "model").String())
+	require.Equal(t, int64(64000), gjson.GetBytes(body, "max_tokens").Int())
+	require.True(t, gjson.GetBytes(body, "stream").Bool())
+	require.True(t, gjson.GetBytes(body, "tools").IsArray())
+	require.Empty(t, gjson.GetBytes(body, "tools").Array())
+	require.False(t, gjson.GetBytes(body, "thinking").Exists())
+	require.False(t, gjson.GetBytes(body, "context_management").Exists())
+	require.False(t, gjson.GetBytes(body, "temperature").Exists())
+	require.Equal(t, "json_schema", gjson.GetBytes(body, "output_config.format.type").String())
+	require.Equal(t, "high", gjson.GetBytes(body, "output_config.effort").String())
+	require.Equal(t, "object", gjson.GetBytes(body, "output_config.format.schema.type").String())
+	require.Equal(t, "string", gjson.GetBytes(body, "output_config.format.schema.properties.title.type").String())
+	require.Equal(t, "title", gjson.GetBytes(body, "output_config.format.schema.required.0").String())
+	require.False(t, gjson.GetBytes(body, "output_config.format.schema.additionalProperties").Bool())
+
+	message := gjson.GetBytes(body, "messages.0")
+	require.Equal(t, "user", message.Get("role").String())
+	require.True(t, message.Get("content").IsArray())
+	require.Len(t, message.Get("content").Array(), 1)
+	require.Equal(t, "text", message.Get("content.0.type").String())
+	require.NotEmpty(t, message.Get("content.0.text").String())
+
+	system := gjson.GetBytes(body, "system")
+	require.True(t, system.IsArray())
+	require.Len(t, system.Array(), 3)
+	for _, block := range system.Array() {
+		require.Equal(t, "text", block.Get("type").String())
+		require.NotEmpty(t, block.Get("text").String())
+		require.False(t, block.Get("cache_control").Exists())
+	}
+	billingText := system.Get("0.text").String()
+	require.Equal(t, "cc_version="+ExtractCLIVersion(getHeaderRaw(req.Header, "User-Agent")), ccVersionInBillingRe.FindString(billingText))
+	require.Contains(t, billingText, "cc_entrypoint=cli;")
+	require.NotContains(t, billingText, "cch=")
+}
+
+func assertAlignedCaptureMainRequest(t *testing.T, req *http.Request, body []byte) {
+	t.Helper()
+	assertAlignedCaptureCommonRequest(t, req, body, expectedCaptureMainBetas)
 
 	billingText := gjson.GetBytes(body, "system.0.text").String()
 	require.Equal(t, "cc_version="+ExtractCLIVersion(getHeaderRaw(req.Header, "User-Agent")), ccVersionInBillingRe.FindString(billingText))
 	require.Contains(t, billingText, "cc_entrypoint=cli;")
 	require.NotContains(t, billingText, "cch=")
 	require.False(t, gjson.GetBytes(body, "system.0.cache_control").Exists())
-
-	userID := gjson.GetBytes(body, "metadata.user_id").String()
-	require.True(t, gjson.Valid(userID))
-	parsedUserID := ParseMetadataUserID(userID)
-	require.NotNil(t, parsedUserID)
-	require.NotEmpty(t, parsedUserID.DeviceID)
-	require.Equal(t, "11111111-2222-4333-8444-555555555555", parsedUserID.AccountUUID)
-	require.Equal(t, parsedUserID.SessionID, getHeaderRaw(req.Header, "x-claude-code-session-id"))
 
 	require.False(t, gjson.GetBytes(body, "temperature").Exists())
 	require.Equal(t, "adaptive", gjson.GetBytes(body, "thinking.type").String())
@@ -444,22 +715,30 @@ func countCaptureCacheControlsValue(value any) int {
 	}
 }
 
-func selectUniqueCaptureTraceMainRequest(tracePath string) (captureRequestSummary, error) {
+type captureSessionRequests struct {
+	Source       string
+	RequestCount int
+	Quota        *captureRequestSummary
+	Title        *captureRequestSummary
+	Main         *captureRequestSummary
+}
+
+func selectCaptureTraceSessionRequests(tracePath string) (captureSessionRequests, error) {
 	source := filepath.Base(tracePath)
 	raw, err := os.ReadFile(tracePath)
 	if err != nil {
-		return captureRequestSummary{}, fmt.Errorf("read trace %s: %w", source, err)
+		return captureSessionRequests{}, fmt.Errorf("read trace %s: %w", source, err)
 	}
 
 	var entries []captureTraceEntry
 	if err := json.Unmarshal(raw, &entries); err != nil {
-		return captureRequestSummary{}, fmt.Errorf("parse trace %s: invalid JSON", source)
+		return captureSessionRequests{}, fmt.Errorf("parse trace %s: invalid JSON", source)
 	}
 	if len(entries) == 0 {
-		return captureRequestSummary{}, fmt.Errorf("trace %s has no requests", source)
+		return captureSessionRequests{}, fmt.Errorf("trace %s has no requests", source)
 	}
 
-	candidates := make([]captureRequestSummary, 0, 1)
+	requests := captureSessionRequests{Source: source, RequestCount: len(entries)}
 	for index, entry := range entries {
 		headers := make(http.Header, len(entry.Request.Headers))
 		for key, value := range entry.Request.Headers {
@@ -467,22 +746,67 @@ func selectUniqueCaptureTraceMainRequest(tracePath string) (captureRequestSummar
 		}
 		summary, err := summarizeCaptureRequest(source, index, entry.Request.Method, entry.Request.URL, headers, entry.Request.Body)
 		if err != nil {
-			return captureRequestSummary{}, fmt.Errorf("trace %s request index %d cannot be summarized safely: %w", source, index, err)
+			return captureSessionRequests{}, fmt.Errorf("trace %s request index %d cannot be summarized safely: %w", source, index, err)
 		}
 		summary.TraceRequestCount = len(entries)
-		if isCaptureMainRequest(summary) {
-			candidates = append(candidates, summary)
+		summary.Role = classifyCaptureWireRequest(entry.Request.Body)
+		if err := addCaptureSessionRequest(&requests, summary); err != nil {
+			return captureSessionRequests{}, fmt.Errorf("trace %s request index %d: %w", source, index, err)
 		}
 	}
 
-	if len(candidates) != 1 {
-		return captureRequestSummary{}, fmt.Errorf(
-			"trace %s expected exactly one main-request candidate; candidates=%s",
-			source,
-			formatCaptureCandidates(candidates),
-		)
+	if requests.Quota == nil || requests.Main == nil {
+		return captureSessionRequests{}, fmt.Errorf("trace %s must contain exactly one quota and one main request", source)
 	}
-	return candidates[0], nil
+	return requests, nil
+}
+
+func summarizeCaptureSessionSnapshots(source string, snapshots []captureWireSnapshot) (captureSessionRequests, error) {
+	requests := captureSessionRequests{Source: source, RequestCount: len(snapshots)}
+	for index, snapshot := range snapshots {
+		if snapshot.Request == nil {
+			return captureSessionRequests{}, fmt.Errorf("capture snapshot %d has no request", index)
+		}
+		summary, err := summarizeCaptureRequest(source, index, snapshot.Request.Method, snapshot.Request.URL.String(), snapshot.Request.Header, snapshot.Body)
+		if err != nil {
+			return captureSessionRequests{}, fmt.Errorf("capture snapshot %d cannot be summarized safely: %w", index, err)
+		}
+		summary.Role = snapshot.Role
+		if err := addCaptureSessionRequest(&requests, summary); err != nil {
+			return captureSessionRequests{}, fmt.Errorf("capture snapshot %d: %w", index, err)
+		}
+	}
+	if requests.Quota == nil || requests.Title == nil || requests.Main == nil {
+		return captureSessionRequests{}, fmt.Errorf("offline capture must contain exactly one quota, title, and main request")
+	}
+	return requests, nil
+}
+
+func addCaptureSessionRequest(requests *captureSessionRequests, summary captureRequestSummary) error {
+	if requests == nil {
+		return fmt.Errorf("nil capture session")
+	}
+	copy := summary
+	switch summary.Role {
+	case "quota":
+		if requests.Quota != nil {
+			return fmt.Errorf("duplicate quota request")
+		}
+		requests.Quota = &copy
+	case "title":
+		if requests.Title != nil {
+			return fmt.Errorf("duplicate title request")
+		}
+		requests.Title = &copy
+	case "main":
+		if requests.Main != nil {
+			return fmt.Errorf("duplicate main request")
+		}
+		requests.Main = &copy
+	default:
+		return fmt.Errorf("unexpected request role %q", summary.Role)
+	}
+	return nil
 }
 
 func summarizeCaptureRequest(source string, index int, method, rawURL string, headers http.Header, body []byte) (captureRequestSummary, error) {
@@ -513,6 +837,7 @@ func summarizeCaptureRequest(source string, index int, method, rawURL string, he
 	summary.ThinkingType = gjson.GetBytes(body, "thinking.type").String()
 	outputConfig := gjson.GetBytes(body, "output_config")
 	summary.OutputFormat = outputConfig.Get("format").Exists()
+	summary.OutputFormatType = captureSafeOutputFormatType(outputConfig.Get("format.type").String())
 	summary.OutputEffort = outputConfig.Get("effort").String()
 	summary.TemperaturePresent = gjson.GetBytes(body, "temperature").Exists()
 
@@ -530,6 +855,7 @@ func summarizeCaptureRequest(source string, index int, method, rawURL string, he
 
 	betaTokens := parseAnthropicBetaHeader(getHeaderRaw(headers, "anthropic-beta"))
 	summary.BetaTokenCount = len(betaTokens)
+	summary.BetaTokens = captureSafeBetaTokens(betaTokens)
 	summary.BetaMatchesMainProfile = captureStringSlicesEqual(betaTokens, expectedCaptureMainBetas)
 	summary.StainlessOS = getHeaderRaw(headers, "x-stainless-os")
 	summary.UserAgentVersion = ExtractCLIVersion(getHeaderRaw(headers, "user-agent"))
@@ -756,77 +1082,274 @@ func captureSafeModel(value string) string {
 	return "other"
 }
 
-func buildNoToolsAlignmentCaptureReport(now time.Time, traces []captureRequestSummary, synthetic captureRequestSummary) string {
+func buildSessionCompanionsAlignmentCaptureReport(now time.Time, trace15, trace16, synthetic captureSessionRequests) string {
 	var report strings.Builder
-	fmt.Fprintf(&report, "# Claude OAuth 无工具主请求离线对齐报告\n\n生成时间：%s\n\n", now.Format("2006-01-02 15:04:05 MST"))
-	report.WriteString("## 证据边界与脱敏\n\n")
-	report.WriteString("- 两份真实 trace 仅在进程内读取，用结构条件唯一选择主请求；报告不会写入其原始 header 或 body。\n")
-	report.WriteString("- authorization 统一表示为 `Bearer [redacted]`；metadata 三元组的三个值均表示为 `[redacted]`；CCH 仅报告存在性；system/messages 原文永不输出。\n")
-	report.WriteString("- 合成 capture 只使用测试账号、测试 token 与固定输入；它完整调用 `GatewayService.Forward`，但 HTTPUpstream 是进程内 fake recorder，不建立网络连接。\n\n")
+	fmt.Fprintf(&report, "# Claude OAuth 首问 quota/title/main 离线对齐报告\n\n生成时间：%s\n\n", now.Format("2006-01-02 15:04:05 MST"))
 
-	report.WriteString("## 真实主请求的结构化选择\n\n")
-	report.WriteString("| trace | 数组索引 | 满足的唯一条件 | 会话请求数 |\n|---|---:|---|---:|\n")
-	for _, trace := range traces {
-		fmt.Fprintf(&report, "| `%s` | %d | POST /v1/messages；stream=true；thinking.type=adaptive；max_tokens!=1；无 output_config.format | %d |\n", trace.Source, trace.Index, trace.TraceRequestCount)
+	report.WriteString("## 证据边界与脱敏\n\n")
+	report.WriteString("- 两份真实 trace 仅在进程内读取并按结构分类；报告不保留原始 header、metadata、CCH、认证值、首问或 title system prompt。\n")
+	report.WriteString("- 合成 capture 完整调用 `GatewayService.Forward`，但 HTTPUpstream 是进程内 fake recorder；不会建立网络连接或使用真实账号。\n")
+	report.WriteString("- 下文只列角色、字段存在性、固定 header 的预期匹配状态、公开 beta 名称及顺序、block 类型/数量/长度、以及脱敏的一致性布尔值。\n\n")
+
+	report.WriteString("## 会话角色观察\n\n")
+	report.WriteString("| 来源 | 捕获请求数 | quota | title | main |\n|---|---:|---|---|---|\n")
+	writeCaptureSessionObservation(&report, trace15)
+	writeCaptureSessionObservation(&report, trace16)
+	writeCaptureSessionObservation(&report, synthetic)
+
+	writeCaptureRoleComparison(&report, "quota", trace15.Quota, synthetic.Quota)
+	writeCaptureRoleComparison(&report, "title", trace15.Title, synthetic.Title)
+	writeCaptureRoleComparison(&report, "main", trace15.Main, synthetic.Main)
+
+	report.WriteString("## trace16 的伴生请求观察\n\n")
+	fmt.Fprintf(&report, "`%s` 共记录 %d 个请求：quota=%s，title=%s，main=%s。", trace16.Source, trace16.RequestCount, captureReportRolePresence(trace16.Quota), captureReportRolePresence(trace16.Title), captureReportRolePresence(trace16.Main))
+	if trace16.Title == nil {
+		report.WriteString("其中未观察到 title；这仅为观察事实，不能据此证明 title 的状态机、持久化规则或所有会话的发送条件。\n\n")
+	} else {
+		report.WriteString("该 trace 中也观察到 title；这同样不能单独证明其完整状态机。\n\n")
 	}
 
-	report.WriteString("\n## 逐字段白名单比较\n\n")
-	report.WriteString("| 字段 | 真实 trace（两份） | 合成离线 capture | 结论 |\n|---|---|---|---|\n")
-	fmt.Fprintf(&report, "| 有序主请求 beta | %s | %d 项；与主 profile 精确有序匹配=%t | %s |\n", captureTraceStatus(traces, captureBetaStatus), synthetic.BetaTokenCount, synthetic.BetaMatchesMainProfile, captureExpectedFieldVerdict(traces, synthetic, captureExpectedMainBeta))
-	fmt.Fprintf(&report, "| `x-stainless-os` | %s | %s | %s |\n", captureTraceStatus(traces, captureOSStatus), captureOSStatus(synthetic), captureExpectedFieldVerdict(traces, synthetic, captureExpectedStainlessOS))
-	fmt.Fprintf(&report, "| billing / 最终 UA semver | %s | %s | %s |\n", captureTraceStatus(traces, captureBillingStatus), captureBillingStatus(synthetic), captureExpectedFieldVerdict(traces, synthetic, captureExpectedBillingVersion))
-	fmt.Fprintf(&report, "| metadata/session | %s | %s | %s；三元组值均脱敏 |\n", captureTraceStatus(traces, captureMetadataStatus), captureMetadataStatus(synthetic), captureExpectedFieldVerdict(traces, synthetic, captureExpectedMetadataSession))
-	fmt.Fprintf(&report, "| 删除的 identity helper headers | %s | x-client-request-id=%t；x-stainless-helper-method=%t | %s |\n", captureTraceStatus(traces, captureDeletedHeaderStatus), synthetic.ClientRequestIDPresent, synthetic.HelperMethodPresent, captureExpectedFieldVerdict(traces, synthetic, captureExpectedDeletedHeaders))
-	fmt.Fprintf(&report, "| `model` / `stream` | %s | %s | %s |\n", captureTraceStatus(traces, captureModelStreamStatus), captureModelStreamStatus(synthetic), captureExpectedFieldVerdict(traces, synthetic, captureExpectedModelStream))
-	fmt.Fprintf(&report, "| `max_tokens` | %s | %s | %s |\n", captureTraceStatus(traces, captureMaxTokensStatus), captureMaxTokensStatus(synthetic), captureMaxTokensVerdict(traces, synthetic))
-	fmt.Fprintf(&report, "| `thinking.type` | %s | %s | %s |\n", captureTraceStatus(traces, captureThinkingStatus), captureThinkingStatus(synthetic), captureExpectedFieldVerdict(traces, synthetic, captureExpectedThinking))
-	fmt.Fprintf(&report, "| `output_config` | %s | %s | %s；与 effort beta 自洽 |\n", captureTraceStatus(traces, captureOutputConfigStatus), captureOutputConfigStatus(synthetic), captureExpectedFieldVerdict(traces, synthetic, captureExpectedOutputConfig))
-	fmt.Fprintf(&report, "| `context_management.edits[0]` | %s | %s | %s；与 context-management beta 自洽 |\n", captureTraceStatus(traces, captureContextManagementStatus), captureContextManagementStatus(synthetic), captureExpectedFieldVerdict(traces, synthetic, captureExpectedContextManagement))
-	fmt.Fprintf(&report, "| `temperature` | %s | %s | %s |\n", captureTraceStatus(traces, captureTemperatureStatus), captureTemperatureStatus(synthetic), captureExpectedFieldVerdict(traces, synthetic, captureExpectedTemperatureAbsent))
-	fmt.Fprintf(&report, "| cache_control 布局 | %s | %s | 部分对齐；仍有结构差异（仅输出位置/类型/TTL） |\n", captureTraceStatus(traces, captureCacheLayout), captureCacheLayout(synthetic))
-	fmt.Fprintf(&report, "| system/messages 结构 | %s | %s | 部分对齐；仍有结构差异（文本只列 block 类型与长度） |\n", captureTraceStatus(traces, capturePromptLayout), capturePromptLayout(synthetic))
-	fmt.Fprintf(&report, "| authorization | %s | %s | 值已脱敏 |\n", captureTraceStatus(traces, captureAuthorizationStatus), captureAuthorizationStatus(synthetic))
-	fmt.Fprintf(&report, "| tools / tool_choice | %s | %s | 有意保留差异 |\n", captureTraceStatus(traces, captureToolsStatus), captureToolsStatus(synthetic))
-	fmt.Fprintf(&report, "| CCH | %s | %s | 有意不生成或复制 |\n", captureTraceStatus(traces, captureCCHStatus), captureCCHStatus(synthetic))
-
-	report.WriteString("\n## 固定 Header profile\n\n")
-	report.WriteString("下表只输出与固定预期的匹配状态；不保留任意未知 header 原值。\n\n")
-	report.WriteString("| Header | 真实 trace（两份） | 合成离线 capture | 结论 |\n|---|---|---|---|\n")
+	report.WriteString("## 固定 Header profile\n\n")
+	report.WriteString("下表仅报告固定预期是否匹配，未知 header 原值不会写入报告。\n\n")
+	report.WriteString("| Header | quota（trace15 / 合成） | title（trace15 / 合成） | main（trace15 / 合成） |\n|---|---|---|---|\n")
 	for _, expected := range captureExpectedFixedHeaders() {
 		fmt.Fprintf(
 			&report,
 			"| `%s` | %s | %s | %s |\n",
 			expected.Name,
-			captureTraceStatus(traces, func(summary captureRequestSummary) string {
-				return captureFixedHeaderStatusText(summary, expected.Name)
-			}),
-			captureFixedHeaderStatusText(synthetic, expected.Name),
-			captureFixedHeaderVerdict(traces, synthetic, expected.Name),
+			captureFixedHeaderPairStatus(trace15.Quota, synthetic.Quota, expected.Name),
+			captureFixedHeaderPairStatus(trace15.Title, synthetic.Title, expected.Name),
+			captureFixedHeaderPairStatus(trace15.Main, synthetic.Main, expected.Name),
 		)
 	}
-	fmt.Fprintf(&report, "| `x-claude-code-session-id` | %s | %s | %s |\n", captureTraceStatus(traces, captureSessionHeaderStatus), captureSessionHeaderStatus(synthetic), captureSessionHeaderVerdict(traces, synthetic))
-	fmt.Fprintf(&report, "| `connection` / `accept-encoding` | %s | %s | 离线 http.Request 不验证实际 transport 层 |\n", captureTraceStatus(traces, captureTransportHeaderPresence), captureTransportHeaderPresence(synthetic))
+	fmt.Fprintf(
+		&report,
+		"| `x-claude-code-session-id` | %s | %s | %s |\n",
+		captureSessionHeaderPairStatus(trace15.Quota, synthetic.Quota),
+		captureSessionHeaderPairStatus(trace15.Title, synthetic.Title),
+		captureSessionHeaderPairStatus(trace15.Main, synthetic.Main),
+	)
+	fmt.Fprintf(
+		&report,
+		"| `connection` / `accept-encoding` | %s | %s | %s |\n",
+		captureTransportHeaderPairStatus(trace15.Quota, synthetic.Quota),
+		captureTransportHeaderPairStatus(trace15.Title, synthetic.Title),
+		captureTransportHeaderPairStatus(trace15.Main, synthetic.Main),
+	)
 
-	report.WriteString("\n## 已修复差异\n\n")
-	report.WriteString("- 主请求 beta 使用精确的 11-token 顺序，且合成请求声明 MacOS。\n")
-	report.WriteString("- billing `cc_version` 与最终发送的 User-Agent semver 一致；合成 billing block 不带 CCH。\n")
-	report.WriteString("- `thinking.type=adaptive`、`output_config.effort=high`、`context_management.edits[0]={type=clear_thinking_20251015,keep=all}` 和缺失的 `temperature` 均与两份真实主请求一致。\n")
-	report.WriteString("- 合成无工具 profile 形成 3 个 `ephemeral/1h` cache_control：两个 system block 与一个用户 text block；这只对齐数量、类型与 TTL，不宣称位置或完整 prompt 结构一致。\n")
-	report.WriteString("- metadata 三元组可解析，且其 session 与 `x-claude-code-session-id` 一致；两个已删除 helper header 均不存在。\n")
+	report.WriteString("\n## 已对齐或明确保留的差异\n\n")
+	report.WriteString("- quota、title、main 均使用各自有序的 beta profile；title 的 json schema 与 `output_config.effort=high` 一并发送。\n")
+	report.WriteString("- 三个合成请求均带可解析 metadata，且其 session 与 session header 一致；已删除的两个 helper header 均不出现。\n")
+	report.WriteString("- main 的 `max_tokens` 继续按 curl 下游显式值透传；因此它与真实 CLI 的数值不同，这不是本轮伪造为固定值的目标。\n")
+	report.WriteString("- tools 仍保持现有策略；本轮不伪造真实 CLI 的完整 tools schema、tool_choice 或 prompt 原文。\n\n")
 
-	report.WriteString("\n## 有意保留差异\n\n")
-	report.WriteString("- 合成请求的 `tools` 是显式空数组、没有 `tool_choice`，不会伪造工具 schema、role-system 或 system-reminder。\n")
-	report.WriteString("- 合成 capture 只有一个主请求，不伪造真实会话中的 quota/title 等伴生请求。\n")
-	report.WriteString("- `max_tokens` 按下游显式值透传：本次 curl 合成输入为 1024，真实 Claude Code 主请求为 64000；这不是伪造为固定 CLI 值的目标。\n")
-	report.WriteString("- 不生成、重放或复制 CCH；真实 trace 中 CCH 的具体值不写入本报告。\n")
-	report.WriteString("- 本轮不复制真实 `system/messages` 的完整结构：真实 trace 的用户 cache 位于 `content[1]`，合成请求位于 `content[0]`；真实 role=system 内容和 system[2] 文本长度也可能不同。这些是有意保留的结构差异，不属于“已修复”。\n")
+	report.WriteString("## 上游识别风险\n\n")
+	report.WriteString("不能把本离线结果视为不可识别的证明。合成请求仍不生成 CCH，而真实 trace 存在 CCH；这是明确保留的高风险差异。quota/title/main 在代码中只保证逻辑 dispatch，title 与 main 的实际写线微秒级先后、连接排队和并发复用并未由该测试证明。TLS 指纹、HTTP/2、IP/ASN、代理、连接复用以及真实 Claude Code 进程状态均未模拟。伴生请求 claim 的 TTL 为 1 小时；curl 若缺少稳定的会话输入，可能重复发送或漏发首问伴生请求。最后，首问额外增加 quota 与 title 上游流量及其可观察的失败/限流行为。\n")
 
-	report.WriteString("\n## 上游识别风险\n\n")
-	report.WriteString("不能据此离线对齐报告宣称请求不可被上游识别。真实主请求仍带有 CCH，而合成无工具请求不生成 CCH；合成请求也没有真实 tools schema、tool_choice 或 quota/title 等伴生请求序列。虽然双方各有 3 个 `ephemeral/1h` cache_control，真实用户 cache 在 `content[1]`、合成在 `content[0]`，且真实 role=system 内容与 system[2] 长度仍可不同。TLS、HTTP/2、IP/ASN、连接复用、`connection` 与 `accept-encoding` 仍未经实际写线验证。这些均是尚未消除的上游识别风险，而非已修复项。\n")
-
-	report.WriteString("\n## 传输层未知差异\n\n")
-	report.WriteString("TLS、HTTP/2 行为、IP/ASN、连接复用、`connection` 与 `accept-encoding` 由实际写线或网络环境决定；离线 http.Request capture 不对这些项目作一致性结论。\n")
 	return report.String()
+}
+
+func writeCaptureSessionObservation(report *strings.Builder, requests captureSessionRequests) {
+	fmt.Fprintf(
+		report,
+		"| `%s` | %d | %s | %s | %s |\n",
+		requests.Source,
+		requests.RequestCount,
+		captureReportRolePresence(requests.Quota),
+		captureReportRolePresence(requests.Title),
+		captureReportRolePresence(requests.Main),
+	)
+}
+
+func captureReportRolePresence(summary *captureRequestSummary) string {
+	if summary == nil {
+		return "未观察到"
+	}
+	return "存在"
+}
+
+func writeCaptureRoleComparison(report *strings.Builder, role string, trace, synthetic *captureRequestSummary) {
+	fmt.Fprintf(report, "## %s：trace15 与合成 capture\n\n", role)
+	if trace == nil || synthetic == nil {
+		fmt.Fprintf(report, "该角色缺失：trace15=%s，合成=%s。\n\n", captureReportRolePresence(trace), captureReportRolePresence(synthetic))
+		return
+	}
+	report.WriteString("| 字段 | trace15 | 合成离线 capture | 结论 |\n|---|---|---|---|\n")
+	fmt.Fprintf(report, "| method / path | %s | %s | %s |\n", captureMethodPathStatus(*trace), captureMethodPathStatus(*synthetic), captureCaptureRoleVerdict(trace, synthetic, captureExpectedMethodPath))
+	fmt.Fprintf(report, "| `model` / `stream` | %s | %s | %s |\n", captureModelStreamStatus(*trace), captureModelStreamStatus(*synthetic), captureCaptureRoleVerdict(trace, synthetic, captureExpectedRoleModelStream))
+	fmt.Fprintf(report, "| `max_tokens` | %s | %s | %s |\n", captureMaxTokensStatus(*trace), captureMaxTokensStatus(*synthetic), captureMaxTokensRoleVerdict(role, trace, synthetic))
+	fmt.Fprintf(report, "| 有序 `anthropic-beta` | %s | %s | %s |\n", captureRoleBetaStatus(*trace), captureRoleBetaStatus(*synthetic), captureCaptureRoleVerdict(trace, synthetic, captureExpectedRoleBeta))
+	fmt.Fprintf(report, "| authorization | %s | %s | 值已脱敏 |\n", captureAuthorizationStatus(*trace), captureAuthorizationStatus(*synthetic))
+	fmt.Fprintf(report, "| metadata/session | %s | %s | %s；值均脱敏 |\n", captureMetadataStatus(*trace), captureMetadataStatus(*synthetic), captureCaptureRoleVerdict(trace, synthetic, captureExpectedMetadataSession))
+	fmt.Fprintf(report, "| identity helper headers | %s | %s | %s |\n", captureDeletedHeaderStatus(*trace), captureDeletedHeaderStatus(*synthetic), captureCaptureRoleVerdict(trace, synthetic, captureExpectedDeletedHeaders))
+	fmt.Fprintf(report, "| output_config | %s | %s | %s |\n", captureSessionOutputConfigStatus(*trace), captureSessionOutputConfigStatus(*synthetic), captureCaptureRoleVerdict(trace, synthetic, captureExpectedRoleOutputConfig))
+	fmt.Fprintf(report, "| thinking/context/temperature | %s | %s | %s |\n", captureBodyControlStatus(*trace), captureBodyControlStatus(*synthetic), captureCaptureRoleVerdict(trace, synthetic, captureExpectedRoleBodyControls))
+	fmt.Fprintf(report, "| tools / tool_choice | %s | %s | 仅报告结构 |\n", captureToolsStatus(*trace), captureToolsStatus(*synthetic))
+	fmt.Fprintf(report, "| system/messages | %s | %s | 仅报告 block 类型与长度 |\n", capturePromptLayout(*trace), capturePromptLayout(*synthetic))
+	fmt.Fprintf(report, "| cache_control | %s | %s | 仅报告位置、类型与 TTL |\n", captureCacheLayout(*trace), captureCacheLayout(*synthetic))
+	fmt.Fprintf(report, "| CCH | %s | %s | 合成明确不生成 |\n\n", captureCCHStatus(*trace), captureCCHStatus(*synthetic))
+}
+
+func captureMethodPathStatus(summary captureRequestSummary) string {
+	return fmt.Sprintf("%s %s", captureSafeMethod(summary.Method), captureSafePath(summary.Path))
+}
+
+func captureExpectedMethodPath(summary captureRequestSummary) bool {
+	return summary.Method == http.MethodPost && summary.Path == "/v1/messages"
+}
+
+func captureExpectedRoleModelStream(summary captureRequestSummary) bool {
+	if summary.Model != "claude-opus-4-8" {
+		return false
+	}
+	if summary.Role == "quota" {
+		return !summary.Stream
+	}
+	return summary.Stream
+}
+
+func captureCaptureRoleVerdict(trace, synthetic *captureRequestSummary, predicate func(captureRequestSummary) bool) string {
+	if trace == nil || synthetic == nil {
+		return "缺失"
+	}
+	if predicate(*trace) && predicate(*synthetic) {
+		return "已对齐"
+	}
+	return "不一致"
+}
+
+func captureMaxTokensRoleVerdict(role string, trace, synthetic *captureRequestSummary) string {
+	if trace == nil || synthetic == nil || !trace.MaxTokensPresent || !synthetic.MaxTokensPresent {
+		return "未验证"
+	}
+	if trace.MaxTokens == synthetic.MaxTokens {
+		return "已对齐"
+	}
+	if role == "main" {
+		return "不同；下游显式值透传"
+	}
+	return "不一致"
+}
+
+func captureExpectedRoleBeta(summary captureRequestSummary) bool {
+	return captureStringSlicesEqual(summary.BetaTokens, captureExpectedBetasForRole(summary.Role))
+}
+
+func captureExpectedBetasForRole(role string) []string {
+	switch role {
+	case "quota":
+		return expectedCaptureQuotaBetas
+	case "title":
+		return expectedCaptureTitleBetas
+	case "main":
+		return expectedCaptureMainBetas
+	default:
+		return nil
+	}
+}
+
+func captureRoleBetaStatus(summary captureRequestSummary) string {
+	return fmt.Sprintf("%d 项：%s；匹配角色 profile=%t", len(summary.BetaTokens), strings.Join(summary.BetaTokens, ","), captureExpectedRoleBeta(summary))
+}
+
+func captureExpectedRoleOutputConfig(summary captureRequestSummary) bool {
+	switch summary.Role {
+	case "quota":
+		return !summary.OutputFormat && summary.OutputEffort == ""
+	case "title":
+		return summary.OutputFormatType == "json_schema" && summary.OutputEffort == "high"
+	case "main":
+		return !summary.OutputFormat && summary.OutputEffort == "high"
+	default:
+		return false
+	}
+}
+
+func captureSessionOutputConfigStatus(summary captureRequestSummary) string {
+	return fmt.Sprintf("format=%s；output_config.effort=%s", summary.OutputFormatType, captureSafeOutputEffort(summary.OutputEffort))
+}
+
+func captureExpectedRoleBodyControls(summary captureRequestSummary) bool {
+	switch summary.Role {
+	case "quota", "title":
+		return summary.ThinkingType == "" && !summary.ContextManagementPresent && !summary.TemperaturePresent
+	case "main":
+		return captureExpectedThinking(summary) && captureExpectedContextManagement(summary) && captureExpectedTemperatureAbsent(summary)
+	default:
+		return false
+	}
+}
+
+func captureBodyControlStatus(summary captureRequestSummary) string {
+	return fmt.Sprintf(
+		"thinking=%s；context_management=%s；temperature=%s",
+		captureThinkingStatus(summary),
+		captureContextManagementStatus(summary),
+		captureTemperatureStatus(summary),
+	)
+}
+
+func captureFixedHeaderPairStatus(trace, synthetic *captureRequestSummary, name string) string {
+	if trace == nil || synthetic == nil {
+		return "缺失"
+	}
+	return fmt.Sprintf("trace=%s；合成=%s", captureFixedHeaderStatusText(*trace, name), captureFixedHeaderStatusText(*synthetic, name))
+}
+
+func captureSessionHeaderPairStatus(trace, synthetic *captureRequestSummary) string {
+	if trace == nil || synthetic == nil {
+		return "缺失"
+	}
+	return fmt.Sprintf("trace=%s；合成=%s", captureSessionHeaderStatus(*trace), captureSessionHeaderStatus(*synthetic))
+}
+
+func captureTransportHeaderPairStatus(trace, synthetic *captureRequestSummary) string {
+	if trace == nil || synthetic == nil {
+		return "缺失"
+	}
+	return fmt.Sprintf("trace=%s；合成=%s", captureTransportHeaderPresence(*trace), captureTransportHeaderPresence(*synthetic))
+}
+
+func captureSafeBetaTokens(tokens []string) []string {
+	safe := make([]string, 0, len(tokens))
+	for _, token := range tokens {
+		if captureKnownBetaToken(token) {
+			safe = append(safe, token)
+			continue
+		}
+		safe = append(safe, "unknown")
+	}
+	return safe
+}
+
+func captureKnownBetaToken(token string) bool {
+	for _, expected := range expectedCaptureQuotaBetas {
+		if token == expected {
+			return true
+		}
+	}
+	for _, expected := range expectedCaptureTitleBetas {
+		if token == expected {
+			return true
+		}
+	}
+	for _, expected := range expectedCaptureMainBetas {
+		if token == expected {
+			return true
+		}
+	}
+	return false
+}
+
+func captureSafeOutputFormatType(value string) string {
+	switch value {
+	case "json_schema":
+		return value
+	case "":
+		return "缺失"
+	default:
+		return "非预期值（已省略）"
+	}
 }
 
 func captureTraceStatus(traces []captureRequestSummary, render func(captureRequestSummary) string) string {
@@ -1121,50 +1644,84 @@ func captureAllSummariesMatch(traces []captureRequestSummary, synthetic captureR
 	return true
 }
 
-func TestBuildNoToolsAlignmentCaptureReportListsBodyControlFields(t *testing.T) {
-	trace := captureRequestSummary{
-		Source:                   "trace.json",
-		Model:                    "claude-opus-4-8",
-		Stream:                   true,
-		MaxTokensPresent:         true,
-		MaxTokens:                64000,
-		ThinkingType:             "adaptive",
-		OutputFormat:             false,
-		OutputEffort:             "high",
-		ContextManagementPresent: true,
-		ContextEditCount:         1,
-		ContextEditType:          "clear_thinking_20251015",
-		ContextEditKeep:          "all",
-		TemperaturePresent:       false,
-		ToolsPresent:             true,
-		ToolsCount:               30,
+func TestBuildSessionCompanionsAlignmentCaptureReportListsRolesAndRisks(t *testing.T) {
+	newSummary := func(role string) *captureRequestSummary {
+		summary := &captureRequestSummary{
+			Role:                         role,
+			Model:                        "claude-opus-4-8",
+			MaxTokensPresent:             true,
+			AuthorizationPresent:         true,
+			SessionHeaderPresent:         true,
+			MetadataParseable:            true,
+			MetadataHasThreeFields:       true,
+			MetadataSessionMatchesHeader: true,
+			FixedHeaders:                 map[string]captureFixedHeaderStatus{},
+		}
+		for _, expected := range captureExpectedFixedHeaders() {
+			summary.FixedHeaders[expected.Name] = captureFixedHeaderStatus{Present: true, MatchesExpected: true}
+		}
+		switch role {
+		case "quota":
+			summary.MaxTokens = 1
+			summary.BetaTokens = expectedCaptureQuotaBetas
+		case "title":
+			summary.Stream = true
+			summary.MaxTokens = 64000
+			summary.OutputFormat = true
+			summary.OutputFormatType = "json_schema"
+			summary.OutputEffort = "high"
+			summary.BetaTokens = expectedCaptureTitleBetas
+		case "main":
+			summary.Stream = true
+			summary.MaxTokens = 1024
+			summary.ThinkingType = "adaptive"
+			summary.OutputEffort = "high"
+			summary.ContextManagementPresent = true
+			summary.ContextEditCount = 1
+			summary.ContextEditType = "clear_thinking_20251015"
+			summary.ContextEditKeep = "all"
+			summary.BetaTokens = expectedCaptureMainBetas
+		}
+		return summary
 	}
-	synthetic := trace
-	synthetic.Source = "offline synthetic capture"
-	synthetic.MaxTokens = 1024
-	synthetic.ToolsCount = 0
+	trace15 := captureSessionRequests{
+		Source:       "trace15.json",
+		RequestCount: 3,
+		Quota:        newSummary("quota"),
+		Title:        newSummary("title"),
+		Main:         newSummary("main"),
+	}
+	trace16 := captureSessionRequests{
+		Source:       "trace16.json",
+		RequestCount: 2,
+		Quota:        newSummary("quota"),
+		Main:         newSummary("main"),
+	}
+	synthetic := captureSessionRequests{
+		Source:       "offline synthetic capture",
+		RequestCount: 3,
+		Quota:        newSummary("quota"),
+		Title:        newSummary("title"),
+		Main:         newSummary("main"),
+	}
 
-	report := buildNoToolsAlignmentCaptureReport(time.Date(2026, time.July, 17, 0, 0, 0, 0, time.UTC), []captureRequestSummary{trace}, synthetic)
-	for _, field := range []string{
-		"| `model` / `stream` |",
-		"| `max_tokens` |",
-		"| `thinking.type` |",
-		"| `output_config` |",
-		"| `context_management.edits[0]` |",
-		"| `temperature` |",
+	report := buildSessionCompanionsAlignmentCaptureReport(time.Date(2026, time.July, 17, 0, 0, 0, 0, time.UTC), trace15, trace16, synthetic)
+	for _, section := range []string{
+		"## quota：trace15 与合成 capture",
+		"## title：trace15 与合成 capture",
+		"## main：trace15 与合成 capture",
+		"output_config.effort=high",
+		"仅为观察事实",
+		"## 固定 Header profile",
+		"| `connection` / `accept-encoding` |",
+		"## 上游识别风险",
+		"CCH",
+		"TLS 指纹、HTTP/2、IP/ASN",
+		"TTL 为 1 小时",
 	} {
-		require.Contains(t, report, field)
+		require.Contains(t, report, section)
 	}
-	require.Contains(t, report, "| `max_tokens` | trace.json：64000 | 1024 |")
-	require.Contains(t, report, "| `thinking.type` | trace.json：adaptive | adaptive |")
-	require.Contains(t, report, "| `output_config` | trace.json：effort=high；format=缺失 | effort=high；format=缺失 |")
-	require.Contains(t, report, "| `context_management.edits[0]` | trace.json：edits=1；type=clear_thinking_20251015；keep=all | edits=1；type=clear_thinking_20251015；keep=all |")
-	require.Contains(t, report, "| `temperature` | trace.json：缺失 | 缺失 |")
-	require.Contains(t, report, "## 固定 Header profile")
-	require.Contains(t, report, "| `accept` |")
-	require.Contains(t, report, "| `anthropic-version` |")
-	require.Contains(t, report, "| `x-claude-code-session-id` |")
-	require.Contains(t, report, "| `connection` / `accept-encoding` |")
+	require.NotContains(t, report, "cch=")
 }
 
 func TestWriteCaptureReportAtomicallyPreservesConcurrentReport(t *testing.T) {
