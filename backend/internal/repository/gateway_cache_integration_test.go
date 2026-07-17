@@ -104,6 +104,23 @@ func (s *GatewayCacheSuite) TestGetSessionAccountID_CorruptedValue() {
 	require.False(s.T(), errors.Is(err, redis.Nil), "expected parsing error, not redis.Nil")
 }
 
+func (s *GatewayCacheSuite) TestTryClaimClaudeOAuthSessionCompanions() {
+	store, ok := s.cache.(service.ClaudeOAuthSessionCompanionClaimStore)
+	require.True(s.T(), ok, "GatewayCache should expose the optional companion claim store")
+
+	claimed, err := store.TryClaimClaudeOAuthSessionCompanions(s.ctx, 99, "session-a", time.Minute)
+	require.NoError(s.T(), err)
+	require.True(s.T(), claimed)
+
+	claimed, err = store.TryClaimClaudeOAuthSessionCompanions(s.ctx, 99, "session-a", time.Minute)
+	require.NoError(s.T(), err)
+	require.False(s.T(), claimed)
+
+	claimed, err = store.TryClaimClaudeOAuthSessionCompanions(s.ctx, 100, "session-a", time.Minute)
+	require.NoError(s.T(), err)
+	require.True(s.T(), claimed)
+}
+
 func TestGatewayCacheSuite(t *testing.T) {
 	suite.Run(t, new(GatewayCacheSuite))
 }

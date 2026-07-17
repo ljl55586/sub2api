@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -10,6 +11,8 @@ import (
 )
 
 const stickySessionPrefix = "sticky_session:"
+
+const claudeOAuthSessionCompanionPrefix = "claude_oauth_session_companion:"
 
 type gatewayCache struct {
 	rdb *redis.Client
@@ -54,6 +57,18 @@ func (c *gatewayCache) DeleteSessionAccountID(ctx context.Context, groupID int64
 
 // Compile-time assertion: gatewayCache must implement CyberSessionBlockStore.
 var _ service.CyberSessionBlockStore = (*gatewayCache)(nil)
+var _ service.ClaudeOAuthSessionCompanionClaimStore = (*gatewayCache)(nil)
+
+func buildClaudeOAuthSessionCompanionKey(accountID int64, sessionID string) string {
+	return fmt.Sprintf("%s%d:%s", claudeOAuthSessionCompanionPrefix, accountID, strings.TrimSpace(sessionID))
+}
+
+func (c *gatewayCache) TryClaimClaudeOAuthSessionCompanions(ctx context.Context, accountID int64, sessionID string, ttl time.Duration) (bool, error) {
+	if accountID <= 0 || strings.TrimSpace(sessionID) == "" || ttl <= 0 {
+		return false, nil
+	}
+	return c.rdb.SetNX(ctx, buildClaudeOAuthSessionCompanionKey(accountID, sessionID), 1, ttl).Result()
+}
 
 const cyberSessionBlockPrefix = "cyber_session_block:"
 
