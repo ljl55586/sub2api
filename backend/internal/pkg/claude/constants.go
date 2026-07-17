@@ -28,6 +28,7 @@ const (
 	BetaMidConversationSystem = "mid-conversation-system-2026-04-07"
 	BetaAdvisorTool           = "advisor-tool-2026-03-01"
 	BetaExtendedCacheTTL      = "extended-cache-ttl-2025-04-11"
+	BetaStructuredOutputs     = "structured-outputs-2025-12-15"
 )
 
 // DroppedBetas 是转发时需要从 anthropic-beta header 中移除的 beta token 列表。
@@ -91,6 +92,31 @@ func ClaudeCodeOAuthMainMimicryBetas() []string {
 		BetaEffort,
 		BetaExtendedCacheTTL,
 	}
+}
+
+// ClaudeCodeOAuthQuotaMimicryBetas returns the ordered beta profile used by
+// Claude Code's initial quota probe.
+func ClaudeCodeOAuthQuotaMimicryBetas() []string {
+	return []string{
+		BetaClaudeCode,
+		BetaOAuth,
+		BetaInterleavedThinking,
+		BetaRedactThinking,
+		BetaThinkingTokenCount,
+		BetaContextManagement,
+		BetaPromptCachingScope,
+		BetaMidConversationSystem,
+	}
+}
+
+// ClaudeCodeOAuthTitleMimicryBetas returns the ordered beta profile used by
+// Claude Code's structured session-title request.
+func ClaudeCodeOAuthTitleMimicryBetas() []string {
+	return append(ClaudeCodeOAuthQuotaMimicryBetas(),
+		BetaAdvisorTool,
+		BetaEffort,
+		BetaStructuredOutputs,
+	)
 }
 
 // ClaudeCodeOAuthCountTokensMimicryBetas 返回 OAuth 模拟 count_tokens 请求使用的 beta 列表。

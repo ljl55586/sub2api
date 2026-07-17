@@ -137,6 +137,7 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 	}
 
 	body := parsed.Body.Bytes()
+	firstUserTextBeforeMimic := extractFirstUserText(body)
 	replaceBody := func(next []byte) error {
 		if err := parsed.ReplaceBody(next); err != nil {
 			return fmt.Errorf("rewrite request body: %w", err)
@@ -171,6 +172,7 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 	}
 	isClaudeCode := IsClaudeCodeClient(ctx) || isClaudeCodeClient(clientUserAgent, parsed.MetadataUserID)
 	shouldMimicClaudeCode := account.IsOAuth() && !isClaudeCode
+	var oauthMimicMetadataUserID string
 
 	if shouldMimicClaudeCode {
 		// The normalizer removes tool_choice when tools is empty. Preserve the
@@ -210,6 +212,7 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 		if metadataErr != nil {
 			return nil, metadataErr
 		}
+		oauthMimicMetadataUserID = metadataUserID
 		normalizeOpts.injectMetadata = true
 		normalizeOpts.metadataUserID = metadataUserID
 
@@ -364,6 +367,20 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 			logger.LegacyPrintf("service.gateway", "Account %d: rewrote thinking.type for %s (Anthropic-SDK default 'enabled' -> vendor-specific)", account.ID, reqModel)
 		}
 	}
+
+	s.dispatchClaudeOAuthSessionCompanions(ctx, claudeOAuthCompanionDispatchInput{
+		c:               c,
+		account:         account,
+		modelID:         reqModel,
+		token:           token,
+		tokenType:       tokenType,
+		reqStream:       reqStream,
+		mimicClaudeCode: shouldMimicClaudeCode,
+		metadataUserID:  oauthMimicMetadataUserID,
+		firstUserText:   firstUserTextBeforeMimic,
+		proxyURL:        proxyURL,
+		tlsProfile:      tlsProfile,
+	})
 
 	// 重试循环
 	var resp *http.Response

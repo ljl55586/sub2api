@@ -17,7 +17,16 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+type upstreamRequestBuildOptions struct {
+	finalAnthropicBetaOverride *string
+	debugSnapshotTag           string
+}
+
 func (s *GatewayService) buildUpstreamRequest(ctx context.Context, c *gin.Context, account *Account, body []byte, token, tokenType, modelID string, reqStream bool, mimicClaudeCode bool) (*http.Request, []byte, error) {
+	return s.buildUpstreamRequestWithOptions(ctx, c, account, body, token, tokenType, modelID, reqStream, mimicClaudeCode, upstreamRequestBuildOptions{})
+}
+
+func (s *GatewayService) buildUpstreamRequestWithOptions(ctx context.Context, c *gin.Context, account *Account, body []byte, token, tokenType, modelID string, reqStream bool, mimicClaudeCode bool, opts upstreamRequestBuildOptions) (*http.Request, []byte, error) {
 	if account.Platform == PlatformAnthropic && account.Type == AccountTypeServiceAccount {
 		req, err := s.buildUpstreamRequestAnthropicVertex(ctx, c, account, body, token, modelID, reqStream)
 		return req, body, err
@@ -116,6 +125,10 @@ func (s *GatewayService) buildUpstreamRequest(ctx context.Context, c *gin.Contex
 	if beta, ok := account.HeaderOverrideValue("anthropic-beta"); ok {
 		finalBetaHeader, finalBetaShouldSet = beta, true
 	}
+	if opts.finalAnthropicBetaOverride != nil {
+		finalBetaHeader = *opts.finalAnthropicBetaOverride
+		finalBetaShouldSet = finalBetaHeader != ""
+	}
 
 	// 能力维度 body sanitize：与最终 anthropic-beta header 对称
 	if sanitized, changed := sanitizeAnthropicBodyForBetaTokens(body, finalBetaHeader); changed {
@@ -197,7 +210,11 @@ func (s *GatewayService) buildUpstreamRequest(ctx context.Context, c *gin.Contex
 	account.ApplyHeaderOverrides(req.Header)
 
 	// === DEBUG: 打印上游转发请求（headers + body 摘要），与 CLIENT_ORIGINAL 对比 ===
-	s.debugLogGatewaySnapshot("UPSTREAM_FORWARD", req.Header, body, map[string]string{
+	debugSnapshotTag := opts.debugSnapshotTag
+	if debugSnapshotTag == "" {
+		debugSnapshotTag = "UPSTREAM_FORWARD"
+	}
+	s.debugLogGatewaySnapshot(debugSnapshotTag, req.Header, body, map[string]string{
 		"url":                 req.URL.String(),
 		"token_type":          tokenType,
 		"mimic_claude_code":   strconv.FormatBool(mimicClaudeCode),
