@@ -1170,7 +1170,7 @@ func buildSessionCompanionsAlignmentCaptureReport(now time.Time, trace15, trace1
 	report.WriteString("- tools 仍保持现有策略；本轮不伪造真实 CLI 的完整 tools schema、tool_choice 或 prompt 原文。\n\n")
 
 	report.WriteString("## 上游识别风险\n\n")
-	report.WriteString("不能把本离线结果视为不可识别的证明。合成请求仍不生成 CCH，而真实 trace 存在 CCH；这是明确保留的高风险差异。system/messages 布局差异仍然存在，且真实 CLI 的 tools schema/count 差异以及 tool_choice 与合成请求不同；即使报告只列结构摘要、不输出原始 prompt 或工具内容，这些差异仍可成为上游识别线索。quota/title/main 在代码中只保证逻辑 dispatch，title 与 main 的实际写线微秒级先后、连接排队和并发复用并未由该测试证明。TLS 指纹、HTTP/2、IP/ASN、代理、连接复用以及真实 Claude Code 进程状态均未模拟。伴生请求 claim 的 TTL 为 1 小时；curl 若缺少稳定的会话输入，可能重复发送或漏发首问伴生请求。最后，首问额外增加 quota 与 title 上游流量及其可观察的失败/限流行为。\n")
+	report.WriteString("不能把本离线结果视为不可识别的证明。合成请求仍不生成 CCH，而真实 trace 存在 CCH；这是明确保留的高风险差异。system/messages 布局差异仍然存在，且真实 CLI 的 tools schema/count 差异以及 tool_choice 与合成请求不同；即使报告只列结构摘要、不输出原始 prompt 或工具内容，这些差异仍可成为上游识别线索。quota/title 现在在独立受限连接池的后台 worker 中按逻辑顺序执行，回归测试覆盖它们不阻塞主请求；但 title 与 main 的实际写线微秒级先后仍不保证，离线 fake recorder 也不能证明真实网络中的调度、连接复用或上游观察顺序。TLS 指纹、HTTP/2、IP/ASN、代理、连接复用以及真实 Claude Code 进程状态均未模拟。伴生请求 claim 的 TTL 为 1 小时；curl 若缺少稳定的会话输入，可能重复发送或漏发首问伴生请求。最后，首问额外增加 quota 与 title 上游流量及其可观察的失败/限流行为。\n")
 
 	return report.String()
 }
@@ -1746,6 +1746,7 @@ func TestBuildSessionCompanionsAlignmentCaptureReportListsRolesAndRisks(t *testi
 		"TTL 为 1 小时",
 		"system/messages 布局差异",
 		"tools schema/count 差异",
+		"独立受限连接池",
 	} {
 		require.Contains(t, report, section)
 	}
