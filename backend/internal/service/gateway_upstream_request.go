@@ -129,6 +129,12 @@ func (s *GatewayService) buildUpstreamRequestWithOptions(ctx context.Context, c 
 		finalBetaHeader = *opts.finalAnthropicBetaOverride
 		finalBetaShouldSet = finalBetaHeader != ""
 	}
+	// Forward() 预检查的是下游客户端传入的 header；OAuth mimic 主请求会在这里
+	// 自动生成完整 beta profile，账号覆写也会在这里替换最终值。因此必须基于最终
+	// 上游 beta 再检查 block 规则，避免生成/覆写的 token 绕过策略。
+	if blockErr := s.checkBetaPolicyBlockForTokens(ctx, parseAnthropicBetaHeader(finalBetaHeader), account, modelID); blockErr != nil {
+		return nil, nil, blockErr
+	}
 
 	// 能力维度 body sanitize：与最终 anthropic-beta header 对称
 	if sanitized, changed := sanitizeAnthropicBodyForBetaTokens(body, finalBetaHeader); changed {

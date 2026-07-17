@@ -4,6 +4,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -103,6 +104,30 @@ func TestSanitizeAnthropicBodyForBetaTokens_FieldStrippedWhenBetaEmpty(t *testin
 	require.False(t, gjson.GetBytes(out, "context_management").Exists())
 }
 
+func TestSanitizeAnthropicBodyForBetaTokens_OutputEffortStrippedWhenBetaMissingPreservingFormat(t *testing.T) {
+	body := []byte(`{"model":"claude-opus-4-8","output_config":{"effort":"high","format":{"type":"json_schema","schema":{"type":"object"}}},"messages":[]}`)
+
+	out, changed := sanitizeAnthropicBodyForBetaTokens(body, "oauth-2025-04-20,context-management-2025-06-27")
+
+	require.True(t, changed)
+	require.True(t, gjson.GetBytes(out, "output_config").Exists())
+	require.False(t, gjson.GetBytes(out, "output_config.effort").Exists(),
+		"final beta 缺少 effort 时必须删除 output_config.effort")
+	require.Equal(t, "json_schema", gjson.GetBytes(out, "output_config.format.type").String(),
+		"删除 effort 不能破坏其余 output_config")
+	require.Equal(t, "object", gjson.GetBytes(out, "output_config.format.schema.type").String())
+}
+
+func TestSanitizeAnthropicBodyForBetaTokens_OutputEffortKeptWhenBetaPresent(t *testing.T) {
+	body := []byte(`{"output_config":{"effort":"high","format":{"type":"json_schema"}},"messages":[]}`)
+
+	out, changed := sanitizeAnthropicBodyForBetaTokens(body, "oauth-2025-04-20,effort-2025-11-24")
+
+	require.False(t, changed)
+	require.Equal(t, "high", gjson.GetBytes(out, "output_config.effort").String())
+	require.Equal(t, "json_schema", gjson.GetBytes(out, "output_config.format.type").String())
+}
+
 func TestSanitizeAnthropicBodyForBetaTokens_EmptyBody(t *testing.T) {
 	out, changed := sanitizeAnthropicBodyForBetaTokens([]byte{}, "")
 	require.False(t, changed)
@@ -134,6 +159,31 @@ func newTestGatewayServiceForBeta(injectBetaForAPIKey bool) *GatewayService {
 	cfg := &config.Config{}
 	cfg.Gateway.InjectBetaForAPIKey = injectBetaForAPIKey
 	return &GatewayService{cfg: cfg}
+}
+
+func newTestGatewayServiceWithBetaPolicy(t *testing.T, rules []BetaPolicyRule) *GatewayService {
+	t.Helper()
+	raw, err := json.Marshal(BetaPolicySettings{Rules: rules})
+	require.NoError(t, err)
+	cfg := &config.Config{}
+	return &GatewayService{
+		cfg: cfg,
+		settingService: NewSettingService(&gatewayTTLSettingRepo{data: map[string]string{
+			SettingKeyBetaPolicySettings: string(raw),
+		}}, cfg),
+	}
+}
+
+func oauthMimicMetadataForBetaTest(t *testing.T) string {
+	t.Helper()
+	encoded, err := json.Marshal(FormatMetadataUserID(
+		"beta-test-device",
+		"beta-test-account",
+		"11111111-2222-4333-8444-555555555555",
+		claude.CLICurrentVersion,
+	))
+	require.NoError(t, err)
+	return string(encoded)
 }
 
 func TestComputeFinalAnthropicBeta_OAuthMimic_NonHaiku_UsesExactMainProfileOrder(t *testing.T) {
@@ -439,6 +489,100 @@ func TestBuildCountTokensRequestAnthropicAPIKeyPassthrough_StripsContextManageme
 // 全路径验证上游 outgoing body 与 anthropic-beta header 严格对称。
 // 这个测试能挡住未来某人忘调 sanitize / 将 sanitize 挪到 CCH 之后 等 regression。
 // ============================================================================
+
+func TestBuildUpstreamRequest_OAuthMimicOpusBetaPolicyFilterStripsEffortEndToEnd(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	svc := newTestGatewayServiceWithBetaPolicy(t, []BetaPolicyRule{{
+		BetaToken: claude.BetaEffort,
+		Action:    BetaPolicyActionFilter,
+		Scope:     BetaPolicyScopeOAuth,
+	}})
+	account := &Account{ID: 450, Platform: PlatformAnthropic, Type: AccountTypeOAuth}
+	body := []byte(`{"model":"claude-opus-4-8","metadata":{"user_id":` + oauthMimicMetadataForBetaTest(t) + `},"output_config":{"effort":"high","format":{"type":"json_schema","schema":{"type":"object"}}},"messages":[]}`)
+
+	req, _, err := svc.buildUpstreamRequest(
+		context.Background(), c, account, body,
+		"oauth-tok", "oauth", "claude-opus-4-8", false, true,
+	)
+	require.NoError(t, err)
+
+	outBody := readUpstreamBodyForTest(t, req)
+	outBeta := getHeaderRaw(req.Header, "anthropic-beta")
+	require.False(t, anthropicBetaTokensContains(outBeta, claude.BetaEffort),
+		"filter policy must remove effort from the final main beta header")
+	require.False(t, gjson.GetBytes(outBody, "output_config.effort").Exists(),
+		"final main beta lacks effort, so the body must not carry output_config.effort")
+	require.Equal(t, "json_schema", gjson.GetBytes(outBody, "output_config.format.type").String())
+	require.Equal(t, "object", gjson.GetBytes(outBody, "output_config.format.schema.type").String())
+}
+
+func TestBuildUpstreamRequest_OAuthMimicGeneratedBetaBlockFailsBeforeWireRequest(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	svc := newTestGatewayServiceWithBetaPolicy(t, []BetaPolicyRule{{
+		BetaToken:    claude.BetaRedactThinking,
+		Action:       BetaPolicyActionBlock,
+		Scope:        BetaPolicyScopeOAuth,
+		ErrorMessage: "generated redact thinking is blocked",
+	}})
+	account := &Account{ID: 451, Platform: PlatformAnthropic, Type: AccountTypeOAuth}
+	body := []byte(`{"model":"claude-opus-4-8","metadata":{"user_id":` + oauthMimicMetadataForBetaTest(t) + `},"messages":[]}`)
+
+	req, wireBody, err := svc.buildUpstreamRequest(
+		context.Background(), c, account, body,
+		"oauth-tok", "oauth", "claude-opus-4-8", false, true,
+	)
+
+	require.Nil(t, req)
+	require.Nil(t, wireBody)
+	var blocked *BetaBlockedError
+	require.ErrorAs(t, err, &blocked)
+	require.Equal(t, "generated redact thinking is blocked", err.Error())
+}
+
+func TestBuildUpstreamRequest_AccountBetaOverrideBlockFailsBeforeWireRequest(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	svc := newTestGatewayServiceWithBetaPolicy(t, []BetaPolicyRule{{
+		BetaToken:    claude.BetaEffort,
+		Action:       BetaPolicyActionBlock,
+		Scope:        BetaPolicyScopeAPIKey,
+		ErrorMessage: "overridden effort is blocked",
+	}})
+	account := &Account{
+		ID:       452,
+		Platform: PlatformAnthropic,
+		Type:     AccountTypeAPIKey,
+		Credentials: map[string]any{
+			credKeyHeaderOverrideEnabled: true,
+			credKeyHeaderOverrides: map[string]any{
+				"anthropic-beta": claude.BetaEffort,
+			},
+		},
+	}
+	body := []byte(`{"model":"claude-opus-4-8","output_config":{"effort":"high","format":{"type":"json_schema"}},"messages":[]}`)
+
+	req, wireBody, err := svc.buildUpstreamRequest(
+		context.Background(), c, account, body,
+		"api-key", "apikey", "claude-opus-4-8", false, false,
+	)
+
+	require.Nil(t, req)
+	require.Nil(t, wireBody)
+	var blocked *BetaBlockedError
+	require.ErrorAs(t, err, &blocked)
+	require.Equal(t, "overridden effort is blocked", err.Error())
+}
 
 func TestBuildUpstreamRequest_OAuthMimicHaiku_StripsContextManagementEndToEnd(t *testing.T) {
 	gin.SetMode(gin.TestMode)

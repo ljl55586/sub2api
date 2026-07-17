@@ -13,6 +13,7 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/domain"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/antigravity"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -868,9 +869,10 @@ const anthropicBetaContextManagementToken = "context-management-2025-06-27"
 //   - 若两侧不一致上游 Pydantic schema 拒收：
 //     "context_management: Extra inputs are not permitted"
 //
-// 本函数按最终发送的 anthropic-beta header 决定是否保留 body 中的
-// context_management 字段：缺 beta token → strip。这将限制完全建立在
-// "能力维度" 上，与 model 名 / token type / mimicry 子路径无关。
+// 本函数按最终发送的 anthropic-beta header 决定是否保留 body 中受 beta 控制的
+// 字段：缺对应 beta token → strip。目前覆盖 context_management 和
+// output_config.effort。这将限制完全建立在 "能力维度" 上，与 model 名 /
+// token type / mimicry 子路径无关。
 //
 // 调用约束：必须在 CCH 签名之前调用，否则签名 hash 与最终 body
 // 不一致，上游会以 third-party 拒收。
@@ -881,23 +883,28 @@ func sanitizeAnthropicBodyForBetaTokens(body []byte, anthropicBetaHeader string)
 	if len(body) == 0 {
 		return body, false
 	}
-	if !gjson.GetBytes(body, "context_management").Exists() {
-		return body, false
+
+	changed := false
+	stripWhenBetaMissing := func(path, requiredBeta string) {
+		if anthropicBetaTokensContains(anthropicBetaHeader, requiredBeta) || !gjson.GetBytes(body, path).Exists() {
+			return
+		}
+		if sanitized, err := sjson.DeleteBytes(body, path); err == nil {
+			body = sanitized
+			changed = true
+		} else {
+			// 不应发生：gjson 刚验证过字段存在 + body 是合法 JSON。如果 sjson 仍报错，
+			// 调用方会拿到未净化的 body，可能与最终 beta header 不对称。记录 warning
+			// 以便运维发现异常。
+			logger.LegacyPrintf("service.gateway",
+				"[AnthropicBetaSanitize] failed to delete %s: %v (body len=%d). "+
+					"body and final anthropic-beta header may be out of sync.", path, err, len(body))
+		}
 	}
-	if anthropicBetaTokensContains(anthropicBetaHeader, anthropicBetaContextManagementToken) {
-		return body, false
-	}
-	if b, err := sjson.DeleteBytes(body, "context_management"); err == nil {
-		return b, true
-	} else {
-		// 不应发生：gjson 刚验证过字段存在 + body 是合法 JSON。如果 sjson 仍报错，
-		// 调用方会拿到 (body, false)，但此前 computeFinalAnthropicBeta 已按“strip 后”
-		// 计算了 finalBeta——两侧会不一致。记录 warning 最小限度提醒运维。
-		logger.LegacyPrintf("service.gateway",
-			"[CtxMgmtSanitize] sjson.DeleteBytes failed unexpectedly: %v (body len=%d). "+
-				"body and final anthropic-beta header may be out of sync.", err, len(body))
-	}
-	return body, false
+
+	stripWhenBetaMissing("context_management", anthropicBetaContextManagementToken)
+	stripWhenBetaMissing("output_config.effort", claude.BetaEffort)
+	return body, changed
 }
 
 // anthropicBetaTokensContains 检测逗号分隔的 anthropic-beta header 是否含指定 token。
