@@ -405,7 +405,19 @@ func (s *GatewayService) buildOAuthMimicMetadataUserID(
 	if err != nil {
 		return "", fmt.Errorf("resolve OAuth metadata identity: %w", err)
 	}
-	return s.buildOAuthMetadataUserID(parsed, account, identity, claude.CLICurrentVersion)
+	userID, err := s.buildOAuthMetadataUserID(parsed, account, identity, claude.CLICurrentVersion)
+	if err != nil || !account.IsSessionIDMaskingEnabled() {
+		return userID, err
+	}
+	parsedUserID := ParseMetadataUserID(userID)
+	if parsedUserID == nil {
+		return "", fmt.Errorf("parse generated OAuth metadata user_id")
+	}
+	maskedSessionID, err := s.identityService.GetOrCreateMaskedSessionID(ctx, account.ID)
+	if err != nil {
+		return "", fmt.Errorf("resolve OAuth masked session: %w", err)
+	}
+	return FormatMetadataUserID(parsedUserID.DeviceID, parsedUserID.AccountUUID, maskedSessionID, claude.CLICurrentVersion), nil
 }
 
 // applyClaudeCodeOAuthMimicryToBody 将"非 Claude Code 客户端 + Claude OAuth 账号"

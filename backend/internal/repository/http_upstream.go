@@ -313,9 +313,10 @@ func (s *httpUpstreamService) getClientEntryWithTLS(proxyURL string, accountID i
 	}
 	settings := s.resolvePoolSettings(isolation, accountConcurrency)
 	settings = s.applyProfilePoolSettings(settings, upstreamProfile)
-	// TLS 指纹客户端使用独立的缓存键，加 "tls:" 前缀
-	cacheKey := "tls:" + buildCacheKey(isolation, proxyKey, accountID, upstreamProtocolModeDefault)
-	poolKey := buildPoolKey(settings, upstreamProtocolModeDefault) + ":tls"
+	// TLS 指纹客户端使用独立的缓存键，加 "tls:" 前缀。伴生流量还需
+	// 与主请求隔离，避免账号级 MaxConnsPerHost 把主请求排在 title/quota 后面。
+	cacheKey := "tls:" + buildProfileCacheKey(isolation, proxyKey, accountID, upstreamProtocolModeDefault, upstreamProfile)
+	poolKey := buildProfilePoolKey(settings, upstreamProtocolModeDefault, upstreamProfile) + ":tls"
 
 	now := time.Now()
 	nowUnix := now.UnixNano()
@@ -474,9 +475,9 @@ func (s *httpUpstreamService) getClientEntry(proxyURL string, accountID int64, a
 	settings := s.resolvePoolSettings(isolation, accountConcurrency)
 	settings = s.applyProfilePoolSettings(settings, profile)
 	// 构建缓存键（根据隔离策略不同）
-	cacheKey := buildCacheKey(isolation, proxyKey, accountID, protocolMode)
+	cacheKey := buildProfileCacheKey(isolation, proxyKey, accountID, protocolMode, profile)
 	// 构建连接池配置键（用于检测配置变更）
-	poolKey := buildPoolKey(settings, protocolMode)
+	poolKey := buildProfilePoolKey(settings, protocolMode, profile)
 
 	now := time.Now()
 	nowUnix := now.UnixNano()
@@ -717,12 +718,19 @@ func (s *httpUpstreamService) resolvePoolSettings(isolation string, accountConcu
 }
 
 func (s *httpUpstreamService) applyProfilePoolSettings(settings poolSettings, profile service.HTTPUpstreamProfile) poolSettings {
-	if profile != service.HTTPUpstreamProfileOpenAI {
-		return settings
-	}
-	settings.responseHeaderTimeout = 0
-	if s != nil && s.cfg != nil && s.cfg.Gateway.OpenAIResponseHeaderTimeout > 0 {
-		settings.responseHeaderTimeout = time.Duration(s.cfg.Gateway.OpenAIResponseHeaderTimeout) * time.Second
+	switch profile {
+	case service.HTTPUpstreamProfileOpenAI:
+		settings.responseHeaderTimeout = 0
+		if s != nil && s.cfg != nil && s.cfg.Gateway.OpenAIResponseHeaderTimeout > 0 {
+			settings.responseHeaderTimeout = time.Duration(s.cfg.Gateway.OpenAIResponseHeaderTimeout) * time.Second
+		}
+	case service.HTTPUpstreamProfileClaudeOAuthCompanion:
+		// Quota/title are best-effort background traffic. Keep a single, separate
+		// connection so they cannot consume the main account pool while also not
+		// multiplying companion connections per account.
+		settings.maxIdleConns = 1
+		settings.maxIdleConnsPerHost = 1
+		settings.maxConnsPerHost = 1
 	}
 	return settings
 }
@@ -772,6 +780,25 @@ func buildCacheKey(isolation, proxyKey string, accountID int64, protocolMode str
 		base += "|proto:" + protocolMode
 	}
 	return base
+}
+
+// buildProfileCacheKey keeps traffic classes that have different pool semantics
+// in distinct client entries. A pool-key-only distinction would evict/rebuild
+// the main client under the same cache key and would not isolate contention.
+func buildProfileCacheKey(isolation, proxyKey string, accountID int64, protocolMode string, profile service.HTTPUpstreamProfile) string {
+	key := buildCacheKey(isolation, proxyKey, accountID, protocolMode)
+	if profile != service.HTTPUpstreamProfileDefault {
+		key += "|traffic:" + string(profile)
+	}
+	return key
+}
+
+func buildProfilePoolKey(settings poolSettings, protocolMode string, profile service.HTTPUpstreamProfile) string {
+	key := buildPoolKey(settings, protocolMode)
+	if profile != service.HTTPUpstreamProfileDefault {
+		key += "|traffic:" + string(profile)
+	}
+	return key
 }
 
 func (s *httpUpstreamService) resolveOpenAIHTTP2Settings() openAIHTTP2Settings {

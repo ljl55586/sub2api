@@ -173,6 +173,10 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 	isClaudeCode := IsClaudeCodeClient(ctx) || isClaudeCodeClient(clientUserAgent, parsed.MetadataUserID)
 	shouldMimicClaudeCode := account.IsOAuth() && !isClaudeCode
 	var oauthMimicMetadataUserID string
+	metadataPassthroughEnabled := false
+	if shouldMimicClaudeCode && s.settingService != nil {
+		_, metadataPassthroughEnabled, _ = s.settingService.GetGatewayForwardingSettings(ctx)
+	}
 
 	if shouldMimicClaudeCode {
 		// The normalizer removes tool_choice when tools is empty. Preserve the
@@ -208,13 +212,18 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 			stripSystemCacheControl:    !systemRewritten,
 			alignClaudeCodeMainRequest: true,
 		}
-		metadataUserID, metadataErr := s.buildOAuthMimicMetadataUserID(ctx, c, parsed, account)
-		if metadataErr != nil {
-			return nil, metadataErr
+		if !metadataPassthroughEnabled {
+			metadataUserID, metadataErr := s.buildOAuthMimicMetadataUserID(ctx, c, parsed, account)
+			if metadataErr != nil {
+				return nil, metadataErr
+			}
+			oauthMimicMetadataUserID = metadataUserID
+			normalizeOpts.injectMetadata = true
+			normalizeOpts.metadataUserID = metadataUserID
+			if c != nil {
+				c.Set(oauthMimicMetadataFinalContextKey, true)
+			}
 		}
-		oauthMimicMetadataUserID = metadataUserID
-		normalizeOpts.injectMetadata = true
-		normalizeOpts.metadataUserID = metadataUserID
 
 		var normalizedBody []byte
 		normalizedBody, reqModel = normalizeClaudeOAuthRequestBody(body, reqModel, normalizeOpts)

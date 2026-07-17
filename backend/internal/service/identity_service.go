@@ -352,22 +352,9 @@ func (s *IdentityService) RewriteUserIDWithMasking(ctx context.Context, body []b
 		return newBody, nil
 	}
 
-	// 获取或生成固定的伪装 session ID
-	maskedSessionID, err := s.cache.GetMaskedSessionID(ctx, account.ID)
+	maskedSessionID, err := s.GetOrCreateMaskedSessionID(ctx, account.ID)
 	if err != nil {
-		logger.LegacyPrintf("service.identity", "Warning: failed to get masked session ID for account %d: %v", account.ID, err)
-		return newBody, nil
-	}
-
-	if maskedSessionID == "" {
-		// 首次或已过期，生成新的伪装 session ID
-		maskedSessionID = generateRandomUUID()
-		logger.LegacyPrintf("service.identity", "Generated new masked session ID for account %d: %s", account.ID, maskedSessionID)
-	}
-
-	// 刷新 TTL（每次请求都刷新，保持 15 分钟有效期）
-	if err := s.cache.SetMaskedSessionID(ctx, account.ID, maskedSessionID); err != nil {
-		logger.LegacyPrintf("service.identity", "Warning: failed to set masked session ID for account %d: %v", account.ID, err)
+		return newBody, err
 	}
 
 	// 用 FormatMetadataUserID 重建（保持与 RewriteUserID 相同的格式）
@@ -389,6 +376,28 @@ func (s *IdentityService) RewriteUserIDWithMasking(ctx context.Context, body []b
 		return newBody, nil
 	}
 	return maskedBody, nil
+}
+
+// GetOrCreateMaskedSessionID resolves the account-scoped session mask and
+// refreshes its TTL. A storage error is returned instead of falling back to an
+// unmasked session: callers that send multiple related requests must never
+// split one lifecycle across masked and unmasked identities.
+func (s *IdentityService) GetOrCreateMaskedSessionID(ctx context.Context, accountID int64) (string, error) {
+	if s == nil || s.cache == nil {
+		return "", errors.New("identity cache is unavailable")
+	}
+	maskedSessionID, err := s.cache.GetMaskedSessionID(ctx, accountID)
+	if err != nil {
+		return "", fmt.Errorf("get masked session ID for account %d: %w", accountID, err)
+	}
+	if maskedSessionID == "" {
+		maskedSessionID = generateRandomUUID()
+		logger.LegacyPrintf("service.identity", "Generated new masked session ID for account %d: %s", accountID, maskedSessionID)
+	}
+	if err := s.cache.SetMaskedSessionID(ctx, accountID, maskedSessionID); err != nil {
+		return "", fmt.Errorf("persist masked session ID for account %d: %w", accountID, err)
+	}
+	return maskedSessionID, nil
 }
 
 // generateRandomUUID 生成随机 UUID v4 格式字符串

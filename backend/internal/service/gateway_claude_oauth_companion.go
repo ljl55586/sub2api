@@ -164,6 +164,12 @@ type claudeOAuthCompanionDispatchInput struct {
 	tlsProfile      *tlsfingerprint.Profile
 }
 
+type claudeOAuthCompanionPendingRequest struct {
+	kind    string
+	req     *http.Request
+	timeout time.Duration
+}
+
 func (s *GatewayService) dispatchClaudeOAuthSessionCompanions(ctx context.Context, in claudeOAuthCompanionDispatchInput) {
 	if s == nil || in.account == nil || !in.mimicClaudeCode || in.tokenType != "oauth" ||
 		claude.NormalizeModelID(in.modelID) != "claude-opus-4-8" || !in.reqStream ||
@@ -179,6 +185,8 @@ func (s *GatewayService) dispatchClaudeOAuthSessionCompanions(ctx context.Contex
 	}
 
 	effectiveDropSet := mergeDropSets(s.getBetaPolicyFilterSet(ctx, in.c, in.account, in.modelID))
+	baseCtx := context.WithoutCancel(ctx)
+	pending := make([]claudeOAuthCompanionPendingRequest, 0, 2)
 	quotaBetas := filterBetaTokens(claude.ClaudeCodeOAuthQuotaMimicryBetas(), effectiveDropSet)
 	quotaBetaHeader := strings.Join(quotaBetas, ",")
 	quotaPolicy := s.evaluateBetaPolicy(ctx, quotaBetaHeader, in.account, in.modelID)
@@ -187,73 +195,81 @@ func (s *GatewayService) dispatchClaudeOAuthSessionCompanions(ctx context.Contex
 	} else if quotaBody, err := buildClaudeOAuthQuotaCompanionBody(in.modelID, in.metadataUserID); err != nil {
 		logger.LegacyPrintf("service.gateway", "Claude OAuth quota companion body build failed: %v", err)
 	} else {
-		quotaCtx, cancelQuota := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 		quotaReq, _, buildErr := s.buildUpstreamRequestWithOptions(
-			quotaCtx, in.c, in.account, quotaBody, in.token, in.tokenType, in.modelID, false, true,
+			baseCtx, in.c, in.account, quotaBody, in.token, in.tokenType, in.modelID, false, true,
 			upstreamRequestBuildOptions{
 				finalAnthropicBetaOverride: &quotaBetaHeader,
 				debugSnapshotTag:           "UPSTREAM_SESSION_COMPANION_QUOTA",
+				oauthMimicMetadataFinal:    true,
 			},
 		)
 		if buildErr != nil {
 			logger.LegacyPrintf("service.gateway", "Claude OAuth quota companion request build failed: %v", buildErr)
 		} else {
-			resp, transportErr := s.httpUpstream.DoWithTLS(quotaReq, in.proxyURL, in.account.ID, in.account.Concurrency, in.tlsProfile)
-			if transportErr != nil {
-				logger.LegacyPrintf("service.gateway", "Claude OAuth quota companion transport failed: %v", transportErr)
-			}
-			drainClaudeOAuthCompanionResponse(resp)
+			quotaReq = quotaReq.WithContext(WithHTTPUpstreamProfile(quotaReq.Context(), HTTPUpstreamProfileClaudeOAuthCompanion))
+			pending = append(pending, claudeOAuthCompanionPendingRequest{
+				kind:    "quota",
+				req:     quotaReq,
+				timeout: 2 * time.Second,
+			})
 		}
-		cancelQuota()
 	}
 
 	titleBetas := filterBetaTokens(claude.ClaudeCodeOAuthTitleMimicryBetas(), effectiveDropSet)
 	titleBetaHeader := strings.Join(titleBetas, ",")
 	if !containsBetaToken(titleBetaHeader, claude.BetaStructuredOutputs) {
 		logger.LegacyPrintf("service.gateway", "Claude OAuth title companion skipped because its required beta is unavailable")
-		return
-	}
-	titlePolicy := s.evaluateBetaPolicy(ctx, titleBetaHeader, in.account, in.modelID)
-	if titlePolicy.blockErr != nil {
+	} else if titlePolicy := s.evaluateBetaPolicy(ctx, titleBetaHeader, in.account, in.modelID); titlePolicy.blockErr != nil {
 		logger.LegacyPrintf("service.gateway", "Claude OAuth title companion skipped by beta policy")
-		return
-	}
-	titleBody, err := buildClaudeOAuthTitleCompanionBodyWithEffort(
+	} else if titleBody, err := buildClaudeOAuthTitleCompanionBodyWithEffort(
 		in.modelID,
 		in.metadataUserID,
 		in.firstUserText,
 		containsBetaToken(titleBetaHeader, claude.BetaEffort),
-	)
-	if err != nil {
+	); err != nil {
 		logger.LegacyPrintf("service.gateway", "Claude OAuth title companion body build failed: %v", err)
-		return
-	}
-	titleCtx, cancelTitle := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-	titleReq, _, err := s.buildUpstreamRequestWithOptions(
-		titleCtx, in.c, in.account, titleBody, in.token, in.tokenType, in.modelID, true, true,
+	} else if titleReq, _, err := s.buildUpstreamRequestWithOptions(
+		baseCtx, in.c, in.account, titleBody, in.token, in.tokenType, in.modelID, true, true,
 		upstreamRequestBuildOptions{
 			finalAnthropicBetaOverride: &titleBetaHeader,
 			debugSnapshotTag:           "UPSTREAM_SESSION_COMPANION_TITLE",
+			oauthMimicMetadataFinal:    true,
 		},
-	)
-	if err != nil {
-		cancelTitle()
+	); err != nil {
 		logger.LegacyPrintf("service.gateway", "Claude OAuth title companion request build failed: %v", err)
+	} else {
+		titleReq = titleReq.WithContext(WithHTTPUpstreamProfile(titleReq.Context(), HTTPUpstreamProfileClaudeOAuthCompanion))
+		pending = append(pending, claudeOAuthCompanionPendingRequest{
+			kind:    "title",
+			req:     titleReq,
+			timeout: 5 * time.Second,
+		})
+	}
+
+	if len(pending) == 0 || s.httpUpstream == nil {
 		return
 	}
 
+	// Build all bodies and requests before starting the goroutine: gin.Context
+	// is request-scoped and must not be accessed after the main handler returns.
+	// The worker retains quota → title ordering but runs on a dedicated, bounded
+	// pool so neither companion can delay the main account pool.
 	httpUpstream := s.httpUpstream
 	accountID := in.account.ID
 	accountConcurrency := in.account.Concurrency
 	proxyURL := in.proxyURL
 	tlsProfile := in.tlsProfile
 	go func() {
-		defer cancelTitle()
-		resp, transportErr := httpUpstream.DoWithTLS(titleReq, proxyURL, accountID, accountConcurrency, tlsProfile)
-		if transportErr != nil {
-			logger.LegacyPrintf("service.gateway", "Claude OAuth title companion transport failed: %v", transportErr)
+		for _, item := range pending {
+			requestCtx, cancel := context.WithTimeout(item.req.Context(), item.timeout)
+			req := item.req.WithContext(requestCtx)
+			resp, transportErr := httpUpstream.DoWithTLS(req, proxyURL, accountID, accountConcurrency, tlsProfile)
+			if transportErr != nil {
+				logger.LegacyPrintf("service.gateway", "Claude OAuth %s companion transport failed: %v", item.kind, transportErr)
+			}
+			drainClaudeOAuthCompanionResponse(resp)
+			cancel()
 		}
-		drainClaudeOAuthCompanionResponse(resp)
 	}()
 }
 

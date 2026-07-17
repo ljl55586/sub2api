@@ -19,3 +19,10 @@ func TestWithHTTPUpstreamProfile_OpenAI(t *testing.T) {
 		t.Fatalf("expected profile %q, got %q", HTTPUpstreamProfileOpenAI, profile)
 	}
 }
+
+func TestWithHTTPUpstreamProfile_ClaudeOAuthCompanion(t *testing.T) {
+	ctx := WithHTTPUpstreamProfile(context.TODO(), HTTPUpstreamProfileClaudeOAuthCompanion)
+	if profile := HTTPUpstreamProfileFromContext(ctx); profile != HTTPUpstreamProfileClaudeOAuthCompanion {
+		t.Fatalf("expected profile %q, got %q", HTTPUpstreamProfileClaudeOAuthCompanion, profile)
+	}
+}

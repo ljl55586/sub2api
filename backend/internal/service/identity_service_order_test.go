@@ -10,11 +10,13 @@ import (
 )
 
 type identityCacheStub struct {
-	maskedSessionID    string
-	fingerprint        *Fingerprint
-	fingerprintErr     error
-	setFingerprintErr  error
-	setFingerprintCall int
+	maskedSessionID     string
+	maskedSessionErr    error
+	setMaskedSessionErr error
+	fingerprint         *Fingerprint
+	fingerprintErr      error
+	setFingerprintErr   error
+	setFingerprintCall  int
 }
 
 func (s *identityCacheStub) GetFingerprint(_ context.Context, _ int64) (*Fingerprint, error) {
@@ -32,9 +34,15 @@ func (s *identityCacheStub) SetFingerprint(_ context.Context, _ int64, fp *Finge
 	return nil
 }
 func (s *identityCacheStub) GetMaskedSessionID(_ context.Context, _ int64) (string, error) {
+	if s.maskedSessionErr != nil {
+		return "", s.maskedSessionErr
+	}
 	return s.maskedSessionID, nil
 }
 func (s *identityCacheStub) SetMaskedSessionID(_ context.Context, _ int64, sessionID string) error {
+	if s.setMaskedSessionErr != nil {
+		return s.setMaskedSessionErr
+	}
 	s.maskedSessionID = sessionID
 	return nil
 }
@@ -140,6 +148,23 @@ func TestIdentityService_CreateFingerprintDefaultsToMacOS(t *testing.T) {
 	fp := svc.createFingerprintFromHeaders(nil)
 
 	require.Equal(t, "MacOS", fp.StainlessOS)
+}
+
+func TestIdentityService_RewriteUserIDWithMaskingReturnsStorageError(t *testing.T) {
+	cacheErr := errors.New("masked session cache unavailable")
+	svc := NewIdentityService(&identityCacheStub{maskedSessionErr: cacheErr})
+	account := &Account{
+		ID:       123,
+		Platform: PlatformAnthropic,
+		Type:     AccountTypeOAuth,
+		Extra:    map[string]any{"session_id_masking_enabled": true},
+	}
+	metadataUserID := FormatMetadataUserID("device", "account", "11111111-2222-4333-8444-555555555555", "2.1.161")
+	body := []byte(`{"metadata":{"user_id":` + strconvQuote(metadataUserID) + `},"messages":[]}`)
+
+	_, err := svc.RewriteUserIDWithMasking(context.Background(), body, account, "account", "device", "claude-cli/2.1.161 (external, cli)")
+
+	require.ErrorIs(t, err, cacheErr)
 }
 
 func strconvQuote(v string) string {

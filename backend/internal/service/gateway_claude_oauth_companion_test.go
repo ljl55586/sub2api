@@ -142,10 +142,11 @@ func TestClaimClaudeOAuthSessionCompanions_UnsupportedOrFailingStoreDoesNotClaim
 }
 
 type claudeOAuthCompanionRecordedRequest struct {
-	kind   string
-	header http.Header
-	body   []byte
-	url    string
+	kind    string
+	header  http.Header
+	body    []byte
+	url     string
+	profile HTTPUpstreamProfile
 }
 
 const claudeOAuthCompanionExpectedTitleSystemPrompt = `Generate a concise, sentence-case title (3-7 words) that captures the main topic or goal of this coding session. The title should be clear enough that the user recognizes the session in a list. Use sentence case: capitalize only the first word and proper nouns.
@@ -169,6 +170,11 @@ type claudeOAuthCompanionUpstreamRecorder struct {
 	mu              sync.Mutex
 	requests        []claudeOAuthCompanionRecordedRequest
 	quotaStatus     int
+	quotaStarted    chan struct{}
+	quotaStartOnce  sync.Once
+	quotaRelease    <-chan struct{}
+	quotaFinished   chan struct{}
+	quotaFinishOnce sync.Once
 	titleErr        error
 	titleStarted    chan struct{}
 	titleStartOnce  sync.Once
@@ -191,10 +197,11 @@ func (u *claudeOAuthCompanionUpstreamRecorder) DoWithTLS(req *http.Request, _ st
 
 	u.mu.Lock()
 	u.requests = append(u.requests, claudeOAuthCompanionRecordedRequest{
-		kind:   kind,
-		header: req.Header.Clone(),
-		body:   bytes.Clone(body),
-		url:    req.URL.String(),
+		kind:    kind,
+		header:  req.Header.Clone(),
+		body:    bytes.Clone(body),
+		url:     req.URL.String(),
+		profile: HTTPUpstreamProfileFromContext(req.Context()),
 	})
 	quotaStatus := u.quotaStatus
 	titleErr := u.titleErr
@@ -204,6 +211,17 @@ func (u *claudeOAuthCompanionUpstreamRecorder) DoWithTLS(req *http.Request, _ st
 
 	switch kind {
 	case "quota":
+		u.quotaStartOnce.Do(func() {
+			if u.quotaStarted != nil {
+				close(u.quotaStarted)
+			}
+		})
+		if u.quotaFinished != nil {
+			defer u.quotaFinishOnce.Do(func() { close(u.quotaFinished) })
+		}
+		if quotaRelease := u.quotaRelease; quotaRelease != nil {
+			<-quotaRelease
+		}
 		if quotaStatus == 0 {
 			quotaStatus = http.StatusOK
 		}
@@ -299,6 +317,12 @@ func (u *claudeOAuthCompanionUpstreamRecorder) Find(t *testing.T, kind string) c
 	}
 	require.FailNow(t, "recorded upstream request not found", "kind=%s requests=%v", kind, u.requests)
 	return claudeOAuthCompanionRecordedRequest{}
+}
+
+func (u *claudeOAuthCompanionUpstreamRecorder) Snapshot() []claudeOAuthCompanionRecordedRequest {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return append([]claudeOAuthCompanionRecordedRequest(nil), u.requests...)
 }
 
 func newClaudeOAuthCompanionForwardHarness(t *testing.T) (*GatewayService, *gin.Context, *Account, *ParsedRequest, *claudeOAuthCompanionUpstreamRecorder) {
@@ -449,6 +473,65 @@ func TestGatewayServiceForward_OAuthMimicTitleCompanionDoesNotBlockMain(t *testi
 	}
 }
 
+func TestGatewayServiceForward_OAuthMimicQuotaCompanionDoesNotBlockMain(t *testing.T) {
+	svc, c, account, parsed, upstream := newClaudeOAuthCompanionForwardHarness(t)
+	quotaRelease := make(chan struct{})
+	quotaFinished := make(chan struct{})
+	upstream.quotaStarted = make(chan struct{})
+	upstream.quotaRelease = quotaRelease
+	upstream.quotaFinished = quotaFinished
+
+	var releaseQuotaOnce sync.Once
+	releaseQuota := func() {
+		releaseQuotaOnce.Do(func() { close(quotaRelease) })
+	}
+	quotaStarted := false
+	t.Cleanup(func() {
+		releaseQuota()
+		if !quotaStarted {
+			return
+		}
+		select {
+		case <-quotaFinished:
+		case <-time.After(time.Second):
+			t.Error("blocked quota companion did not finish after test cleanup released it")
+		}
+	})
+
+	type forwardOutcome struct {
+		result *ForwardResult
+		err    error
+	}
+	forwardDone := make(chan forwardOutcome, 1)
+	go func() {
+		result, err := svc.Forward(context.Background(), c, account, parsed)
+		forwardDone <- forwardOutcome{result: result, err: err}
+	}()
+
+	select {
+	case <-upstream.quotaStarted:
+		quotaStarted = true
+	case <-time.After(time.Second):
+		t.Fatal("quota companion did not start")
+	}
+
+	select {
+	case outcome := <-forwardDone:
+		require.NoError(t, outcome.err)
+		require.NotNil(t, outcome.result)
+	case <-time.After(time.Second):
+		t.Fatal("Forward waited for the blocked quota companion")
+	}
+	require.True(t, upstream.HasKind("main"), "main request must reach the upstream while quota is blocked")
+
+	releaseQuota()
+	select {
+	case <-quotaFinished:
+	case <-time.After(time.Second):
+		t.Fatal("quota companion did not finish after release")
+	}
+}
+
 func TestGatewayServiceForward_OAuthMimicCompanionsOnlyOncePerSession(t *testing.T) {
 	svc, c, account, parsed, upstream := newClaudeOAuthCompanionForwardHarness(t)
 
@@ -463,6 +546,39 @@ func TestGatewayServiceForward_OAuthMimicCompanionsOnlyOncePerSession(t *testing
 	require.NotNil(t, result)
 	require.Never(t, func() bool { return upstream.Count() > 4 }, 100*time.Millisecond, 10*time.Millisecond)
 	require.Equal(t, 4, upstream.Count())
+}
+
+func TestGatewayServiceForward_OAuthMimicMaskedSessionsClaimFinalWireSession(t *testing.T) {
+	svc, c, account, parsed, upstream := newClaudeOAuthCompanionForwardHarness(t)
+	const maskedSessionID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+	svc.identityService = NewIdentityService(&identityCacheStub{
+		maskedSessionID: maskedSessionID,
+		fingerprint: &Fingerprint{
+			ClientID:  "companion-device",
+			UserAgent: claude.DefaultHeaders["User-Agent"],
+			UpdatedAt: time.Now().Unix(),
+		},
+	})
+	account.Extra["session_id_masking_enabled"] = true
+
+	result, err := svc.Forward(context.Background(), c, account, parsed)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Eventually(t, func() bool { return upstream.Count() == 3 }, time.Second, 10*time.Millisecond)
+
+	// A different first prompt derives a different canonical session seed. With
+	// masking enabled, the wire session is nevertheless the same account-scoped
+	// mask, so it must not create a duplicate quota/title pair.
+	secondParsed := newClaudeOAuthCompanionParsedRequest(t, "claude-opus-4-8", true, "A distinct second conversation")
+	result, err = svc.Forward(context.Background(), c, account, secondParsed)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Never(t, func() bool { return upstream.Count() > 4 }, 200*time.Millisecond, 10*time.Millisecond)
+	require.Equal(t, 4, upstream.Count())
+
+	for _, req := range upstream.Snapshot() {
+		require.Equal(t, maskedSessionID, parseClaudeOAuthCompanionWireSession(t, req), req.kind)
+	}
 }
 
 func TestGatewayServiceForward_OAuthMimicCompanionMaskedSessionStaysAlignedAcrossAllRequests(t *testing.T) {
@@ -488,6 +604,35 @@ func TestGatewayServiceForward_OAuthMimicCompanionMaskedSessionStaysAlignedAcros
 		require.Equal(t, maskedSessionID, parseClaudeOAuthCompanionWireSession(t, req), kind)
 		require.Equal(t, maskedSessionID, getHeaderRaw(req.header, "x-claude-code-session-id"), kind)
 	}
+}
+
+func TestGatewayServiceForward_OAuthMimicMetadataPassthroughPreservesMetadataAndSkipsCompanions(t *testing.T) {
+	svc, c, account, _, upstream := newClaudeOAuthCompanionForwardHarness(t)
+	metadataUserID := FormatMetadataUserID(
+		"passthrough-device",
+		"passthrough-account",
+		"11111111-2222-4333-8444-555555555555",
+		claude.CLICurrentVersion,
+	)
+	parsedBody := []byte(`{"model":"claude-opus-4-8","max_tokens":1024,"stream":true,"metadata":{"user_id":` + strconvQuote(metadataUserID) + `},"messages":[{"role":"user","content":"Keep this metadata unchanged"}]}`)
+	parsed, err := ParseGatewayRequest(NewRequestBodyRef(parsedBody), PlatformAnthropic)
+	require.NoError(t, err)
+	parsed.SessionContext = &SessionContext{ClientIP: "127.0.0.1", UserAgent: "curl/8.4.0", APIKeyID: 77}
+
+	settings := claudeOAuthNoToolsProfileSettingsForTest(map[string]string{
+		SettingKeyEnableMetadataPassthrough: "true",
+	})
+	svc.settingService = NewSettingService(&gatewayTTLSettingRepo{data: settings}, svc.cfg)
+	// Opting into passthrough must not make an identity-cache error fatal.
+	svc.identityService = NewIdentityService(&identityCacheStub{fingerprintErr: errors.New("synthetic fingerprint cache failure")})
+
+	result, err := svc.Forward(context.Background(), c, account, parsed)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Never(t, func() bool { return upstream.Count() > 1 }, 200*time.Millisecond, 10*time.Millisecond)
+	main := upstream.Find(t, "main")
+	require.Equal(t, metadataUserID, gjson.GetBytes(main.body, "metadata.user_id").String())
+	require.Empty(t, getHeaderRaw(main.header, "x-claude-code-session-id"), "metadata passthrough retains the legacy header contract")
 }
 
 func TestGatewayServiceForward_OAuthMimicCompanionClaimErrorSendsOnlyMain(t *testing.T) {
@@ -624,7 +769,7 @@ func TestGatewayServiceForward_OAuthMimicCompanionBetaPolicyFiltersEffortFromTit
 	require.Equal(t, "json_schema", gjson.GetBytes(title.body, "output_config.format.type").String())
 }
 
-func TestGatewayServiceForward_OAuthMimicCompanionBetaPolicyBlockSkipsGeneratedProfiles(t *testing.T) {
+func TestGatewayServiceForward_OAuthMimicCompanionBetaPolicyBlockRejectsGeneratedMainProfile(t *testing.T) {
 	svc, c, account, parsed, upstream := newClaudeOAuthCompanionForwardHarness(t)
 	policyJSON, err := json.Marshal(BetaPolicySettings{Rules: []BetaPolicyRule{{
 		BetaToken:    claude.BetaRedactThinking,
@@ -639,11 +784,10 @@ func TestGatewayServiceForward_OAuthMimicCompanionBetaPolicyBlockSkipsGeneratedP
 	svc.settingService = NewSettingService(&gatewayTTLSettingRepo{data: settings}, svc.cfg)
 
 	result, err := svc.Forward(context.Background(), c, account, parsed)
-	require.NoError(t, err)
-	require.NotNil(t, result)
-	require.Never(t, func() bool { return upstream.Count() > 1 }, 100*time.Millisecond, 10*time.Millisecond)
-	require.Equal(t, 1, upstream.Count())
-	require.Equal(t, "main", upstream.Find(t, "main").kind)
+	var blockErr *BetaBlockedError
+	require.ErrorAs(t, err, &blockErr)
+	require.Nil(t, result)
+	require.Never(t, func() bool { return upstream.Count() > 0 }, 100*time.Millisecond, 10*time.Millisecond)
 }
 
 func TestGatewayServiceForward_OAuthMimicCompanionBetaPolicyBlockSkipsOnlyTitleForTitleOnlyBeta(t *testing.T) {
@@ -754,6 +898,11 @@ func assertClaudeOAuthCompanionCommonWireShape(t *testing.T, req claudeOAuthComp
 	require.Empty(t, getHeaderRaw(req.header, "x-stainless-helper-method"))
 	require.NotContains(t, string(req.body), "cch=")
 	require.Equal(t, parseClaudeOAuthCompanionWireSession(t, req), getHeaderRaw(req.header, "x-claude-code-session-id"))
+	if req.kind == "main" {
+		require.Equal(t, HTTPUpstreamProfileDefault, req.profile)
+	} else {
+		require.Equal(t, HTTPUpstreamProfileClaudeOAuthCompanion, req.profile)
+	}
 }
 
 func assertClaudeOAuthCompanionTopLevelKeys(t *testing.T, body []byte, expected ...string) {

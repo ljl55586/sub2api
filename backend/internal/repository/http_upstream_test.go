@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -275,6 +276,99 @@ func (s *HTTPUpstreamSuite) TestOpenAIProfileTLSFingerprintDoesNotInheritGeneric
 	transport, ok := entry.client.Transport.(*http.Transport)
 	require.True(s.T(), ok, "expected *http.Transport")
 	require.Equal(s.T(), time.Duration(0), transport.ResponseHeaderTimeout, "OpenAI TLS path should not inherit generic header timeout")
+}
+
+func (s *HTTPUpstreamSuite) TestClaudeOAuthCompanionProfileUsesDedicatedSingleConnectionPool() {
+	s.cfg.Gateway = config.GatewayConfig{
+		ConnectionPoolIsolation: config.ConnectionPoolIsolationAccount,
+	}
+	svc := s.newService()
+
+	main, err := svc.getClientEntry("", 101, 3, service.HTTPUpstreamProfileDefault, false, false)
+	require.NoError(s.T(), err)
+	companion, err := svc.getClientEntry("", 101, 3, service.HTTPUpstreamProfileClaudeOAuthCompanion, false, false)
+	require.NoError(s.T(), err)
+	require.NotSame(s.T(), main, companion, "companion traffic must not reuse the main account pool")
+	require.Len(s.T(), svc.clients, 2, "main and companion profiles must use distinct cache keys")
+
+	mainTransport, ok := main.client.Transport.(*http.Transport)
+	require.True(s.T(), ok)
+	companionTransport, ok := companion.client.Transport.(*http.Transport)
+	require.True(s.T(), ok)
+	require.Equal(s.T(), 3, mainTransport.MaxConnsPerHost)
+	require.Equal(s.T(), 1, companionTransport.MaxConnsPerHost)
+	require.Equal(s.T(), 1, companionTransport.MaxIdleConnsPerHost)
+
+	tlsProfile := &tlsfingerprint.Profile{Name: "test"}
+	tlsMain, err := svc.getClientEntryWithTLS("", 101, 3, tlsProfile, service.HTTPUpstreamProfileDefault, false, false)
+	require.NoError(s.T(), err)
+	tlsCompanion, err := svc.getClientEntryWithTLS("", 101, 3, tlsProfile, service.HTTPUpstreamProfileClaudeOAuthCompanion, false, false)
+	require.NoError(s.T(), err)
+	require.NotSame(s.T(), tlsMain, tlsCompanion, "TLS companion traffic must not reuse the main account pool")
+	tlsCompanionTransport, ok := tlsCompanion.client.Transport.(*http.Transport)
+	require.True(s.T(), ok)
+	require.Equal(s.T(), 1, tlsCompanionTransport.MaxConnsPerHost)
+}
+
+func (s *HTTPUpstreamSuite) TestClaudeOAuthCompanionProfileDoesNotBlockMainAccountPool() {
+	t := s.T()
+	s.cfg.Gateway = config.GatewayConfig{
+		ConnectionPoolIsolation: config.ConnectionPoolIsolationAccount,
+	}
+	svc := s.newService()
+	titleStarted := make(chan struct{})
+	releaseTitle := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Header.Get("X-Test-Role") == "title" {
+			close(titleStarted)
+			<-releaseTitle
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	titleReq, err := http.NewRequest(http.MethodPost, server.URL, nil)
+	require.NoError(t, err)
+	titleReq.Header.Set("X-Test-Role", "title")
+	titleReq = titleReq.WithContext(service.WithHTTPUpstreamProfile(titleReq.Context(), service.HTTPUpstreamProfileClaudeOAuthCompanion))
+	titleDone := make(chan error, 1)
+	go func() {
+		resp, doErr := svc.Do(titleReq, "", 404, 1)
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		titleDone <- doErr
+	}()
+	select {
+	case <-titleStarted:
+	case <-time.After(time.Second):
+		t.Fatal("title request did not reach the upstream")
+	}
+
+	mainReq, err := http.NewRequest(http.MethodPost, server.URL, nil)
+	require.NoError(t, err)
+	mainDone := make(chan error, 1)
+	go func() {
+		resp, doErr := svc.Do(mainReq, "", 404, 1)
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		mainDone <- doErr
+	}()
+	select {
+	case doErr := <-mainDone:
+		require.NoError(t, doErr)
+	case <-time.After(time.Second):
+		t.Fatal("main request waited behind the companion connection")
+	}
+
+	close(releaseTitle)
+	select {
+	case doErr := <-titleDone:
+		require.NoError(t, doErr)
+	case <-time.After(time.Second):
+		t.Fatal("title request did not finish after release")
+	}
 }
 
 func (s *HTTPUpstreamSuite) TestOpenAIProfileHTTP2DisabledUsesHTTP1Transport() {

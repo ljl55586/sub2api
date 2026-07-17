@@ -20,10 +20,19 @@ import (
 type upstreamRequestBuildOptions struct {
 	finalAnthropicBetaOverride *string
 	debugSnapshotTag           string
+	oauthMimicMetadataFinal    bool
 }
 
+const oauthMimicMetadataFinalContextKey = "oauthMimicMetadataFinal"
+
 func (s *GatewayService) buildUpstreamRequest(ctx context.Context, c *gin.Context, account *Account, body []byte, token, tokenType, modelID string, reqStream bool, mimicClaudeCode bool) (*http.Request, []byte, error) {
-	return s.buildUpstreamRequestWithOptions(ctx, c, account, body, token, tokenType, modelID, reqStream, mimicClaudeCode, upstreamRequestBuildOptions{})
+	opts := upstreamRequestBuildOptions{}
+	if c != nil {
+		if value, ok := c.Get(oauthMimicMetadataFinalContextKey); ok {
+			opts.oauthMimicMetadataFinal, _ = value.(bool)
+		}
+	}
+	return s.buildUpstreamRequestWithOptions(ctx, c, account, body, token, tokenType, modelID, reqStream, mimicClaudeCode, opts)
 }
 
 func (s *GatewayService) buildUpstreamRequestWithOptions(ctx context.Context, c *gin.Context, account *Account, body []byte, token, tokenType, modelID string, reqStream bool, mimicClaudeCode bool, opts upstreamRequestBuildOptions) (*http.Request, []byte, error) {
@@ -80,14 +89,18 @@ func (s *GatewayService) buildUpstreamRequestWithOptions(ctx context.Context, c 
 			// 2. 重写metadata.user_id（需要指纹中的ClientID和账号的account_uuid）
 			// 如果启用了会话ID伪装，会在重写后替换 session 部分为固定值
 			// 当 metadata 透传开启时跳过重写
-			if !enableMPT && mimicClaudeCode {
+			if !enableMPT && mimicClaudeCode && !opts.oauthMimicMetadataFinal {
 				accountUUID := account.GetExtraString("account_uuid")
 				deviceID := strings.TrimSpace(account.GetClaudeUserID())
 				if deviceID == "" {
 					deviceID = strings.TrimSpace(fp.ClientID)
 				}
 				if accountUUID != "" && deviceID != "" {
-					if newBody, err := s.identityService.RewriteUserIDWithMasking(ctx, body, account, accountUUID, deviceID, claude.DefaultHeaders["User-Agent"]); err == nil && len(newBody) > 0 {
+					newBody, rewriteErr := s.identityService.RewriteUserIDWithMasking(ctx, body, account, accountUUID, deviceID, claude.DefaultHeaders["User-Agent"])
+					if rewriteErr != nil {
+						return nil, nil, fmt.Errorf("rewrite OAuth metadata user_id: %w", rewriteErr)
+					}
+					if len(newBody) > 0 {
 						body = newBody
 					}
 				}
@@ -201,8 +214,8 @@ func (s *GatewayService) buildUpstreamRequestWithOptions(ctx context.Context, c 
 	}
 
 	// OAuth mimic 的 header session 必须来自最终 body，避免分别生成导致身份漂移。
-	// 真实 Claude Code 路径不进入本分支，客户端 metadata/header 保持原样。
-	if tokenType == "oauth" && mimicClaudeCode {
+	// metadata passthrough 是显式兼容模式，保留其既有行为：不生成或强制该 header。
+	if tokenType == "oauth" && mimicClaudeCode && !enableMPT {
 		deleteHeaderAllForms(req.Header, "x-client-request-id")
 		parsedUserID := ParseMetadataUserID(gjson.GetBytes(body, "metadata.user_id").String())
 		if parsedUserID == nil || strings.TrimSpace(parsedUserID.SessionID) == "" {
