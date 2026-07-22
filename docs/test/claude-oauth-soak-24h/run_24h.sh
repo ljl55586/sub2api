@@ -120,6 +120,18 @@ if ! soak_validate_schedule; then
   : >"$SOAK_OUTPUT_DIR/control/STOP"
   exit 1
 fi
+
+scheduled_sessions=$(awk -F '\t' '$1 !~ /^#/ && $3 != "" && !seen[$3]++ { print $3 }' "$script_dir/schedule.tsv")
+if [[ -z $scheduled_sessions ]]; then
+  echo "schedule.tsv has no sessions for identity initialization" >&2
+  exit 1
+fi
+# Session names are restricted to [A-Za-z0-9._-]+ by soak_validate_schedule.
+# shellcheck disable=SC2086
+"$script_dir/init_session_identities.sh" $scheduled_sessions
+export SOAK_SESSION_IDENTITIES_FILE=${SOAK_SESSION_IDENTITIES_FILE:-"$SOAK_OUTPUT_DIR/session-identities.json"}
+printf 'session_identities_file=%s\n' "$SOAK_SESSION_IDENTITIES_FILE" >>"$SOAK_OUTPUT_DIR/run.meta"
+
 if [[ ${SOAK_VALIDATE_ONLY:-0} == 1 ]]; then
   soak_log "SOAK_VALIDATE_ONLY=1; schedule validation completed without sending requests"
   exit 0

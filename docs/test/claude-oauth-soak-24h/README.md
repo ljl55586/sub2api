@@ -75,7 +75,8 @@ git checkout codex/claude-request-alignment
 git pull --ff-only origin codex/claude-request-alignment
 
 cd /root/sub2api-src/docs/test/claude-oauth-soak-24h
-chmod 700 run_24h.sh send_turn.sh summarize.sh usage_guard.sh sessions/*.sh
+chmod 700 run_24h.sh send_turn.sh summarize.sh usage_guard.sh \
+  init_session_identities.sh verify_session_identities.sh sessions/*.sh
 ```
 
 如果本次提交只修改 `docs/test/claude-oauth-soak-24h` 和 `.gitignore`，不需要重新构建 sub2api 镜像。如果同时更新了后端转发代码，仍需按正常部署流程重新 build 并 recreate `sub2api` 容器。
@@ -102,6 +103,7 @@ command -v curl
 command -v jq
 command -v flock
 command -v tmux
+command -v od
 ```
 
 并行模式必须有 `flock`。在 Debian/Ubuntu 上，如果缺失，它通常由 `util-linux` 软件包提供；安装完成后再继续。
@@ -150,6 +152,7 @@ export SOAK_PARALLEL_SESSIONS='1'
 
 export SOAK_ACCOUNT_ID='1'
 export SOAK_DEPLOY_DIR='/root/sub2api-deploy'
+export SOAK_IDENTITY_HOME='/root/sub2api-soak-identity'
 export SOAK_USAGE_GUARD_MODE='required'
 export SOAK_USAGE_5H_STOP_PERCENT='78'
 export SOAK_USAGE_7D_STOP_PERCENT='70'
@@ -185,10 +188,19 @@ unset SOAK_VALIDATE_ONLY
 
 ```text
 schedule validated: 30 burst rows grouped into parallel waves
+session identities ready: file=.../session-identities.json device=............ sessions=3
 SOAK_VALIDATE_ONLY=1; schedule validation completed without sending requests
 ```
 
 这个步骤不会调用 sub2api 或 Anthropic。校验目录已经非空，不能用于正式运行。
+
+验证 A、B、C 共用一个 device ID、各自拥有不同的固定 session ID：
+
+```bash
+./verify_session_identities.sh "$SOAK_OUTPUT_DIR"
+```
+
+`SOAK_IDENTITY_HOME` 中的 `account-1.device-id` 是账号级持久身份，后续正式运行和重新测试都会复用；每个新 `SOAK_OUTPUT_DIR` 则生成一组新的 A/B/C session ID。
 
 ### 0.9 创建全新的正式输出目录并启动
 
@@ -199,6 +211,12 @@ printf 'formal output: %s\n' "$SOAK_OUTPUT_DIR"
 ```
 
 启动后先进入 5–15 分钟的随机等待是正常现象。第一组 wave 随后会并行启动 A1、B1、C1；如果需要 bootstrap 用量样本，则先只放行其中一路。
+
+正式启动后可再次执行身份校验；已有请求时，它还会逐个检查请求体内的 metadata 是否与该 session 的固定身份一致：
+
+```bash
+./verify_session_identities.sh "$SOAK_OUTPUT_DIR"
+```
 
 不要在同一个 `SOAK_OUTPUT_DIR` 上再次启动第二个 `run_24h.sh`。脚本发现目录非空会拒绝启动。
 
@@ -366,14 +384,15 @@ export SOAK_PARALLEL_SESSIONS='1'
 # 自动用量保护直接读取本机 sub2api PostgreSQL
 export SOAK_ACCOUNT_ID='1'
 export SOAK_DEPLOY_DIR='/root/sub2api-deploy'
+export SOAK_IDENTITY_HOME='/root/sub2api-soak-identity'
 export SOAK_USAGE_GUARD_MODE='required'
 export SOAK_USAGE_5H_STOP_PERCENT='78'
 export SOAK_USAGE_7D_STOP_PERCENT='70'
 ```
 
-同一次测试中不要更换 API key、`SOAK_USER_AGENT` 或运行主机。三套项目首轮提示词不同，所以会生成三个不同的上游 session；同一项目的第一条 user 内容始终不变，所以后续轮次保持同一个上游 session。
+同一次测试中不要更换 API key、`SOAK_USER_AGENT`、`SOAK_ACCOUNT_ID`、`SOAK_IDENTITY_HOME` 或运行主机。初始化器为同一账号保存一个 64 位十六进制 device ID，并为每个新 run 的 A、B、C 分别生成一个 UUID。每次请求都携带该会话固定的 `metadata.user_id.session_id`，所以 sub2api 在选账号和检查 `max_sessions` 之前就能稳定识别三条会话。
 
-脚本中的 `session-a`、`session-b`、`session-c` 只是本地状态文件名，不会作为 metadata 透传给上游。
+`session-a`、`session-b`、`session-c` 是本地映射名；发给 sub2api 的是对应 UUID，不是这些文字名称。metadata passthrough 必须保持关闭，因此下游 metadata 不会原样发给 Anthropic；OAuth 模拟逻辑仍会按账号指纹和第一条 user 内容生成稳定的上游 session ID。
 
 `SOAK_USAGE_GUARD_MODE=required` 表示读取用量失败时 fail-closed，不再发送请求。首次运行尚无被动用量样本时，脚本最多放行一个 bootstrap 请求；该响应应该让 sub2api 保存 5h/7d 响应头，下一次请求前如果仍读不到数据就会停止。`best_effort` 会在读取失败时继续，不适合保护 Claude Pro 账号；`off` 只应用于不联网的脚本测试。
 
@@ -401,8 +420,16 @@ unset SOAK_DRY_RUN
 查看生成的请求：
 
 ```bash
-jq '{model,max_tokens,message_count:(.messages|length),last_message:.messages[-1]}' \
+jq '{
+  model,
+  max_tokens,
+  metadata:(.metadata.user_id | fromjson),
+  message_count:(.messages|length),
+  last_message:.messages[-1]
+}' \
   "$SOAK_OUTPUT_DIR"/requests/*.json
+
+./verify_session_identities.sh "$SOAK_OUTPUT_DIR"
 ```
 
 必须确认：
@@ -411,6 +438,7 @@ jq '{model,max_tokens,message_count:(.messages|length),last_message:.messages[-1
 - `max_tokens` 是 1536；
 - 没有 `stream` 字段；
 - 没有 `tools`；
+- metadata 中的 device ID 是 64 位十六进制，session ID 与 `session-identities.json` 一致；
 - 只有最新 user content 带 `cache_control`；
 - TTL 是 `5m`，没有 `1h`。
 
@@ -510,6 +538,14 @@ touch "$run_dir/control/STOP"
 
 ## 8. cache_control 和历史维护
 
+每个 run 启动时先生成：
+
+```text
+session-identities.json
+```
+
+其中 A、B、C 共用账号级 device ID，但各自使用不同的 session UUID。`send_turn.sh` 每次发送前都会读取并校验该文件，把固定身份写入 `metadata.user_id`。身份文件不随 messages 增长而改变；缺失、格式错误、账号/device 不匹配或 session UUID 重复都会在发送前停止。
+
 `send_turn.sh` 为每个 session 保存一个：
 
 ```text
@@ -557,6 +593,16 @@ UPSTREAM_SESSION_COMPANION_TITLE
 ```
 
 每个主请求都应看到一组 `CLIENT_ORIGINAL` 和 `UPSTREAM_FORWARD`。同一项目会话中的 `x-claude-code-session-id` 应保持不变；A、B、C 三个项目之间应不同。
+
+第一组 wave 发送到第 2 轮后，额外检查 sub2api 的调度 hash 来源：
+
+```bash
+cd /root/sub2api-deploy
+docker compose logs --since 20m sub2api 2>&1 |
+  grep -E 'sticky.hash_source|sticky.session_hash_generated'
+```
+
+`sticky.hash_source` 应显示 `source=metadata_user_id`。A1/A2/A3 应重复同一个 session UUID，B、C 同理，三组之间不同；不应再在 A2 出现第 4 个新调度会话。如果这里仍显示 `source=cacheable_content`，立即停止测试，说明服务器没有运行修正后的脚本请求体。
 
 ### 9.2 容器资源
 
@@ -628,6 +674,7 @@ K = 本地窗口费用增量 / 上游 5h utilization 增量
 run.meta
 run.log
 manifest.tsv
+session-identities.json
 successful-request-times.txt
 inflight-request-reservations.tsv
 usage-samples.tsv
@@ -673,6 +720,7 @@ jq '.messages | length' "$SOAK_OUTPUT_DIR"/requests/请求文件名.json
 
 - 没有 400、401、403、429；
 - 每个 wave 最多三条不同会话请求并行，同一会话没有并发或重复发送；
+- 所有下游请求共用账号级 device ID，A/B/C 各自的 metadata session ID 跨 30 轮稳定且互不相同；
 - A、B、C 各自的上游 session ID 在多轮中稳定，三者之间不同；
 - 预期 hit 样本大多数有长前缀量级的 `cache_read_input_tokens`；
 - 预期 TTL/cold miss 大多数有相应的 `cache_creation_input_tokens`；
@@ -693,4 +741,4 @@ jq '.messages | length' "$SOAK_OUTPUT_DIR"/requests/请求文件名.json
 4. 在 `schedule.tsv` 增加 Session D 的 burst；
 5. 把 sub2api 的最大会话数从 3 调整到实际会话总数。
 
-公共 curl、历史维护、随机等待、缓存分类、滚动请求上限和用量保护都在 `lib/runtime.sh`，新增会话不需要修改这些逻辑。同一个 phase/wave 中的会话会并行，所以新增会话后必须同时评估账号并发、RPM 和最大会话数；同一会话不能在同一个 wave 出现两次。
+总调度器会从 `schedule.tsv` 自动发现 Session D，并在新 run 的 `session-identities.json` 中为它生成一个独立 UUID，不需要手工维护身份表。公共 curl、历史维护、随机等待、缓存分类、滚动请求上限和用量保护都在 `lib/runtime.sh`。同一个 phase/wave 中的会话会并行，所以新增会话后必须同时评估账号并发、RPM 和最大会话数；同一会话不能在同一个 wave 出现两次。

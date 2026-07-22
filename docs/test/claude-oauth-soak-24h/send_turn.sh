@@ -45,6 +45,7 @@ model=${SOAK_MODEL:-claude-opus-4-8}
 max_tokens=${SOAK_MAX_TOKENS:-1536}
 user_agent=${SOAK_USER_AGENT:-soak-curl/1.0}
 endpoint="${SOAK_BASE_URL%/}/v1/messages"
+identity_file=${SOAK_SESSION_IDENTITIES_FILE:-"$output_dir/session-identities.json"}
 
 if [[ ! $max_tokens =~ ^[1-9][0-9]*$ ]]; then
   echo "SOAK_MAX_TOKENS must be a positive integer" >&2
@@ -52,6 +53,23 @@ if [[ ! $max_tokens =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 mkdir -p "$output_dir"/{control,requests,responses,headers,state,tmp}
+if [[ ! -f $identity_file ]] || \
+  ! jq -e --arg session "$session_name" '.sessions[$session].session_id | type == "string"' "$identity_file" >/dev/null 2>&1; then
+  "$script_dir/init_session_identities.sh" "$session_name" >/dev/null
+fi
+
+metadata_user_id=$(jq -er --arg session "$session_name" '
+  .device_id as $device_id
+  | .sessions[$session].session_id as $session_id
+  | select($device_id | test("^[a-f0-9]{64}$"))
+  | select($session_id | test("^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$"))
+  | {device_id: $device_id, account_uuid: "", session_id: $session_id}
+  | tojson
+' "$identity_file") || {
+  echo "valid session identity not found for $session_name in $identity_file" >&2
+  exit 65
+}
+
 state_file="$output_dir/state/$session_name.messages.json"
 tmp_history=$(mktemp "$output_dir/tmp/history.XXXXXX")
 trap 'rm -f "$tmp_history"' EXIT
@@ -75,10 +93,12 @@ jq -n \
   --slurpfile history "$tmp_history" \
   --rawfile prompt "$prompt_file" \
   --arg model "$model" \
+  --arg metadata_user_id "$metadata_user_id" \
   --argjson max_tokens "$max_tokens" \
   '{
     model: $model,
     max_tokens: $max_tokens,
+    metadata: {user_id: $metadata_user_id},
     messages: ($history[0] + [{
       role: "user",
       content: [{

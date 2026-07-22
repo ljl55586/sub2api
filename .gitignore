@@ -143,6 +143,7 @@ docs/test/*
 !docs/test/claude-oauth-soak-24h/**
 docs/test/claude-oauth-soak-24h/runs/
 docs/test/claude-oauth-soak-24h/output/
+docs/test/claude-oauth-soak-24h/.runtime-identity/
 .serena/
 .codex/
 frontend/coverage/
