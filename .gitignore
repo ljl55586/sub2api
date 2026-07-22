@@ -137,6 +137,12 @@ docs/*
 !docs/ADMIN_PAYMENT_INTEGRATION_API.md
 !docs/legal/
 !docs/legal/*.md
+!docs/test/
+docs/test/*
+!docs/test/claude-oauth-soak-24h/
+!docs/test/claude-oauth-soak-24h/**
+docs/test/claude-oauth-soak-24h/runs/
+docs/test/claude-oauth-soak-24h/output/
 .serena/
 .codex/
 frontend/coverage/
