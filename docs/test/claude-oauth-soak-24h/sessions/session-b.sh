@@ -8,7 +8,7 @@ source "$SOAK_SCRIPT_DIR/lib/runtime.sh"
 soak_init_runtime
 
 if [[ $# -ne 4 ]]; then
-  echo "usage: $0 <first-turn> <cold|ttl_miss> <gap-min-seconds> <gap-max-seconds>" >&2
+  echo "usage: $0 <first-turn> <cold|hit|ttl_miss> <gap-min-seconds> <gap-max-seconds>" >&2
   exit 64
 fi
 

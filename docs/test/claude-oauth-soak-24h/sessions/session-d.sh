@@ -13,6 +13,6 @@ if [[ $# -ne 4 ]]; then
 fi
 
 soak_send_burst \
-  session-c \
-  "$SOAK_SCRIPT_DIR/prompts/session-c-redis-delay-queue.md" \
+  session-d \
+  "$SOAK_SCRIPT_DIR/prompts/session-d-payment-reconciliation.md" \
   "$1" "$2" "$3" "$4"

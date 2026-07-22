@@ -26,7 +26,7 @@ if ! jq -e '
   exit 65
 fi
 
-scheduled_sessions=$(awk -F '\t' '$1 !~ /^#/ && $3 != "" && !seen[$3]++ { print $3 }' "$script_dir/schedule.tsv")
+scheduled_sessions=$(awk -F '\t' '$1 !~ /^#/ && $2 != "" && !seen[$2]++ { print $2 }' "$script_dir/schedule.tsv")
 for session_name in $scheduled_sessions; do
   if ! jq -e --arg session "$session_name" '.sessions[$session].session_id | type == "string"' "$identity_file" >/dev/null; then
     echo "scheduled session identity is missing: $session_name" >&2

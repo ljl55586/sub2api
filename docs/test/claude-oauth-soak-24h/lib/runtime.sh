@@ -262,9 +262,19 @@ soak_check_usage_limits() {
 
 soak_reserve_rolling_slot() {
   local reservation_id=$1
-  local limit=${SOAK_MAX_REQUESTS_PER_5H:-18}
+  local limit=${SOAK_MAX_REQUESTS_PER_5H:-0}
   local window_seconds=$((5 * 60 * 60))
   local reservation_stale_seconds=${SOAK_RESERVATION_STALE_SECONDS:-1800}
+  if [[ ! $limit =~ ^[0-9]+$ ]]; then
+    soak_log "SOAK_MAX_REQUESTS_PER_5H must be a non-negative integer"
+    return 64
+  fi
+  if (( limit == 0 )); then
+    soak_shared_lock
+    printf '%s\t%s\n' "$reservation_id" "$(date +%s)" >>"$SOAK_RESERVATIONS_FILE"
+    soak_shared_unlock
+    return
+  fi
   while true; do
     soak_check_stop
     soak_check_deadline
@@ -456,8 +466,8 @@ soak_send_burst() {
     return 64
   fi
   case "$first_expectation" in
-    cold|ttl_miss) ;;
-    *) echo "first expectation must be cold or ttl_miss: $first_expectation" >&2; return 64 ;;
+    cold|hit|ttl_miss) ;;
+    *) echo "first expectation must be cold, hit, or ttl_miss: $first_expectation" >&2; return 64 ;;
   esac
   if [[ ! $gap_min =~ ^[0-9]+$ || ! $gap_max =~ ^[0-9]+$ ]] || (( gap_max < gap_min )); then
     echo "invalid burst wait range: $gap_min-$gap_max" >&2

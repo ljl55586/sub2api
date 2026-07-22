@@ -4,7 +4,7 @@ set -euo pipefail
 umask 077
 
 if [[ $# -ne 3 ]]; then
-  echo "usage: $0 <session-a|session-b|session-c> <prompt-file> <cold|hit|ttl_miss>" >&2
+  echo "usage: $0 <session-a|session-b|session-c|session-d|session-e> <prompt-file> <cold|hit|ttl_miss>" >&2
   exit 64
 fi
 
