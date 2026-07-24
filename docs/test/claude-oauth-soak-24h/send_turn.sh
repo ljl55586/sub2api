@@ -54,6 +54,7 @@ upstream_approval_required=${SOAK_UPSTREAM_APPROVAL_REQUIRED:-0}
 upstream_approval_dir=${SOAK_UPSTREAM_APPROVAL_DIR:-}
 upstream_approval_token=${SOAK_UPSTREAM_APPROVAL_TOKEN:-}
 upstream_preview_pager=${SOAK_UPSTREAM_PREVIEW_PAGER:-auto}
+auto_approve_upstream=${SOAK_AUTO_APPROVE_UPSTREAM:-0}
 companion_delay_min_seconds=${SOAK_COMPANION_DELAY_MIN_SECONDS:-45}
 companion_delay_max_seconds=${SOAK_COMPANION_DELAY_MAX_SECONDS:-90}
 claude_oauth_companion_delay_header='X-Sub2API-Claude-Companion-Delay-Seconds'
@@ -83,6 +84,13 @@ case "$upstream_approval_required" in
     exit 64
     ;;
 esac
+case "$auto_approve_upstream" in
+  0|1) ;;
+  *)
+    echo "SOAK_AUTO_APPROVE_UPSTREAM must be 0 or 1" >&2
+    exit 64
+    ;;
+esac
 case "$upstream_preview_pager" in
   auto|0|1) ;;
   *)
@@ -107,6 +115,10 @@ if [[ ! $companion_delay_min_seconds =~ ^[0-9]+$ ||
 fi
 if [[ $confirm_before_send == 1 && ${SOAK_DRY_RUN:-0} == 1 ]]; then
   echo "SOAK_CONFIRM_BEFORE_SEND=1 cannot be combined with SOAK_DRY_RUN=1" >&2
+  exit 64
+fi
+if [[ $auto_approve_upstream == 1 && $upstream_approval_required != 1 ]]; then
+  echo "SOAK_AUTO_APPROVE_UPSTREAM=1 requires SOAK_UPSTREAM_APPROVAL_REQUIRED=1" >&2
   exit 64
 fi
 if [[ $upstream_approval_required == 1 ]]; then
@@ -420,11 +432,20 @@ process_upstream_preview() {
   fi
 
   cp -- "$preview_file" "$audit_file"
-  show_upstream_preview "$preview_file" "$audit_file" "$stage_id" "$actual_kinds"
-  if ! check_confirmation_safety_guards || ! read_send_request_confirmation; then
-    write_upstream_approval_marker "$active_reject_path" "rejected"
-    active_reject_path=""
-    return 75
+  if [[ $auto_approve_upstream == 1 ]]; then
+    if ! check_confirmation_safety_guards; then
+      write_upstream_approval_marker "$active_reject_path" "automatic-safety-rejection"
+      active_reject_path=""
+      return 75
+    fi
+    echo "automatic upstream approval validated: stage=$stage_id bundle=$actual_kinds audit=$audit_file"
+  else
+    show_upstream_preview "$preview_file" "$audit_file" "$stage_id" "$actual_kinds"
+    if ! check_confirmation_safety_guards || ! read_send_request_confirmation; then
+      write_upstream_approval_marker "$active_reject_path" "rejected"
+      active_reject_path=""
+      return 75
+    fi
   fi
   write_upstream_approval_marker "$upstream_approval_dir/$stage_id.approve" "approved"
   active_reject_path=""
@@ -432,7 +453,11 @@ process_upstream_preview() {
   if (( processed_approval_stages == 1 )); then
     adjust_cache_expectation_after_confirmation
   fi
-  echo "confirmation accepted; releasing exact upstream stage=$stage_id bundle=$actual_kinds"
+  if [[ $auto_approve_upstream == 1 ]]; then
+    echo "automatic upstream approval accepted; releasing exact stage=$stage_id bundle=$actual_kinds"
+  else
+    echo "confirmation accepted; releasing exact upstream stage=$stage_id bundle=$actual_kinds"
+  fi
 }
 
 monitor_upstream_approvals() {

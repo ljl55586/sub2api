@@ -85,6 +85,7 @@ if ! jq -e '
   and .confirmation_required == 1
   and .confirmation_scope == "final_upstream_stage"
   and .confirmation_timeout_seconds == 0
+  and .approval_mode == "manual"
   and .planned_sessions == 1
   and .planned_requests == 30
 ' <(
@@ -109,4 +110,81 @@ if ! jq -e '
   exit 1
 fi
 
-printf '%s\n' 'single-session 30-request confirmation runner tests passed'
+automatic_output_dir="$test_dir/automatic-run"
+automatic_approval_dir="$test_dir/automatic-upstream-approval"
+mkdir -p "$automatic_approval_dir"
+
+set +e
+PATH="$fake_bin:$PATH" \
+  SOAK_BASE_URL='http://127.0.0.1:1' \
+  SOAK_API_KEY='test-key' \
+  SOAK_ACCOUNT_ID='1' \
+  SOAK_OUTPUT_DIR="$automatic_output_dir" \
+  SOAK_IDENTITY_HOME="$test_dir/automatic-identity" \
+  SOAK_USAGE_GUARD_MODE='off' \
+  SOAK_SKIP_WAITS='1' \
+  SOAK_STREAM='true' \
+  SOAK_CONFIRM_BEFORE_SEND='0' \
+  SOAK_AUTO_APPROVE_UPSTREAM='1' \
+  SOAK_UPSTREAM_APPROVAL_DIR="$automatic_approval_dir" \
+  SOAK_UPSTREAM_APPROVAL_TOKEN='approval-secret' \
+  SOAK_UPSTREAM_PREVIEW_PAGER='0' \
+  FAKE_CURL_UPSTREAM_APPROVAL_DIR="$automatic_approval_dir" \
+  FAKE_CURL_EXPECT_APPROVAL_TOKEN='approval-secret' \
+  FAKE_CURL_RESPONSE_FILE="$script_dir/testdata/valid-response.json" \
+    "$script_dir/run_24h.sh" </dev/null >"$test_dir/automatic-run.log" 2>&1
+automatic_runner_rc=$?
+set -e
+
+if (( automatic_runner_rc != 0 )); then
+  echo "the automatic single-session runner failed with exit code $automatic_runner_rc" >&2
+  sed -n '1,160p' "$test_dir/automatic-run.log" >&2
+  exit 1
+fi
+
+automatic_request_count=$(
+  find "$automatic_output_dir/requests" -type f -name '*.json' |
+    wc -l |
+    tr -d ' '
+)
+automatic_accepted_count=$(
+  grep -Fc 'automatic upstream approval accepted; releasing exact stage=' \
+    "$test_dir/automatic-run.log"
+)
+if [[ $automatic_request_count != 30 || $automatic_accepted_count != 30 ]] ||
+  grep -F 'Type exactly SEND REQUEST' "$test_dir/automatic-run.log" >/dev/null; then
+  echo "automatic runner was not a 30-request stdin-free run" >&2
+  exit 1
+fi
+
+if ! jq -e '
+  .parallel_sessions == 0
+  and .confirmation_required == 0
+  and .confirmation_scope == "final_upstream_stage"
+  and .approval_mode == "automatic"
+  and .scheduling_mode == "single_session_automatic_waves"
+  and .planned_sessions == 1
+  and .planned_requests == 30
+' <(
+  awk -F '=' '
+    {
+      key=$1
+      value=substr($0, index($0, "=") + 1)
+      if (value ~ /^[0-9]+$/) {
+        printf "%s\"%s\":%s", separator, key, value
+      } else {
+        gsub(/\\/, "\\\\", value)
+        gsub(/"/, "\\\"", value)
+        printf "%s\"%s\":\"%s\"", separator, key, value
+      }
+      separator=","
+    }
+    BEGIN { printf "{" }
+    END { print "}" }
+  ' "$automatic_output_dir/run.meta"
+) >/dev/null; then
+  echo "run.meta does not record automatic approval mode" >&2
+  exit 1
+fi
+
+printf '%s\n' 'single-session manual and automatic 30-request runner tests passed'

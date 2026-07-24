@@ -11,8 +11,26 @@ export SOAK_PARALLEL_SESSIONS=0
 export SOAK_CONFIRM_BEFORE_SEND=0
 export SOAK_UPSTREAM_APPROVAL_REQUIRED=1
 export SOAK_CONFIRM_TIMEOUT_SECONDS=${SOAK_CONFIRM_TIMEOUT_SECONDS:-0}
+export SOAK_AUTO_APPROVE_UPSTREAM=${SOAK_AUTO_APPROVE_UPSTREAM:-0}
 export SOAK_COMPANION_DELAY_MIN_SECONDS=${SOAK_COMPANION_DELAY_MIN_SECONDS:-45}
 export SOAK_COMPANION_DELAY_MAX_SECONDS=${SOAK_COMPANION_DELAY_MAX_SECONDS:-90}
+
+case "$SOAK_AUTO_APPROVE_UPSTREAM" in
+  0)
+    confirmation_required=1
+    approval_mode=manual
+    scheduling_mode=single_session_confirmed_waves
+    ;;
+  1)
+    confirmation_required=0
+    approval_mode=automatic
+    scheduling_mode=single_session_automatic_waves
+    ;;
+  *)
+    echo "SOAK_AUTO_APPROVE_UPSTREAM must be 0 or 1" >&2
+    exit 64
+    ;;
+esac
 
 planned_session_count=1
 planned_turns_per_session=30
@@ -36,10 +54,11 @@ export SOAK_SUCCESS_TIMES_FILE="$SOAK_OUTPUT_DIR/successful-request-times.txt"
 export SOAK_RESERVATIONS_FILE="$SOAK_OUTPUT_DIR/inflight-request-reservations.tsv"
 export SOAK_RUN_LOG="$SOAK_OUTPUT_DIR/run.log"
 export SOAK_USAGE_SAMPLES_FILE="$SOAK_OUTPUT_DIR/usage-samples.tsv"
-printf 'start_epoch=%s\ndeadline_epoch=%s\nparallel_sessions=%s\nconfirmation_required=1\nconfirmation_scope=final_upstream_stage\nconfirmation_timeout_seconds=%s\ncompanion_delay_min_seconds=%s\ncompanion_delay_max_seconds=%s\nscheduling_mode=single_session_confirmed_waves\n' \
+printf 'start_epoch=%s\ndeadline_epoch=%s\nparallel_sessions=%s\nconfirmation_required=%s\nconfirmation_scope=final_upstream_stage\nconfirmation_timeout_seconds=%s\napproval_mode=%s\ncompanion_delay_min_seconds=%s\ncompanion_delay_max_seconds=%s\nscheduling_mode=%s\n' \
   "$start_epoch" "$SOAK_DEADLINE_EPOCH" "$SOAK_PARALLEL_SESSIONS" \
-  "$SOAK_CONFIRM_TIMEOUT_SECONDS" "$SOAK_COMPANION_DELAY_MIN_SECONDS" \
-  "$SOAK_COMPANION_DELAY_MAX_SECONDS" >"$SOAK_OUTPUT_DIR/run.meta"
+  "$confirmation_required" "$SOAK_CONFIRM_TIMEOUT_SECONDS" "$approval_mode" \
+  "$SOAK_COMPANION_DELAY_MIN_SECONDS" "$SOAK_COMPANION_DELAY_MAX_SECONDS" \
+  "$scheduling_mode" >"$SOAK_OUTPUT_DIR/run.meta"
 : >"$SOAK_SUCCESS_TIMES_FILE"
 : >"$SOAK_RESERVATIONS_FILE"
 
@@ -182,7 +201,11 @@ soak_run_confirmed_waves() {
   local wave_gap_min wave_gap_max wave_failed
   local waves
 
-  soak_log "starting one-session confirmed waves; every final upstream stage waits for SEND REQUEST"
+  if [[ $SOAK_AUTO_APPROVE_UPSTREAM == 1 ]]; then
+    soak_log "starting one-session automatic-approval waves; validated upstream stages send without stdin"
+  else
+    soak_log "starting one-session confirmed waves; every final upstream stage waits for SEND REQUEST"
+  fi
   waves=$(awk -F '\t' '$1 !~ /^#/ && !seen[$1]++ { print $1 }' "$script_dir/schedule.tsv")
   for target_wave in $waves; do
     if [[ -s $SOAK_SUCCESS_TIMES_FILE ]]; then

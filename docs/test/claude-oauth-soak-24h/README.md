@@ -567,6 +567,28 @@ tmux attach -t sub2api-soak
 
 不要对同一个 `SOAK_OUTPUT_DIR` 再次运行 `run_24h.sh`。
 
+### 无人值守自动批准模式
+
+默认值 `SOAK_AUTO_APPROVE_UPSTREAM=0` 保持上述逐条人工确认。已经人工核对过请求结构、准备让一个会话自行完成 30 轮时，可以显式开启：
+
+```bash
+export SOAK_AUTO_APPROVE_UPSTREAM='1'
+export SOAK_UPSTREAM_PREVIEW_PAGER='0'
+export SOAK_OUTPUT_DIR="/root/sub2api-soak-runs/auto-$(date -u +%Y%m%dT%H%M%SZ)"
+
+./run_24h.sh </dev/null
+```
+
+自动模式不读取 stdin，也不要使用 `yes 'SEND REQUEST' | ./run_24h.sh`。后者的输入可能被用量检查等子进程提前消费，导致后续确认错位。
+
+自动模式不会关闭后端 approval gate。每个 preview 仍先经过 URL、脱敏、body hash 和 bundle 形状校验，审计副本仍保存到 `upstream-previews/`；首轮仍严格执行 quota → 随机延迟 → title → main，后续必须是 main-only。区别只是校验通过后 runner 自动写入 `.approve`。发现非法 preview、异常 bundle、STOP、deadline、用量超限或请求失败时仍会停止。
+
+切回人工确认：
+
+```bash
+export SOAK_AUTO_APPROVE_UPSTREAM='0'
+```
+
 ## 10. 用量保护行为
 
 在 `required` 模式下，请求前、随机等待后和成功响应后都会读取 PostgreSQL 中账号最近一次上游响应保存的：

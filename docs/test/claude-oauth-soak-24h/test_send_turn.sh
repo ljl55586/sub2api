@@ -77,6 +77,7 @@ export SOAK_SESSION_IDENTITIES_FILE="$identity_file"
 export SOAK_PARALLEL_SESSIONS=0
 export SOAK_SKIP_WAITS=1
 unset SOAK_UPSTREAM_APPROVAL_REQUIRED SOAK_UPSTREAM_APPROVAL_DIR SOAK_UPSTREAM_APPROVAL_TOKEN
+unset SOAK_AUTO_APPROVE_UPSTREAM
 unset FAKE_CURL_UPSTREAM_APPROVAL_DIR FAKE_CURL_EXPECT_APPROVAL_TOKEN
 
 latest_request_file() {
@@ -296,6 +297,39 @@ if ! grep -Fx 'X-Sub2API-Claude-Companion-Delay-Seconds: 37' "$upstream_approval
 fi
 awk -F '\t' 'NR == 2 { exit !($14 == "true" && $15 == "37") }' \
   "$upstream_approval_output/manifest.tsv"
+
+automatic_approval_dir="$test_dir/upstream-automatic-approval"
+automatic_approval_output="$test_dir/upstream-automatic-approval-output"
+mkdir -p "$automatic_approval_dir"
+SOAK_OUTPUT_DIR="$automatic_approval_output" \
+  SOAK_STREAM=true \
+  SOAK_COMPANION_DELAY_MIN_SECONDS=19 \
+  SOAK_COMPANION_DELAY_MAX_SECONDS=19 \
+  SOAK_CONFIRM_BEFORE_SEND=0 \
+  SOAK_UPSTREAM_APPROVAL_REQUIRED=1 \
+  SOAK_AUTO_APPROVE_UPSTREAM=1 \
+  SOAK_UPSTREAM_APPROVAL_DIR="$automatic_approval_dir" \
+  SOAK_UPSTREAM_APPROVAL_TOKEN='approval-secret' \
+  SOAK_UPSTREAM_PREVIEW_PAGER=0 \
+  FAKE_CURL_UPSTREAM_APPROVAL_DIR="$automatic_approval_dir" \
+  FAKE_CURL_EXPECT_APPROVAL_TOKEN='approval-secret' \
+  FAKE_CURL_RESPONSE_FILE="$valid_response" \
+  "$script_dir/send_turn.sh" session-a "$prompt_file" cold \
+  </dev/null >"$test_dir/upstream-automatic-approval.log" 2>&1
+
+if [[ $(find "$automatic_approval_dir" -type f -name '*.approve' | wc -l | tr -d ' ') != 1 ||
+  ! -f "$automatic_approval_output/state/session-a.messages.json" ]]; then
+  echo "automatic upstream approval did not release and complete the stage" >&2
+  exit 1
+fi
+if ! grep -F 'automatic upstream approval accepted; releasing exact stage=' \
+  "$test_dir/upstream-automatic-approval.log" >/dev/null ||
+  grep -F 'Type exactly SEND REQUEST' "$test_dir/upstream-automatic-approval.log" >/dev/null; then
+  echo "automatic upstream approval unexpectedly depended on confirmation stdin" >&2
+  exit 1
+fi
+awk -F '\t' 'NR == 2 { exit !($14 == "true" && $15 == "19") }' \
+  "$automatic_approval_output/manifest.tsv"
 
 upstream_reject_dir="$test_dir/upstream-reject"
 upstream_reject_output="$test_dir/upstream-approval-reject"

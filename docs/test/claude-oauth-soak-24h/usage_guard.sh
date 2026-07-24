@@ -40,7 +40,7 @@ snapshot=$(
   cd -- "$deploy_dir"
   docker compose exec -T postgres sh -c \
     'psql -X -A -t -F "|" -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "$1"' \
-    sh "$query"
+    sh "$query" </dev/null
 )
 snapshot=${snapshot//$'\r'/}
 snapshot=${snapshot%$'\n'}
