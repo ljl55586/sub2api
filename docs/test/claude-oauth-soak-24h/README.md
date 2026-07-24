@@ -1,30 +1,36 @@
-# Claude OAuth 单账号五会话 curl 压测
+# Claude OAuth 单账号单会话逐请求确认压测
 
-本测试包只通过 `curl` 调用 sub2api `/v1/messages`，用于观察单个 Claude OAuth/Pro 账号的连续多轮、粘性会话、5 分钟提示缓存、并行调度和用量保护。
+本测试包只通过 `curl` 调用 sub2api `/v1/messages`，用于观察单个 Claude OAuth/Pro 账号的连续多轮、粘性会话、Claude Code 1 小时提示缓存、会话启动伴生请求和用量保护。
 
-当前计划包含五个彼此独立、但各自连续推进的自然项目会话：
+当前正式计划只运行一个新会话：
 
-- Session A：Go 网关日志分析器，从乱序、重试、重复计费逐步讨论到 checkpoint、reconciliation、故障演练和发布；
-- Session B：TypeScript + PostgreSQL 会议室预约服务，从并发 hold 和幂等逐步讨论到迁移、outbox、性能、主库切换和全量发布；
-- Session C：Go + Redis 延迟任务队列，从 lease、重复执行和丢任务逐步讨论到 fencing、分桶、故障演练和发布；
-- Session D：Java + Kafka + PostgreSQL 支付对账服务，从重复入账和提交结果未知逐步讨论到退款、账本不变量、历史修复和发布；
-- Session E：Python + Celery + PostgreSQL 超大 CSV 导入，从断点恢复和重复批次逐步讨论到 replace 可见性、取消、容量和发布。
+- Session F：Go + PostgreSQL + Redis 多租户 Webhook 投递平台，从事件写入、调度、lease、重试和租户顺序逐步讨论到 SSRF、密钥轮换、回放、容量、事故修复和发布。
 
-每个会话 30 轮，共 150 个主请求。五个会话在同一 wave 中并行，同一会话内部严格串行。
+Session F 共 30 个主请求，严格串行。首轮还会异步启动一次 quota 和一次 title；如果伴生请求首次成功，完整运行预计产生 32 个上游请求。
+
+每次主请求都会先把最终 JSON 完整打印到终端并明确标记为“尚未发送”。只有输入精确字符串 `SEND REQUEST` 后才会调用 `curl`；正式 runner 默认无限等待确认。输入其他内容、关闭输入、创建 `STOP` 文件或超过 24 小时截止时间都不会发送该请求，并会停止本轮运行。
 
 调度器不再划分固定的 5 个 phase，也没有“每个 phase 18 个请求”或“滚动 5h 最多 18 个请求”的默认限制。它连续执行 10 个 wave，真正控制发送的是上游用量保护：
 
 - 5h utilization 达到 `78%`：停止发送，等待当前窗口重置后自动继续剩余请求；
 - 7d utilization 达到 `70%`：终止整个运行；
-- 150 个计划请求全部完成但 5h 仍低于阈值：正常结束，不重复旧问题，也不自动增加请求。
+- 30 个计划请求全部完成但 5h 仍低于阈值：正常结束，不重复旧问题，也不自动增加请求。
 
 ## 1. 文件和会话设计
 
 ```text
 claude-oauth-soak-24h/
 ├── README.md
+├── cache_hit_demo.sh
 ├── run_24h.sh
 ├── send_turn.sh
+├── parse_anthropic_sse.sh
+├── test_cache_hit_demo.sh
+├── test_run_24h.sh
+├── test_send_turn.sh
+├── testdata/
+│   ├── fake_curl.sh
+│   └── valid-response.json
 ├── init_session_identities.sh
 ├── verify_session_identities.sh
 ├── usage_guard.sh
@@ -36,98 +42,93 @@ claude-oauth-soak-24h/
 │   ├── session-b.sh
 │   ├── session-c.sh
 │   ├── session-d.sh
-│   └── session-e.sh
+│   ├── session-e.sh
+│   └── session-f.sh
 └── prompts/
     ├── session-a-go-log-analyzer.md
     ├── session-b-booking-service.md
     ├── session-c-redis-delay-queue.md
     ├── session-d-payment-reconciliation.md
     ├── session-e-data-import-pipeline.md
+    ├── session-f-webhook-delivery.md
+    ├── cache-demo-followup.md
     └── followups.json
 ```
 
-### Session A：Go 网关日志分析器
+### Session F：多租户 Webhook 投递平台
 
-首轮提供一份接近真实 code review 的长项目包，包含业务约束、事件协议、现有 Go 代码、测试和脱敏日志。后续 29 轮按照真实维护节奏推进：
+首轮是一份约 24.8KB 的完整项目审查材料，包含：
 
-1. 乱序、重试、重复 usage 和 finalize 不变量；
-2. watermark、跨日归属、空闲日志源和大行读取；
-3. 有界错误收集、时间戳异常、复合 request key；
-4. pricing 版本、attempt 摘要、时钟偏差和确定性输出；
-5. profile、gzip、checkpoint 和 usage reconciliation；
-6. fuzz/property 测试、灰度事故、schema 演进和发布检查。
+- PostgreSQL schema、事件事务写入和 scheduler 查询；
+- Go worker、claim/lease、HTTP 投递、重试和死信处理；
+- Redis 租户并发与顺序锁；
+- pause、cancel、replay、secret rotation 和 SSRF 防护；
+- 指标、日志、故障案例、现有测试和部署约束。
 
-### Session B：PostgreSQL 预约服务
+后续 29 轮都沿同一个项目自然推进，覆盖重复投递、提交结果未知、lease fencing、租户内顺序、限流公平性、DNS rebinding、签名密钥轮换、历史回放、分区迁移、容量规划、故障演练和最终发布检查。长背景只在首轮发送一次，后续依靠完整的 user/assistant 历史形成真实缓存前缀。
 
-首轮包含业务状态、PostgreSQL 表结构、TypeScript 事务代码、竞态测试和生产日志。后续 29 轮持续沿同一项目推进：
-
-1. exclusion constraint、advisory lock、条件更新和幂等；
-2. 1800 万行脏数据迁移和确定性并发测试；
-3. extend、expire、cancel、outbox 和 worker 竞争；
-4. 热点查询、连接池、时钟、时区和权限边界；
-5. expand/migrate/contract、invalid index 和冲突指标；
-6. 主库故障切换、数据库不变量和最终 readiness review。
-
-### Session C：Redis 延迟任务队列
-
-首轮提供 Redis Cluster key 设计、Lua、Go worker、测试和故障日志。后续 29 轮覆盖 lease lost、fencing、原子 Retry/Dead、故障注入、业务资源串行、分桶、大 payload、resharding、容量和最终发布。
-
-### Session D：支付对账与账本
-
-首轮提供支付状态、账本和余额表、Kafka consumer、主动查询路径、部分退款、对账 SQL、测试与事故日志。后续 29 轮沿统一 capture 命令、提交结果未知、Kafka ack、退款并发、账本不变量、账单修订、历史冲正、迁移和发布逐步推进。
-
-### Session E：超大 CSV 数据导入
-
-首轮提供上传与 import 状态、Celery 配置、validate/apply/cancel 代码、staging 表、测试和故障日志。后续 29 轮沿 outbox、可恢复解析、重复 SKU、batch claim、delta 幂等、replace 原子可见性、取消、租户隔离、容量和发布逐步推进。
-
-五份首轮项目包均为约 15–18KB 的真实项目材料，明显超过 Claude 缓存最低前缀量级。后续问题使用自然口吻引用先前结论，不会每轮重复整份背景。
+Session A–E 的旧脚本和材料仍保留在目录中，便于以后复用，但当前 `schedule.tsv` 不会运行它们。
 
 ## 2. 连续调度和缓存计划
 
-每个 wave 同时启动 A–E 五个 burst；每个 burst 连续发送 3 轮：
+每个 wave 只运行 Session F 的一个 burst；每个 burst 连续发送 3 轮：
 
 - burst 第 1 → 2 轮：上一响应完成后随机等待 `90–180 秒`；
 - burst 第 2 → 3 轮：上一响应完成后随机等待 `90–240 秒`；
-- A–E 首轮启动再各自随机错开 `0–20 秒`。
+- 第 1 轮不预先等待，启动后立即构造并展示请求 JSON。
 
 10 个 wave 的计划如下：
 
 | Wave | 每个会话轮次 | 首轮预期 | Wave 前等待 |
 |---:|---:|---|---:|
-| 1 | 1–3 | cold | 3–8 分钟 |
+| 1 | 1–3 | cold | 0 |
 | 2 | 4–6 | hit | 1–2.5 分钟 |
-| 3 | 7–9 | TTL miss | 6–10 分钟 |
+| 3 | 7–9 | TTL miss | 65–75 分钟 |
 | 4 | 10–12 | hit | 1–3 分钟 |
-| 5 | 13–15 | TTL miss | 7–12 分钟 |
+| 5 | 13–15 | TTL miss | 65–75 分钟 |
 | 6 | 16–18 | hit | 1.5–3 分钟 |
-| 7 | 19–21 | TTL miss | 6–10 分钟 |
+| 7 | 19–21 | TTL miss | 65–75 分钟 |
 | 8 | 22–24 | hit | 1–2.5 分钟 |
-| 9 | 25–27 | TTL miss | 7–12 分钟 |
+| 9 | 25–27 | TTL miss | 65–75 分钟 |
 | 10 | 28–30 | hit | 1.5–3 分钟 |
 
 计划类别总计：
 
-- cold：5 个；
-- TTL miss：20 个；
-- hit：125 个。
+- cold：1 个；
+- TTL miss：4 个；
+- hit：25 个。
 
-实际响应时间、另一个并行会话的完成时间或用量暂停可能让计划 hit 超过 5 分钟。runtime 会在真正发送前根据该会话上一响应完成时间把它自动改记为 `ttl_miss`。
+流式 OAuth no-tools 画像会把上游缓存断点设为 `1h`。实际响应时间、人工确认时间或用量暂停可能让计划 hit 超过 1 小时；runtime 会在请求展示前检查一次，`send_turn.sh` 还会在确认后、发送前再次检查，并把超时的计划 hit 改记为 `ttl_miss`。请求 JSON 本身不会因此改变。
 
-无用量暂停时，150 个请求通常会在约 1.5–3 小时内完成，因为五个会话是并行的；这只是估算，真实响应时长、限流和 5h 暂停会直接增加总耗时。
+无用量暂停时，四次主动 TTL 过期等待本身就需要约 4.3–5 小时，完整运行通常需要约 5–8 小时。真实响应时长、限流和 5h 暂停会继续增加总耗时。
 
 ## 3. 会话身份
 
-这次测试模拟“一个 Claude 账号、同一台客户端设备、五个终端会话”：
+这次测试模拟“一个 Claude 账号、同一台客户端设备、一个终端会话”：
 
-- A–E 共用一个 64 位十六进制 device ID；
-- A–E 分别拥有五个不同的 UUID session ID；
+- Session F 使用一个 64 位十六进制 device ID；
+- Session F 使用一个独立的 UUID session ID；
 - 同一会话的 30 个请求始终携带同一个 `metadata.user_id.session_id`；
-- 每个新 run 生成新的 A–E session ID；
+- 每个新 run 生成新的 Session F session ID；
 - device ID 保存在账号级目录中，跨验证、正式运行和重新测试复用。
 
 严格来说 device ID 表示客户端安装/设备，并不等同于账号；但本测试只有一台服务器和一个账号，因此按账号 ID 持久化一个 device ID 最符合模拟目标。
 
 metadata passthrough 必须保持关闭。下游 metadata 用于 sub2api 在选账号和检查 `max_sessions` 前识别稳定会话，不会原样发给 Anthropic；OAuth mimic 仍使用账号指纹身份构造上游 metadata 和稳定的 `x-claude-code-session-id`。
+
+### 会话启动顺序
+
+Session F 的首轮使用 `stream:true`。它第一次命中所选 OAuth 账号时，网关会在 main 完成最终 body/header 构造和策略检查后，异步启动 quota/title 伴生请求，然后立即发送 main：
+
+```text
+quota goroutine ─┐
+title goroutine ─┼─ 并发，不等待响应
+main request ────┘
+```
+
+压测客户端不再发送私有的伴生延迟 header。goroutine 启动顺序不等于真实网络写入或上游到达顺序，因此本轮不把 `quota → title → main` 的严格先后作为通过条件。quota、title、main 使用相同的最终 `metadata.user_id` 和 `x-claude-code-session-id`，但 quota/title 的 messages 和响应不会拼进 main 历史。成功的伴生 action 状态保留在 30 小时 runtime 中；发送失败时允许后续轮次重试。
+
+`send_turn.sh` 默认使用 `stream:false`，不会因为没有设置环境变量就意外触发伴生请求。本方案只有在第 7 节显式执行 `export SOAK_STREAM='true'` 后才使用上述启动流程；正式启动前务必检查该变量。
 
 ## 4. sub2api 账号配置
 
@@ -135,17 +136,17 @@ metadata passthrough 必须保持关闭。下游 metadata 用于 sub2api 在选�
 
 | 项目 | 值 |
 |---|---:|
-| 账号并发 | 5 |
+| 账号并发 | 1 |
 | 5h 窗口费用控制 | 开启 |
 | 费用阈值 | `$11.20`（仍需按实际 utilization 校准） |
 | 粘性预留额度 | `$2.60`（仍需校准） |
 | 会话数量控制 | 开启 |
-| 最大会话数 | 5 |
+| 最大会话数 | 1 |
 | 会话空闲超时 | 60 分钟 |
 | RPM 限制 | 开启 |
-| 基础 RPM | 8 |
+| 基础 RPM | 4 |
 | RPM 策略 | 分层限流 |
-| RPM 粘性缓冲 | 5 |
+| RPM 粘性缓冲 | 1 |
 | 用户消息限速 | 软性限速 |
 
 同时确认：
@@ -153,12 +154,12 @@ metadata passthrough 必须保持关闭。下游 metadata 用于 sub2api 在选�
 - `session_id_masking_enabled=false`；
 - metadata passthrough 关闭；
 - messages cache rewrite 关闭；
-- cache TTL override 关闭，或明确设为 `5m`；
+- cache TTL override 关闭，让 `stream:true` Claude OAuth no-tools 画像使用真实 CLI 的 `1h`；
 - 测试 API key 所属分组只包含这个 Claude 账号。
 
-不要选择“串行队列”，它会按账号 ID 获取全局锁，把 A–E 五路重新排成串行。
+当前只有一个主请求在途，因此无需用“串行队列”额外限制并发。
 
-旧运行留下的 session-limit 记录会保留到空闲超时。换成最大会话数 5 后，应先等待管理页面显示活动会话 `0/5`，再启动新 run；不要直接清空整个 Redis。
+旧运行留下的 session-limit 记录会保留到空闲超时。换成最大会话数 1 后，应先等待管理页面显示活动会话 `0/1`，再启动新 run；不要直接清空整个 Redis。
 
 ## 5. 本机提交与服务器更新
 
@@ -167,8 +168,12 @@ metadata passthrough 必须保持关闭。下游 metadata 用于 sub2api 在选�
 ```bash
 cd /Users/ling/sub2api
 git status --short --branch
-git add .gitignore docs/test/claude-oauth-soak-24h
-git commit -m "test: run continuous five-session Claude soak"
+git add \
+  backend/internal/service/gateway_claude_oauth_companion.go \
+  backend/internal/service/gateway_claude_oauth_companion_test.go \
+  backend/internal/service/gateway_forward.go \
+  docs/test/claude-oauth-soak-24h
+git commit -m "fix: align Claude session startup soak flow"
 git push myfork codex/claude-request-alignment
 ```
 
@@ -184,7 +189,7 @@ cd /root/sub2api-src/docs/test/claude-oauth-soak-24h
 chmod 700 *.sh sessions/*.sh
 ```
 
-这些修改只涉及测试脚本和文档，不需要重新构建 sub2api 镜像。
+本次同时修改了 Go 网关和压测脚本。服务器拉取后必须按下方第 5.1 节重新构建 sub2api 镜像并重建应用容器，然后才能启动新的压测 run。
 
 ### 5.1 每次修改后的重新部署与运行流程
 
@@ -279,11 +284,15 @@ curl -fsS http://127.0.0.1:8080/health
 ```bash
 cd /root/sub2api-src/docs/test/claude-oauth-soak-24h
 
-bash -n run_24h.sh send_turn.sh usage_guard.sh \
+bash -n run_24h.sh send_turn.sh parse_anthropic_sse.sh usage_guard.sh \
   init_session_identities.sh verify_session_identities.sh \
-  summarize.sh lib/runtime.sh sessions/*.sh
+  summarize.sh test_cache_hit_demo.sh test_run_24h.sh test_send_turn.sh \
+  lib/runtime.sh sessions/*.sh
 
 jq -e 'all(.[]; length == 29)' prompts/followups.json >/dev/null
+./test_send_turn.sh
+./test_cache_hit_demo.sh
+./test_run_24h.sh
 ./usage_guard.sh
 
 export SOAK_OUTPUT_DIR="/root/sub2api-soak-validation/validate-$(date -u +%Y%m%dT%H%M%SZ)"
@@ -309,14 +318,14 @@ printf 'formal output: %s\n' "$SOAK_OUTPUT_DIR"
 
 ### 5.2 新增会话时的检查清单
 
-例如以后新增 `session-f`，需要同时完成：
+例如以后新增 `session-g`，需要同时完成：
 
 1. 新增长首轮 prompt 文件，确保长度足以形成缓存前缀；
-2. 在 `prompts/followups.json` 增加 `session-f`，且恰好包含 29 个追问；
-3. 新增可执行的 `sessions/session-f.sh`，引用正确的 prompt；
+2. 在 `prompts/followups.json` 增加 `session-g`，且恰好包含 29 个追问；
+3. 新增可执行的 `sessions/session-g.sh`，引用正确的 prompt；
 4. 在 `schedule.tsv` 的每个 wave 增加一行，共覆盖首轮 `1、4、7……28`；
 5. 更新 `run_24h.sh` 的 `planned_session_count`，`planned_request_count` 会自动重新计算；
-6. 相应提高 sub2api 的账号并发、最大会话数和 RPM 粘性缓冲；
+6. 如果要与 Session F 并行运行，再相应提高 sub2api 的账号并发、最大会话数和 RPM 粘性缓冲；
 7. 更新 README 的会话数、总请求数和缓存预期统计；
 8. 按 5.1 节停止旧 run、拉取、校验并用新目录运行。
 
@@ -331,12 +340,11 @@ curl -fsS http://127.0.0.1:8080/health
 
 command -v curl
 command -v jq
-command -v flock
 command -v od
 command -v tmux
 ```
 
-并行模式必须有 `flock`。查询 Claude 账号数据库 ID：
+当前单会话正式 runner 不需要 `flock`。查询 Claude 账号数据库 ID：
 
 ```bash
 docker compose exec -T postgres sh -c \
@@ -361,9 +369,14 @@ printf '\n'
 export SOAK_API_KEY
 
 export SOAK_MODEL='claude-opus-4-8'
-export SOAK_MAX_TOKENS='1536'
+# 默认不下发 max_tokens；当前 Claude OAuth 转发会给 Opus 4.8 上游补成 64000。
+# 如果当前 shell 曾按旧教程设置过 1536，这里必须显式清除。
+unset SOAK_MAX_TOKENS
 export SOAK_USER_AGENT='soak-curl/1.0'
-export SOAK_PARALLEL_SESSIONS='1'
+export SOAK_STREAM='true'
+export SOAK_CACHE_TTL_SECONDS='3600'
+# 0 表示请求展示后无限等待确认；正式 runner 强制逐请求确认
+export SOAK_CONFIRM_TIMEOUT_SECONDS='0'
 
 export SOAK_ACCOUNT_ID='1'
 export SOAK_DEPLOY_DIR='/root/sub2api-deploy'
@@ -378,10 +391,11 @@ export SOAK_MAX_REQUESTS_PER_5H='0'
 
 unset SOAK_VALIDATE_ONLY SOAK_DRY_RUN SOAK_SKIP_WAITS \
   SOAK_TEST_MODE SOAK_AUTO_CONTINUE \
-  SOAK_SESSION_IDENTITIES_FILE
+  SOAK_SESSION_IDENTITIES_FILE SOAK_PARALLEL_SESSIONS \
+  SOAK_CONFIRM_BEFORE_SEND
 ```
 
-`SOAK_PARALLEL_SESSIONS=1` 是“启用并行”的布尔开关，不表示只运行 1 个会话；实际并行的五个会话来自 `schedule.tsv` 同一个 wave 的五行。
+正式 `run_24h.sh` 会强制设置单会话、前台串行和逐请求确认；即使当前 shell 留有旧的并行变量，也不会并发启动请求。
 
 API key 是调用 sub2api 的下游 `sk-...`，不是 Claude OAuth token。输入时没有回显是正常的。
 
@@ -421,8 +435,8 @@ unset SOAK_VALIDATE_ONLY
 应看到：
 
 ```text
-schedule validated: 5 sessions x 30 turns in 10 continuous parallel waves
-session identities ready: ... sessions=5
+schedule validated: 1 session x 30 turns in 10 confirmed waves
+session identities ready: ... sessions=1
 SOAK_VALIDATE_ONLY=1; schedule and identities validated without sending requests
 verified unique identities and 0 request bodies
 ```
@@ -440,7 +454,23 @@ printf 'formal output: %s\n' "$SOAK_OUTPUT_DIR"
 ./run_24h.sh
 ```
 
-启动后第一组请求会先随机等待 3–8 分钟。之后不会出现固定 5 小时静默，也不需要创建 `continue-phase-*` 文件。
+启动后第一条请求会立即构造并完整打印。此时终端会显示：
+
+```text
+========== PREPARED REQUEST: NOT SENT ==========
+...
+Type exactly SEND REQUEST to send this file:
+```
+
+先检查完整 JSON，确认后在同一终端输入：
+
+```text
+SEND REQUEST
+```
+
+只有这条精确字符串会放行当前请求。每个请求都会重复上述流程，共需确认 30 次。输入其他内容或关闭 stdin 会以退出码 `75` 停止整个 run，当前 JSON 保留在 `requests/`，但不会调用 `curl`，也不会推进 `state/`。应使用新 `SOAK_OUTPUT_DIR` 修正后重跑，不能在旧目录继续。
+
+Session F 的 quota/title 会在首个 main 前被异步调度，但三者不等待彼此的响应，实际网络写入顺序可能交错。之后不会出现固定 5 小时静默，也不需要创建 `continue-phase-*` 文件。
 
 从 tmux 脱离但保持运行：按 `Ctrl-b`，松开后按 `d`。重新进入：
 
@@ -465,10 +495,11 @@ tmux attach -t sub2api-soak
 - 7d 达到 `70%`：写入 `STOPPED_ON_7D_LIMIT` 和 `STOP`，整个运行结束；
 - 查询失败、账号不存在或 bootstrap 后仍没有样本：fail-closed；
 - 任意非 2xx 或异常响应：不推进会话状态，停止整个运行且不自动重试；
+- `stop_reason=max_tokens`、非 `end_turn` 或没有非空 text block：即使 HTTP 200 也按失败处理，不推进状态并停止整个运行；
 - 24 小时 deadline 到达：停止剩余请求；
-- 150 个请求先完成：立即正常结束，不等待到 24 小时。
+- 30 个请求先完成：立即正常结束，不等待到 24 小时。
 
-最多五个请求可能同时在途。`78%` 是当前目标值，但它不是严格的 `80%` 硬墙：五路在同一份略有滞后的 usage 样本下都可能已经放行。若首个 5h 窗口观察到单个 wave 会让 utilization 跳升超过 2%，后续运行应把 `SOAK_USAGE_5H_STOP_PERCENT` 下调到 `75`；自动保护无法撤回已经发出的请求。
+最多只有一个主请求在途。`78%` 是当前目标值，但数据库样本来自上一条经过 sub2api 的响应，仍可能略有滞后；人工确认前应同时观察官方 Usage 页面。若单个请求会让 utilization 跳升超过预期，后续运行应把 `SOAK_USAGE_5H_STOP_PERCENT` 下调到 `75`；自动保护无法撤回已经发出的请求。
 
 `SOAK_MAX_REQUESTS_PER_5H=0` 表示禁用旧的本地请求数量上限。成功时间戳和在途 reservation 仍会记录，用于审计，但不会因为达到 18 条而暂停。如果将其设置为正整数，才会恢复额外的滚动请求数保护。
 
@@ -476,23 +507,21 @@ tmux attach -t sub2api-soak
 
 ## 11. cache_control 和历史
 
-每个请求发送完整的本会话历史，并只在当前最新 user text block 上添加：
+每个主请求使用 `stream:true` 并发送完整的本会话历史；curl 收到的原始 SSE 保存在 `responses/*.raw`，`parse_anthropic_sse.sh` 将其重组成 `responses/*.json`，再用于 token 统计和下一轮 assistant 历史。下游只在当前最新 user text block 上添加：
 
 ```json
 {"cache_control":{"type":"ephemeral","ttl":"5m"}}
 ```
 
-状态文件不保留旧 cache_control。成功响应的原始 assistant `content` 会完整保存，因此 thinking、signature、text 或 tool block 不会被强行拼成纯文本。失败请求不会推进状态。
+流式 OAuth no-tools 画像会在最终上游请求中把活动断点调整成 `1h`。状态文件不保留旧 cache_control。只有 `stop_reason=end_turn` 且包含非空 text block 的响应才会推进状态；通过校验后，重组出的 assistant `content` 会完整保存，因此合法的 thinking、signature 和 text block 不会被强行拼成纯文本。`max_tokens` 截断、纯 thinking、残缺 SSE 或其他非完整响应只保留 raw response、headers 和 manifest 审计文件，不写入状态。
+
+默认不在 curl 请求中发送 `max_tokens`，当前分支的 Claude OAuth 转发逻辑会给 Opus 4.8 上游请求补成 `64000`。如需显式限制，可以设置正整数 `SOAK_MAX_TOKENS`；不建议再使用 `1536`，复杂项目问题可能在内部思考阶段就耗尽该预算。
 
 每个 run 的关键状态：
 
 ```text
 session-identities.json
-state/session-a.messages.json
-state/session-b.messages.json
-state/session-c.messages.json
-state/session-d.messages.json
-state/session-e.messages.json
+state/session-f.messages.json
 ```
 
 预计 hit 并不保证实际命中。判断长项目前缀是否命中，主要看：
@@ -501,7 +530,52 @@ state/session-e.messages.json
 - TTL miss/cold 是否出现相应的 `cache_creation_input_tokens`；
 - 不要只用 `input_tokens` 是否为 1 判断。
 
-## 12. 监控
+## 12. 两请求缓存确认 Demo
+
+`cache_hit_demo.sh` 与 24h runner 独立。它只使用一个 `cache-demo` 会话，并严格执行：
+
+1. 用超过 16KB 的支付对账项目包发送请求 1，最新 user block 带 `cache_control: 5m`；
+2. 请求 1 必须是带非空 text 的 `end_turn`，且 usage 必须出现 cache creation 或 cache read；
+3. 将请求 1 的完整 user/assistant 历史与第二个自然追问拼成请求 2；
+4. 把请求 2 的完整 JSON 保存到 `requests/` 并打印到终端，此时尚未调用 curl；
+5. 最多等待 240 秒，只有输入精确字符串 `SEND REQUEST` 才发送刚才展示的同一个文件；
+6. 输出请求 2 的 `cache_creation_input_tokens` 和 `cache_read_input_tokens`，后者大于 0 才报告命中。
+
+该 Demo 显式使用 `SOAK_STREAM=false`，因此不触发 quota/title，也继续验证原来的 5 分钟缓存流程。
+
+运行前设置与正式压测相同的基本变量，但使用单独的新目录：
+
+```bash
+cd /root/sub2api-src/docs/test/claude-oauth-soak-24h
+
+export SOAK_BASE_URL='http://127.0.0.1:8080'
+read -rsp 'sub2api test API key: ' SOAK_API_KEY
+printf '\n'
+export SOAK_API_KEY
+
+export SOAK_ACCOUNT_ID='1'
+export SOAK_IDENTITY_HOME='/root/sub2api-soak-identity'
+export CACHE_DEMO_OUTPUT_DIR="/root/sub2api-cache-demo/run-$(date -u +%Y%m%dT%H%M%SZ)"
+
+unset SOAK_MAX_TOKENS
+./cache_hit_demo.sh
+```
+
+请求 2 展示后，检查终端内容或另开 SSH 查看文件：
+
+```bash
+jq . "$CACHE_DEMO_OUTPUT_DIR"/requests/*-cache-demo-t2-*.json
+```
+
+确认无误后，在原终端输入：
+
+```text
+SEND REQUEST
+```
+
+输入其他内容、关闭 stdin 或 240 秒内没有确认，脚本都会以退出码 `75` 结束，并且不会发送请求 2。由于缓存测试使用 5 分钟 TTL，超时后应使用全新的 `CACHE_DEMO_OUTPUT_DIR` 重跑整个 Demo，不要直接发送已过期的第二请求。Demo 会主动清除继承的 `SOAK_MAX_TOKENS`，所以两个下游请求都不包含该字段，由 sub2api 在 OAuth 上游请求中补齐。
+
+## 13. 监控
 
 另开 SSH 终端：
 
@@ -523,6 +597,16 @@ docker compose logs --tail=100 -f sub2api
 tail -F /root/sub2api-deploy/data/gateway_debug.log
 ```
 
+`gateway_debug.log` 是“请求构造完成”的快照，不是网络发送时间线。由于 main 必须先完成最终 body/header 与 beta 策略校验，文件中 `UPSTREAM_FORWARD` 可能出现在 quota/title 快照之前。真正的发送行为应查看容器运行日志：
+
+```bash
+cd /root/sub2api-deploy
+docker compose logs -f sub2api 2>&1 |
+  grep -E 'Claude OAuth (quota|title|main|session startup)'
+```
+
+同一个 `session_id` 应观察到 quota、title 和 main 各自的 `send start`；quota/title 的完成日志可以晚于 main。即使只有一个 session，三个请求仍由并发 goroutine 发出，因此不能用日志行顺序推断严格的网络到达先后。
+
 验证所有已生成请求的下游身份：
 
 ```bash
@@ -538,11 +622,11 @@ docker compose logs --since 30m sub2api 2>&1 |
   grep -E 'sticky.hash_source|sticky.session_hash_generated'
 ```
 
-应看到 `source=metadata_user_id`；A–E 的 UUID 各自跨轮稳定且彼此不同。上游快照中各会话自己的 `x-claude-code-session-id` 也应稳定。
+应看到 `source=metadata_user_id`；Session F 的 UUID 应跨 30 轮保持稳定，上游快照中的 `x-claude-code-session-id` 也应稳定。
 
-本方案不显式发送 `stream`，正常不应触发当前实验性的 quota/title 伴生请求。
+本方案显式发送 `stream:true`。每个新 session 的 quota/title 成功后不应再次发送；若伴生请求失败，runtime 会保留可重试状态，后续轮次可能再次尝试。重复发送时先检查此前同一 `session_id` 的完成或失败日志，再判断是否异常。
 
-## 13. 手动停止
+## 14. 手动停止
 
 优雅停止：
 
@@ -551,7 +635,7 @@ run_dir=$(ls -dt /root/sub2api-soak-runs/run-* | head -n 1)
 touch "$run_dir/control/STOP"
 ```
 
-脚本最长约 30 秒发现 STOP，不再发送新请求；已经在途的最多五个 curl 会等待响应完成或在 900 秒超时。
+等待随机间隔时，脚本最长约 30 秒发现 STOP；等待人工确认时，确认后的最后检查也会阻止发送。已经在途的最多一个主请求会等待响应完成或在 900 秒超时。
 
 立即中断 tmux 中的在途请求：
 
@@ -567,7 +651,7 @@ tail -n 30 "$run_dir/run.log"
 pgrep -af '[r]un_24h.sh' || echo '压测脚本已停止'
 ```
 
-## 14. 输出与汇总
+## 15. 输出与汇总
 
 每个正式 run 包含：
 
@@ -581,6 +665,7 @@ inflight-request-reservations.tsv
 usage-samples.tsv
 requests/*.json
 responses/*.json
+responses/*.raw
 headers/*.headers
 state/*.messages.json
 control/*
@@ -595,12 +680,15 @@ column -t -s $'\t' "$run_dir/manifest.tsv" | less -S
 find "$run_dir/control" -maxdepth 1 -type f -print
 ```
 
-## 15. 通过标准
+## 16. 通过标准
 
-- 最多五个不同会话请求并行，同一会话从不并发修改历史；
-- A–E 各完成 30 轮，或明确因为 5h/7d/deadline/错误保护停止；
-- A–E 的下游 metadata session ID 各自稳定且互不相同；
-- A–E 的上游 session ID 各自稳定；
+- Session F 的主请求始终严格串行，从不并发修改历史；
+- Session F 完成 30 轮，或明确因为人工拒绝、5h/7d/deadline/错误保护停止；
+- Session F 的下游 metadata session ID 跨 30 轮稳定；
+- Session F 的上游 session ID 跨 30 轮稳定；
+- 首轮观察到 quota、title、main；成功的 quota/title 不会无故重复，伴生失败不会阻塞 main；
+- 每个主请求都先完整展示，确认前没有对应的 `curl` 调用、manifest 行或 state 推进；
+- quota、title、main 的最终 session ID 完全相同，title 内容没有进入 main 历史；
 - 计划 hit 大多数出现长前缀量级 cache read；
 - 计划 TTL miss/cold 大多数出现 cache creation；
 - 没有无法解释的 400、401、403、429 或 5xx；

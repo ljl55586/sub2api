@@ -104,24 +104,54 @@ func (s *GatewayCacheSuite) TestGetSessionAccountID_CorruptedValue() {
 	require.False(s.T(), errors.Is(err, redis.Nil), "expected parsing error, not redis.Nil")
 }
 
-func (s *GatewayCacheSuite) TestTryClaimClaudeOAuthSessionCompanions() {
-	store, ok := s.cache.(service.ClaudeOAuthSessionCompanionClaimStore)
-	require.True(s.T(), ok, "GatewayCache should expose the optional companion claim store")
+func (s *GatewayCacheSuite) TestClaudeOAuthSessionActions() {
+	store, ok := s.cache.(service.ClaudeOAuthSessionActionStore)
+	require.True(s.T(), ok, "GatewayCache should expose the optional session action store")
 
-	claimed, err := store.TryClaimClaudeOAuthSessionCompanions(s.ctx, 99, "session-a", time.Minute)
+	claimed, err := store.TryClaimClaudeOAuthSessionAction(s.ctx, 99, "session-a", "title", time.Minute)
 	require.NoError(s.T(), err)
 	require.True(s.T(), claimed)
-	claimTTL, err := s.rdb.TTL(s.ctx, buildClaudeOAuthSessionCompanionKey(99, "session-a")).Result()
+	claimTTL, err := s.rdb.TTL(s.ctx, buildClaudeOAuthSessionActionKey(99, "session-a", "title")).Result()
 	require.NoError(s.T(), err)
 	s.AssertTTLWithin(claimTTL, time.Second, time.Minute)
 
-	claimed, err = store.TryClaimClaudeOAuthSessionCompanions(s.ctx, 99, "session-a", time.Minute)
+	claimed, err = store.TryClaimClaudeOAuthSessionAction(s.ctx, 99, "session-a", "title", time.Minute)
 	require.NoError(s.T(), err)
 	require.False(s.T(), claimed)
 
-	claimed, err = store.TryClaimClaudeOAuthSessionCompanions(s.ctx, 100, "session-a", time.Minute)
+	require.NoError(s.T(), store.ReleaseClaudeOAuthSessionAction(s.ctx, 99, "session-a", "title"))
+	claimed, err = store.TryClaimClaudeOAuthSessionAction(s.ctx, 99, "session-a", "title", time.Minute)
 	require.NoError(s.T(), err)
 	require.True(s.T(), claimed)
+}
+
+func (s *GatewayCacheSuite) TestClaudeOAuthRuntimeCAS() {
+	store, ok := s.cache.(service.ClaudeOAuthRuntimeStore)
+	require.True(s.T(), ok, "GatewayCache should expose the runtime store")
+
+	candidate := &service.ClaudeOAuthSessionRuntime{
+		SchemaVersion: 1,
+		Version:       1,
+		SessionID:     "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+		CreatedAtUnix: 1,
+		UpdatedAtUnix: 1,
+	}
+	runtime, created, err := store.GetOrCreateClaudeOAuthRuntime(s.ctx, 102, "runtime-a", candidate, time.Minute)
+	require.NoError(s.T(), err)
+	require.True(s.T(), created)
+	require.Equal(s.T(), candidate.SessionID, runtime.SessionID)
+
+	next := *runtime
+	next.Version = 2
+	next.Quota = service.ClaudeOAuthRuntimeAction{State: "completed", StatusCode: 429}
+	swapped, err := store.CompareAndSwapClaudeOAuthRuntime(s.ctx, 102, "runtime-a", 1, &next, time.Minute)
+	require.NoError(s.T(), err)
+	require.True(s.T(), swapped)
+
+	stored, err := store.GetClaudeOAuthRuntime(s.ctx, 102, "runtime-a", time.Minute)
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), int64(2), stored.Version)
+	require.Equal(s.T(), 429, stored.Quota.StatusCode)
 }
 
 func TestGatewayCacheSuite(t *testing.T) {

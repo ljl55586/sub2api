@@ -79,77 +79,29 @@ const DefaultStainlessOS = "MacOS"
 // ClaudeCodeOAuthMainMimicryBetas 返回 OAuth 模拟主 messages 请求使用的 beta 列表。
 // 每次调用均返回新切片，以免调用方的 append 或修改影响后续请求。
 func ClaudeCodeOAuthMainMimicryBetas() []string {
-	return []string{
-		BetaClaudeCode,
-		BetaOAuth,
-		BetaInterleavedThinking,
-		BetaRedactThinking,
-		BetaThinkingTokenCount,
-		BetaContextManagement,
-		BetaPromptCachingScope,
-		BetaMidConversationSystem,
-		BetaAdvisorTool,
-		BetaEffort,
-		BetaExtendedCacheTTL,
-	}
+	return CurrentClaudeCodeProfile().MainBetas
 }
 
 // ClaudeCodeOAuthQuotaMimicryBetas returns the ordered beta profile used by
 // Claude Code's initial quota probe.
 func ClaudeCodeOAuthQuotaMimicryBetas() []string {
-	return []string{
-		BetaClaudeCode,
-		BetaOAuth,
-		BetaInterleavedThinking,
-		BetaRedactThinking,
-		BetaThinkingTokenCount,
-		BetaContextManagement,
-		BetaPromptCachingScope,
-		BetaMidConversationSystem,
-	}
+	return CurrentClaudeCodeProfile().QuotaBetas
 }
 
 // ClaudeCodeOAuthTitleMimicryBetas returns the ordered beta profile used by
 // Claude Code's structured session-title request.
 func ClaudeCodeOAuthTitleMimicryBetas() []string {
-	return append(ClaudeCodeOAuthQuotaMimicryBetas(),
-		BetaAdvisorTool,
-		BetaEffort,
-		BetaStructuredOutputs,
-	)
+	return CurrentClaudeCodeProfile().TitleBetas
 }
 
 // ClaudeCodeOAuthCountTokensMimicryBetas 返回 OAuth 模拟 count_tokens 请求使用的 beta 列表。
 // 它与主 messages 请求独立，保持 count_tokens 的既有 profile。
 func ClaudeCodeOAuthCountTokensMimicryBetas() []string {
-	return []string{
-		BetaClaudeCode,
-		BetaOAuth,
-		BetaInterleavedThinking,
-		BetaPromptCachingScope,
-		BetaEffort,
-		BetaContextManagement,
-		BetaExtendedCacheTTL,
-	}
+	return CurrentClaudeCodeProfile().CountTokensBetas
 }
 
 // DefaultHeaders 是 Claude Code 客户端默认请求头。
-var DefaultHeaders = map[string]string{
-	// Keep these in sync with recent Claude CLI traffic to reduce the chance
-	// that Claude Code-scoped OAuth credentials are rejected as "non-CLI" usage.
-	// 版本参考：对齐 Parrot (src/transform/cc_mimicry.py:49) 的 CLI_USER_AGENT。
-	"User-Agent":                                "claude-cli/" + CLICurrentVersion + " (external, cli)",
-	"X-Stainless-Lang":                          "js",
-	"X-Stainless-Package-Version":               "0.94.0",
-	"X-Stainless-OS":                            DefaultStainlessOS,
-	"X-Stainless-Arch":                          "arm64",
-	"X-Stainless-Runtime":                       "node",
-	"X-Stainless-Runtime-Version":               "v24.3.0",
-	"X-Stainless-Retry-Count":                   "0",
-	"X-Stainless-Timeout":                       "600",
-	"X-App":                                     "cli",
-	"Anthropic-Dangerous-Direct-Browser-Access": "true",
-}
+var DefaultHeaders = CurrentClaudeCodeProfile().Headers
 
 // Model 表示一个 Claude 模型
 type Model struct {

@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -137,7 +138,7 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 	}
 
 	body := parsed.Body.Bytes()
-	firstUserTextBeforeMimic := extractFirstUserText(body)
+	titleCandidateTextBeforeMimic := extractLastUserText(body)
 	replaceBody := func(next []byte) error {
 		if err := parsed.ReplaceBody(next); err != nil {
 			return fmt.Errorf("rewrite request body: %w", err)
@@ -173,6 +174,8 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 	isClaudeCode := IsClaudeCodeClient(ctx) || isClaudeCodeClient(clientUserAgent, parsed.MetadataUserID)
 	shouldMimicClaudeCode := account.IsOAuth() && !isClaudeCode
 	var oauthMimicMetadataUserID string
+	var oauthRuntimeTurn *claudeOAuthRuntimeTurn
+	oauthRuntimeTurnFinished := false
 	metadataPassthroughEnabled := false
 	if shouldMimicClaudeCode && s.settingService != nil {
 		_, metadataPassthroughEnabled, _ = s.settingService.GetGatewayForwardingSettings(ctx)
@@ -182,6 +185,33 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 		// settings update must not turn one Forward call into a mixed mode where
 		// metadata is generated but the session header is treated as passthrough.
 		c.Set(oauthMimicMetadataPassthroughContextKey, metadataPassthroughEnabled)
+	}
+	if shouldMimicClaudeCode && !metadataPassthroughEnabled {
+		runtimeTurn, hydratedBody, runtimeErr := s.prepareClaudeOAuthRuntime(
+			ctx,
+			c,
+			parsed,
+			account.ID,
+			"",
+			body,
+		)
+		if runtimeErr != nil {
+			logger.LegacyPrintf("service.gateway", "Claude OAuth runtime unavailable; falling back to request-local history: account_id=%d error=%v", account.ID, runtimeErr)
+		} else if runtimeTurn != nil {
+			oauthRuntimeTurn = runtimeTurn
+			if !bytes.Equal(hydratedBody, body) {
+				if err := replaceBody(hydratedBody); err != nil {
+					return nil, err
+				}
+			}
+			if oauthRuntimeTurn.Claimed {
+				defer func() {
+					if !oauthRuntimeTurnFinished {
+						s.releaseClaudeOAuthRuntimeTurn(context.WithoutCancel(ctx), account.ID, oauthRuntimeTurn)
+					}
+				}()
+			}
+		}
 	}
 
 	if shouldMimicClaudeCode {
@@ -219,7 +249,11 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 			alignClaudeCodeMainRequest: true,
 		}
 		if !metadataPassthroughEnabled {
-			metadataUserID, metadataErr := s.buildOAuthMimicMetadataUserID(ctx, c, parsed, account)
+			runtimeSessionID := ""
+			if oauthRuntimeTurn != nil {
+				runtimeSessionID = oauthRuntimeTurn.SessionID
+			}
+			metadataUserID, metadataErr := s.buildOAuthMimicMetadataUserIDForSession(ctx, c, parsed, account, runtimeSessionID)
 			if metadataErr != nil {
 				return nil, metadataErr
 			}
@@ -404,6 +438,10 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 		// 携带的 extended-cache-ttl）被策略拒绝时，不会留下 quota/title
 		// 副作用；重试也不会重复发伴生请求。
 		if !companionsDispatched {
+			runtimeKey := ""
+			if oauthRuntimeTurn != nil {
+				runtimeKey = oauthRuntimeTurn.RuntimeKey
+			}
 			s.dispatchClaudeOAuthSessionCompanions(ctx, claudeOAuthCompanionDispatchInput{
 				c:                          c,
 				account:                    account,
@@ -413,15 +451,24 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 				reqStream:                  reqStream,
 				mimicClaudeCode:            shouldMimicClaudeCode,
 				metadataUserID:             oauthMimicMetadataUserID,
-				firstUserText:              firstUserTextBeforeMimic,
+				runtimeKey:                 runtimeKey,
+				titleCandidateText:         titleCandidateTextBeforeMimic,
 				metadataPassthroughEnabled: metadataPassthroughEnabled,
 				proxyURL:                   proxyURL,
 				tlsProfile:                 tlsProfile,
+				startDelay:                 claudeOAuthCompanionStartDelay(c),
 			})
 			companionsDispatched = true
 		}
 
 		// 发送请求
+		if companionsDispatched {
+			sessionID := ""
+			if metadata := ParseMetadataUserID(oauthMimicMetadataUserID); metadata != nil {
+				sessionID = strings.TrimSpace(metadata.SessionID)
+			}
+			logger.LegacyPrintf("service.gateway", "Claude OAuth main request send start: account_id=%d session_id=%s", account.ID, sessionID)
+		}
 		resp, err = s.httpUpstream.DoWithTLS(upstreamReq, proxyURL, account.ID, account.Concurrency, tlsProfile)
 		if err != nil {
 			if resp != nil && resp.Body != nil {
@@ -841,6 +888,7 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 	var usage *ClaudeUsage
 	var firstTokenMs *int
 	var clientDisconnect bool
+	var assistantContent json.RawMessage
 	if reqStream {
 		streamResult, err := s.handleStreamingResponse(ctx, resp, c, account, startTime, originalModel, reqModel, shouldMimicClaudeCode)
 		if err != nil {
@@ -891,11 +939,33 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 		usage = streamResult.usage
 		firstTokenMs = streamResult.firstTokenMs
 		clientDisconnect = streamResult.clientDisconnect
+		assistantContent = streamResult.assistantContent
 	} else {
 		usage, err = s.handleNonStreamingResponse(ctx, resp, c, account, originalModel, reqModel)
 		if err != nil {
 			return nil, err
 		}
+		if c != nil {
+			if value, ok := c.Get(claudeOAuthAssistantContentContextKey); ok {
+				if content, ok := value.([]byte); ok {
+					assistantContent = append(json.RawMessage(nil), content...)
+				}
+			}
+		}
+	}
+
+	if oauthRuntimeTurn != nil && oauthRuntimeTurn.Claimed {
+		if len(bytes.TrimSpace(assistantContent)) == 0 {
+			s.releaseClaudeOAuthRuntimeTurn(context.WithoutCancel(ctx), account.ID, oauthRuntimeTurn)
+		} else if commitErr := s.commitClaudeOAuthRuntimeTurn(
+			context.WithoutCancel(ctx),
+			account.ID,
+			oauthRuntimeTurn,
+			assistantContent,
+		); commitErr != nil {
+			logger.LegacyPrintf("service.gateway", "Claude OAuth runtime transcript commit failed: account_id=%d error=%v", account.ID, commitErr)
+		}
+		oauthRuntimeTurnFinished = true
 	}
 
 	return &ForwardResult{

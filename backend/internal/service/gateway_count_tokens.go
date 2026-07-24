@@ -494,7 +494,11 @@ func (s *GatewayService) buildCountTokensRequest(ctx context.Context, c *gin.Con
 			if !ctEnableMPT {
 				accountUUID := account.GetExtraString("account_uuid")
 				if accountUUID != "" && fp.ClientID != "" {
-					if newBody, err := s.identityService.RewriteUserIDWithMasking(ctx, body, account, accountUUID, fp.ClientID, fp.UserAgent); err == nil && len(newBody) > 0 {
+					metadataUserAgent := fp.UserAgent
+					if mimicClaudeCode {
+						metadataUserAgent = claude.DefaultHeaders["User-Agent"]
+					}
+					if newBody, err := s.identityService.RewriteUserIDWithMasking(ctx, body, account, accountUUID, fp.ClientID, metadataUserAgent); err == nil && len(newBody) > 0 {
 						body = newBody
 					}
 				}
@@ -502,13 +506,15 @@ func (s *GatewayService) buildCountTokensRequest(ctx context.Context, c *gin.Con
 		}
 	}
 
-	// 同步 billing header cc_version 与实际发送的 User-Agent 版本
-	if ctFingerprint != nil && ctEnableFP {
+	// OAuth mimic 的最终 header 固定来自当前原子 profile，因此 billing 与
+	// metadata 的版本也必须跟随它，不能混入缓存 fingerprint 的历史版本。
+	if mimicClaudeCode {
+		body = syncBillingHeaderVersion(body, claude.DefaultHeaders["User-Agent"])
+	} else if ctFingerprint != nil && ctEnableFP {
 		body = syncBillingHeaderVersion(body, ctFingerprint.UserAgent)
 	}
 
 	// === 计算最终 anthropic-beta header（先于 body sanitize 与最终请求构造）===
-	// CCH 在此路径有意未建模；sanitize 后的 body 直接用于构造最终请求。
 	ctEffectiveDropSet := mergeDropSets(s.getBetaPolicyFilterSet(ctx, c, account, modelID))
 	finalBetaHeader, finalBetaShouldSet := s.computeFinalCountTokensAnthropicBeta(
 		tokenType, mimicClaudeCode, modelID, clientHeaders, body, ctEffectiveDropSet,
@@ -532,6 +538,13 @@ func (s *GatewayService) buildCountTokensRequest(ctx context.Context, c *gin.Con
 	}
 
 	body = sanitizeCountTokensRequestBody(body)
+	if tokenType == "oauth" && mimicClaudeCode {
+		var cchErr error
+		body, _, cchErr = finalizeClaudeCodeCCH(body, claude.CurrentClaudeCodeProfile())
+		if cchErr != nil {
+			return nil, nil, fmt.Errorf("finalize Claude Code count_tokens CCH: %w", cchErr)
+		}
+	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST", targetURL, bytes.NewReader(body))
 	if err != nil {

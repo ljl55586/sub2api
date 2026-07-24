@@ -736,7 +736,9 @@ func (s *SettingService) parseSettings(settings map[string]string) *SystemSettin
 	result.AllowUngroupedKeyScheduling = settings[SettingKeyAllowUngroupedKeyScheduling] == "true"
 
 	// Gateway forwarding behavior (defaults: fingerprint=true, metadata_passthrough=false,
-	// cch_signing=false, claude_oauth_system_prompt_injection=true)
+	// legacy cch_signing=false, claude_oauth_system_prompt_injection=true).
+	// CCH itself is mandatory in the atomic 2.1.161 mimic profile; the stored
+	// legacy setting no longer controls wire behavior.
 	if v, ok := settings[SettingKeyEnableFingerprintUnification]; ok && v != "" {
 		result.EnableFingerprintUnification = v == "true"
 	} else {

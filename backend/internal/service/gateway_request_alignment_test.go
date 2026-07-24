@@ -58,6 +58,32 @@ func TestNormalizeClaudeOAuthRequestBody_PreservesLegacyDefaultsOutsideTargetAli
 	require.Equal(t, int64(128000), gjson.GetBytes(out, "max_tokens").Int())
 }
 
+func TestNormalizeClaudeOAuthRequestBody_UsesProfileDefaultAndUpperLimit(t *testing.T) {
+	t.Run("missing uses model default", func(t *testing.T) {
+		input := []byte(`{"model":"claude-opus-4-8","messages":[]}`)
+		out, _ := normalizeClaudeOAuthRequestBody(input, "claude-opus-4-8", claudeOAuthNormalizeOptions{
+			alignClaudeCodeMainRequest: true,
+		})
+		require.Equal(t, int64(64000), gjson.GetBytes(out, "max_tokens").Int())
+	})
+
+	t.Run("explicit value below limit is preserved", func(t *testing.T) {
+		input := []byte(`{"model":"claude-opus-4-8","max_tokens":70000,"messages":[]}`)
+		out, _ := normalizeClaudeOAuthRequestBody(input, "claude-opus-4-8", claudeOAuthNormalizeOptions{
+			alignClaudeCodeMainRequest: true,
+		})
+		require.Equal(t, int64(70000), gjson.GetBytes(out, "max_tokens").Int())
+	})
+
+	t.Run("explicit value above limit is clamped", func(t *testing.T) {
+		input := []byte(`{"model":"claude-opus-4-8","max_tokens":200000,"messages":[]}`)
+		out, _ := normalizeClaudeOAuthRequestBody(input, "claude-opus-4-8", claudeOAuthNormalizeOptions{
+			alignClaudeCodeMainRequest: true,
+		})
+		require.Equal(t, int64(128000), gjson.GetBytes(out, "max_tokens").Int())
+	})
+}
+
 func TestNormalizeClaudeOAuthRequestBody_PreservesOutputFormatAndToolsWhileAligning(t *testing.T) {
 	input := []byte(`{
 		"model":"claude-opus-4-8",
@@ -96,7 +122,8 @@ func TestClaudeOAuthNoToolsMainProfile_ForwardAppliesDefaultProfile(t *testing.T
 	require.Contains(t, blocks[0].Get("text").String(), "x-anthropic-billing-header:")
 	require.Contains(t, blocks[0].Get("text").String(), "cc_version=")
 	require.Contains(t, blocks[0].Get("text").String(), "cc_entrypoint=cli")
-	require.NotContains(t, blocks[0].Get("text").String(), "cch=")
+	require.Contains(t, blocks[0].Get("text").String(), "cch=")
+	require.NotContains(t, blocks[0].Get("text").String(), claudeCodeCCHPlaceholder)
 	require.False(t, blocks[0].Get("cache_control").Exists())
 	require.Equal(t, "ephemeral", blocks[1].Get("cache_control.type").String())
 	require.Equal(t, cacheTTLTarget1h, blocks[1].Get("cache_control.ttl").String())
@@ -137,12 +164,12 @@ func TestClaudeOAuthNoToolsMainProfile_PreservesNormalizedDefaultMaxTokens(t *te
 	body, modelID := normalizeClaudeOAuthRequestBody(body, "claude-opus-4-8", claudeOAuthNormalizeOptions{
 		alignClaudeCodeMainRequest: true,
 	})
-	require.Equal(t, int64(128000), gjson.GetBytes(body, "max_tokens").Int())
+	require.Equal(t, int64(64000), gjson.GetBytes(body, "max_tokens").Int())
 	billingBeforeProfile := gjson.GetBytes(body, "system.0.text").String()
 
 	out, applied := applyClaudeOAuthNoToolsMainProfile(body, modelID, true)
 	require.True(t, applied)
-	require.Equal(t, int64(128000), gjson.GetBytes(out, "max_tokens").Int())
+	require.Equal(t, int64(64000), gjson.GetBytes(out, "max_tokens").Int())
 	require.Equal(t, billingBeforeProfile, gjson.GetBytes(out, "system.0.text").String())
 }
 
@@ -577,7 +604,8 @@ func TestBuildUpstreamRequest_MimicUsesMacOSAndFinalBillingVersion(t *testing.T)
 	require.NoError(t, err)
 	require.Contains(t, billingSystemText(outBody), "cc_version=2.1.161.")
 	require.Contains(t, billingSystemText(outBody), "cc_entrypoint=cli;")
-	require.NotContains(t, billingSystemText(outBody), "cch=")
+	require.Contains(t, billingSystemText(outBody), "cch=")
+	require.NotContains(t, billingSystemText(outBody), claudeCodeCCHPlaceholder)
 	require.Equal(t, "MacOS", getHeaderRaw(req.Header, "x-stainless-os"))
 	require.Equal(t, claude.DefaultHeaders["User-Agent"], getHeaderRaw(req.Header, "user-agent"))
 	require.Equal(t, originalClientID, cachedFingerprint.ClientID)

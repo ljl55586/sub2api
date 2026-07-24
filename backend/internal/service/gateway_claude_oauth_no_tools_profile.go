@@ -148,7 +148,7 @@ func hasDefaultClaudeOAuthSystemBlocks(body []byte) bool {
 		!strings.Contains(billingText, "x-anthropic-billing-header:") ||
 		!strings.Contains(billingText, "cc_version=") ||
 		!strings.Contains(billingText, "cc_entrypoint=cli;") ||
-		strings.Contains(billingText, "cch=") ||
+		!strings.Contains(billingText, claudeCodeCCHPlaceholder+";") ||
 		billing.Get("cache_control").Exists() {
 		return false
 	}

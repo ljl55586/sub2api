@@ -12,10 +12,11 @@ import (
 )
 
 const (
-	fingerprintKeyPrefix   = "fingerprint:"
-	fingerprintTTL         = 7 * 24 * time.Hour // 7天，配合每24小时懒续期可保持活跃账号永不过期
-	maskedSessionKeyPrefix = "masked_session:"
-	maskedSessionTTL       = 15 * time.Minute
+	fingerprintKeyPrefix    = "fingerprint:"
+	fingerprintTTL          = 7 * 24 * time.Hour // 7天，配合每24小时懒续期可保持活跃账号永不过期
+	maskedSessionKeyPrefix  = "masked_session:"
+	maskedSessionTTL        = 15 * time.Minute
+	claudeOAuthDevicePrefix = "claude_oauth_device:"
 )
 
 // fingerprintKey generates the Redis key for account fingerprint cache.
@@ -28,6 +29,10 @@ func maskedSessionKey(accountID int64) string {
 	return fmt.Sprintf("%s%d", maskedSessionKeyPrefix, accountID)
 }
 
+func claudeOAuthDeviceKey(accountID int64) string {
+	return fmt.Sprintf("%s%d", claudeOAuthDevicePrefix, accountID)
+}
+
 type identityCache struct {
 	rdb *redis.Client
 }
@@ -35,6 +40,7 @@ type identityCache struct {
 var _ service.FingerprintAtomicClaimStore = (*identityCache)(nil)
 var _ service.FingerprintAtomicRepairStore = (*identityCache)(nil)
 var _ service.MaskedSessionIDAtomicStore = (*identityCache)(nil)
+var _ service.AccountDeviceStore = (*identityCache)(nil)
 
 func NewIdentityCache(rdb *redis.Client) service.IdentityCache {
 	return &identityCache{rdb: rdb}
@@ -75,6 +81,23 @@ func (c *identityCache) TryClaimFingerprint(ctx context.Context, accountID int64
 		return false, err
 	}
 	return c.rdb.SetNX(ctx, key, val, fingerprintTTL).Result()
+}
+
+func (c *identityCache) GetClaudeOAuthDeviceID(ctx context.Context, accountID int64) (string, error) {
+	value, err := c.rdb.Get(ctx, claudeOAuthDeviceKey(accountID)).Result()
+	if errors.Is(err, redis.Nil) {
+		return "", nil
+	}
+	return value, err
+}
+
+func (c *identityCache) TryClaimClaudeOAuthDeviceID(ctx context.Context, accountID int64, candidate string) (bool, error) {
+	if accountID <= 0 || candidate == "" {
+		return false, nil
+	}
+	// A zero expiration intentionally makes the device identity durable and
+	// independent from the seven-day SDK fingerprint cache.
+	return c.rdb.SetNX(ctx, claudeOAuthDeviceKey(accountID), candidate, 0).Result()
 }
 
 // EnsureFingerprintClientID atomically repairs a legacy fingerprint record

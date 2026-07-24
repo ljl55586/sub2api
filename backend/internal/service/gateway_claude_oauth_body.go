@@ -299,17 +299,29 @@ func normalizeClaudeOAuthRequestBody(body []byte, modelID string, opts claudeOAu
 		}
 	}
 
-	// Preserve the existing OAuth normalization defaults for all non-target
-	// paths. The explicit Opus 4.8 main-request alignment below removes
-	// temperature again while leaving a downstream max_tokens value intact.
+	// Preserve the existing OAuth normalization defaults for non-mimic paths.
+	// The Claude Code profile uses a model-aware default and clamps explicit
+	// overrides to that model's upper limit.
 	if !gjson.GetBytes(out, "temperature").Exists() {
 		if next, ok := setJSONValueBytes(out, "temperature", 1); ok {
 			out = next
 			modified = true
 		}
 	}
-	if !gjson.GetBytes(out, "max_tokens").Exists() {
-		if next, ok := setJSONValueBytes(out, "max_tokens", 128000); ok {
+	maxTokens := gjson.GetBytes(out, "max_tokens")
+	if !maxTokens.Exists() {
+		defaultMaxTokens := 128000
+		if opts.alignClaudeCodeMainRequest {
+			defaultMaxTokens = claude.CurrentClaudeCodeModelTokenLimits(modelID).DefaultMaxTokens
+		}
+		if next, ok := setJSONValueBytes(out, "max_tokens", defaultMaxTokens); ok {
+			out = next
+			modified = true
+		}
+	} else if opts.alignClaudeCodeMainRequest &&
+		maxTokens.Type == gjson.Number &&
+		maxTokens.Int() > int64(claude.CurrentClaudeCodeModelTokenLimits(modelID).UpperMaxTokens) {
+		if next, ok := setJSONValueBytes(out, "max_tokens", claude.CurrentClaudeCodeModelTokenLimits(modelID).UpperMaxTokens); ok {
 			out = next
 			modified = true
 		}
@@ -369,6 +381,16 @@ func (s *GatewayService) buildOAuthMetadataUserID(
 	identity AccountIdentity,
 	uaVersion string,
 ) (string, error) {
+	return s.buildOAuthMetadataUserIDForSession(parsed, account, identity, uaVersion, "")
+}
+
+func (s *GatewayService) buildOAuthMetadataUserIDForSession(
+	parsed *ParsedRequest,
+	account *Account,
+	identity AccountIdentity,
+	uaVersion string,
+	sessionID string,
+) (string, error) {
 	if parsed == nil || account == nil {
 		return "", fmt.Errorf("%w: request or account is nil", ErrIncompleteAccountIdentity)
 	}
@@ -382,12 +404,15 @@ func (s *GatewayService) buildOAuthMetadataUserID(
 	// session_id 用"会话级稳定种子"派生（账号 + 客户端区分因子 + 首条 user 文本）：
 	// 随对话在尾部追加 messages 时保持不变，贴近真实 CC 进程级稳定的 session_id。
 	// 不复用 GenerateSessionHash —— 后者是粘性路由键、按设计逐轮变化（见其测试）。
-	var firstUserText string
-	if parsed.Body != nil {
-		firstUserText = extractFirstUserText(parsed.Body.Bytes())
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		var firstUserText string
+		if parsed.Body != nil {
+			firstUserText = extractFirstUserText(parsed.Body.Bytes())
+		}
+		seed := buildStableSessionSeed(account.ID, sessionContextDiscriminator(parsed.SessionContext), firstUserText)
+		sessionID = generateSessionUUID(seed)
 	}
-	seed := buildStableSessionSeed(account.ID, sessionContextDiscriminator(parsed.SessionContext), firstUserText)
-	sessionID := generateSessionUUID(seed)
 
 	return FormatMetadataUserID(identity.DeviceID, identity.AccountUUID, sessionID, uaVersion), nil
 }
@@ -398,6 +423,16 @@ func (s *GatewayService) buildOAuthMimicMetadataUserID(
 	parsed *ParsedRequest,
 	account *Account,
 ) (string, error) {
+	return s.buildOAuthMimicMetadataUserIDForSession(ctx, c, parsed, account, "")
+}
+
+func (s *GatewayService) buildOAuthMimicMetadataUserIDForSession(
+	ctx context.Context,
+	c *gin.Context,
+	parsed *ParsedRequest,
+	account *Account,
+	sessionID string,
+) (string, error) {
 	if s == nil || s.identityService == nil || c == nil || c.Request == nil {
 		return "", fmt.Errorf("%w: identity service or downstream request is unavailable", ErrIncompleteAccountIdentity)
 	}
@@ -405,7 +440,7 @@ func (s *GatewayService) buildOAuthMimicMetadataUserID(
 	if err != nil {
 		return "", fmt.Errorf("resolve OAuth metadata identity: %w", err)
 	}
-	userID, err := s.buildOAuthMetadataUserID(parsed, account, identity, claude.CLICurrentVersion)
+	userID, err := s.buildOAuthMetadataUserIDForSession(parsed, account, identity, claude.CLICurrentVersion, sessionID)
 	if err != nil || !account.IsSessionIDMaskingEnabled() {
 		return userID, err
 	}
@@ -451,6 +486,40 @@ func (s *GatewayService) applyClaudeCodeOAuthMimicryToBody(
 		return body
 	}
 
+	metadataUserID := ""
+	if s.identityService != nil && c != nil && c.Request != nil {
+		if fp, err := s.identityService.GetOrCreateFingerprint(ctx, account.ID, c.Request.Header); err == nil && fp != nil {
+			mimicMPT := false
+			if s.settingService != nil {
+				_, mimicMPT, _ = s.settingService.GetGatewayForwardingSettings(ctx)
+			}
+			if !mimicMPT {
+				if uid := s.buildOAuthMetadataUserIDFromBody(ctx, account, fp, body); uid != "" {
+					metadataUserID = uid
+				}
+			}
+		}
+	}
+
+	return s.applyClaudeCodeOAuthMimicryToBodyWithMetadata(ctx, c, account, body, systemRaw, model, metadataUserID)
+}
+
+// applyClaudeCodeOAuthMimicryToBodyWithMetadata lets callers that own a
+// server-side runtime inject its random, stable session identity while sharing
+// the same field-level Claude Code normalization as the legacy wrapper above.
+func (s *GatewayService) applyClaudeCodeOAuthMimicryToBodyWithMetadata(
+	ctx context.Context,
+	c *gin.Context,
+	account *Account,
+	body []byte,
+	systemRaw any,
+	model string,
+	metadataUserID string,
+) []byte {
+	if account == nil || !account.IsOAuth() || len(body) == 0 {
+		return body
+	}
+
 	systemPromptInjectionEnabled, systemPrompt, systemPromptBlocks := s.claudeOAuthSystemPromptInjectionSettings(ctx)
 	systemRewritten := false
 	if systemPromptInjectionEnabled && !strings.Contains(strings.ToLower(model), "haiku") {
@@ -462,20 +531,9 @@ func (s *GatewayService) applyClaudeCodeOAuthMimicryToBody(
 		stripSystemCacheControl:    !systemRewritten,
 		alignClaudeCodeMainRequest: true,
 	}
-
-	if s.identityService != nil && c != nil && c.Request != nil {
-		if fp, err := s.identityService.GetOrCreateFingerprint(ctx, account.ID, c.Request.Header); err == nil && fp != nil {
-			mimicMPT := false
-			if s.settingService != nil {
-				_, mimicMPT, _ = s.settingService.GetGatewayForwardingSettings(ctx)
-			}
-			if !mimicMPT {
-				if uid := s.buildOAuthMetadataUserIDFromBody(ctx, account, fp, body); uid != "" {
-					normalizeOpts.injectMetadata = true
-					normalizeOpts.metadataUserID = uid
-				}
-			}
-		}
+	if strings.TrimSpace(metadataUserID) != "" {
+		normalizeOpts.injectMetadata = true
+		normalizeOpts.metadataUserID = metadataUserID
 	}
 
 	body, _ = normalizeClaudeOAuthRequestBody(body, model, normalizeOpts)
@@ -954,8 +1012,8 @@ func rewriteSystemForNonClaudeCodeWithPromptBlocks(body []byte, system any, expa
 	//    接近真实，同时不注入会污染被代理用户行为的工具专属指令。
 	//
 	//    缺失 billing block 的系统 payload 是 Anthropic 判定第三方的关键信号之一
-	//    （真实 CLI 每个请求都带）。新版 CLI 已取消 cch=... 签名字段，故 block 不再注入
-	//    cch（见 buildBillingAttributionText）。
+	//    （真实 CLI 每个请求都带）。2.1.161 profile 先注入 cch=00000，
+	//    最终 wire body 在 buildUpstreamRequest 中完成原位签名。
 	systemBlocks, blockErr := buildClaudeOAuthSystemPromptBlocksJSON(body, expansionPrompt, blocksConfig)
 	if blockErr != nil {
 		logger.LegacyPrintf("service.gateway", "Warning: failed to build configured Claude OAuth system blocks: %v", blockErr)

@@ -139,8 +139,8 @@ func (c *captureIdentityCache) DeleteSessionAccountID(context.Context, int64, st
 	return nil
 }
 
-func (c *captureIdentityCache) TryClaimClaudeOAuthSessionCompanions(_ context.Context, accountID int64, sessionID string, ttl time.Duration) (bool, error) {
-	if accountID <= 0 || strings.TrimSpace(sessionID) == "" || ttl <= 0 {
+func (c *captureIdentityCache) TryClaimClaudeOAuthSessionAction(_ context.Context, accountID int64, sessionID, action string, ttl time.Duration) (bool, error) {
+	if accountID <= 0 || strings.TrimSpace(sessionID) == "" || strings.TrimSpace(action) == "" || ttl <= 0 {
 		return false, nil
 	}
 	c.mu.Lock()
@@ -148,7 +148,7 @@ func (c *captureIdentityCache) TryClaimClaudeOAuthSessionCompanions(_ context.Co
 	if c.claimed == nil {
 		c.claimed = make(map[string]struct{})
 	}
-	key := fmt.Sprintf("%d:%s", accountID, strings.TrimSpace(sessionID))
+	key := fmt.Sprintf("%d:%s:%s", accountID, strings.TrimSpace(sessionID), strings.TrimSpace(action))
 	if _, claimed := c.claimed[key]; claimed {
 		return false, nil
 	}
@@ -156,8 +156,15 @@ func (c *captureIdentityCache) TryClaimClaudeOAuthSessionCompanions(_ context.Co
 	return true, nil
 }
 
+func (c *captureIdentityCache) ReleaseClaudeOAuthSessionAction(_ context.Context, accountID int64, sessionID, action string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.claimed, fmt.Sprintf("%d:%s:%s", accountID, strings.TrimSpace(sessionID), strings.TrimSpace(action)))
+	return nil
+}
+
 var _ GatewayCache = (*captureIdentityCache)(nil)
-var _ ClaudeOAuthSessionCompanionClaimStore = (*captureIdentityCache)(nil)
+var _ ClaudeOAuthSessionActionStore = (*captureIdentityCache)(nil)
 
 type captureWireSnapshot struct {
 	Role           string
@@ -668,7 +675,12 @@ func assertAlignedCaptureTitleRequest(t *testing.T, req *http.Request, body []by
 	billingText := system.Get("0.text").String()
 	require.Equal(t, "cc_version="+ExtractCLIVersion(getHeaderRaw(req.Header, "User-Agent")), ccVersionInBillingRe.FindString(billingText))
 	require.Contains(t, billingText, "cc_entrypoint=cli;")
-	require.NotContains(t, billingText, "cch=")
+	require.Contains(t, billingText, "cch=")
+	require.NotContains(t, billingText, claudeCodeCCHPlaceholder)
+	resigned, applied, err := finalizeClaudeCodeCCH(body, claude.CurrentClaudeCodeProfile())
+	require.NoError(t, err)
+	require.True(t, applied)
+	require.Equal(t, body, resigned)
 }
 
 func assertAlignedCaptureMainRequest(t *testing.T, req *http.Request, body []byte) {
@@ -678,7 +690,12 @@ func assertAlignedCaptureMainRequest(t *testing.T, req *http.Request, body []byt
 	billingText := gjson.GetBytes(body, "system.0.text").String()
 	require.Equal(t, "cc_version="+ExtractCLIVersion(getHeaderRaw(req.Header, "User-Agent")), ccVersionInBillingRe.FindString(billingText))
 	require.Contains(t, billingText, "cc_entrypoint=cli;")
-	require.NotContains(t, billingText, "cch=")
+	require.Contains(t, billingText, "cch=")
+	require.NotContains(t, billingText, claudeCodeCCHPlaceholder)
+	resigned, applied, err := finalizeClaudeCodeCCH(body, claude.CurrentClaudeCodeProfile())
+	require.NoError(t, err)
+	require.True(t, applied)
+	require.Equal(t, body, resigned)
 	require.False(t, gjson.GetBytes(body, "system.0.cache_control").Exists())
 
 	require.False(t, gjson.GetBytes(body, "temperature").Exists())
@@ -1180,7 +1197,7 @@ func buildSessionCompanionsAlignmentCaptureReport(now time.Time, trace15, trace1
 	report.WriteString("- tools 仍保持现有策略；本轮不伪造真实 CLI 的完整 tools schema、tool_choice 或 prompt 原文。\n\n")
 
 	report.WriteString("## 上游识别风险\n\n")
-	report.WriteString("不能把本离线结果视为不可识别的证明。合成请求仍不生成 CCH，而真实 trace 存在 CCH；这是明确保留的高风险差异。system/messages 布局差异仍然存在，且真实 CLI 的 tools schema/count 差异以及 tool_choice 与合成请求不同；即使报告只列结构摘要、不输出原始 prompt 或工具内容，这些差异仍可成为上游识别线索。quota/title 现在在独立受限连接池的后台 worker 中按逻辑顺序执行，回归测试覆盖它们不阻塞主请求；但 quota、title 与 main 的相对写线顺序均不保证，离线 fake recorder 也不能证明真实网络中的调度、连接复用或上游观察顺序。TLS 指纹、HTTP/2、IP/ASN、代理、连接复用以及真实 Claude Code 进程状态均未模拟。伴生请求 claim 的 TTL 为 1 小时；curl 若缺少稳定的会话输入，可能重复发送或漏发首问伴生请求。最后，首问额外增加 quota 与 title 上游流量及其可观察的失败/限流行为。\n")
+	report.WriteString("不能把本离线结果视为不可识别的证明。title/main 的 CCH 已按 2.1.161 profile 对最终 body 字节计算，quota 按真实形态不带 billing/CCH；报告只保留存在性，不输出 token。system/messages 布局差异仍然存在，且真实 CLI 的 tools schema/count 差异以及 tool_choice 与合成请求不同；即使报告只列结构摘要、不输出原始 prompt 或工具内容，这些差异仍可成为上游识别线索。离线 fake recorder 也不能证明真实网络中的调度、连接复用或上游观察顺序。TLS 指纹、HTTP/2、IP/ASN、代理、连接复用以及真实 Claude Code 进程状态均未模拟。curl 若缺少稳定的会话输入，仍可能重复发送或漏发伴生请求。最后，首问额外增加 quota 与 title 上游流量及其可观察的失败/限流行为。\n")
 
 	return report.String()
 }
@@ -1223,7 +1240,7 @@ func writeCaptureRoleComparison(report *strings.Builder, role string, trace, syn
 	fmt.Fprintf(report, "| tools / tool_choice | %s | %s | 仅报告结构 |\n", captureToolsStatus(*trace), captureToolsStatus(*synthetic))
 	fmt.Fprintf(report, "| system/messages | %s | %s | 仅报告 block 类型与长度 |\n", capturePromptLayout(*trace), capturePromptLayout(*synthetic))
 	fmt.Fprintf(report, "| cache_control | %s | %s | 仅报告位置、类型与 TTL |\n", captureCacheLayout(*trace), captureCacheLayout(*synthetic))
-	fmt.Fprintf(report, "| CCH | %s | %s | 合成明确不生成 |\n\n", captureCCHStatus(*trace), captureCCHStatus(*synthetic))
+	fmt.Fprintf(report, "| CCH | %s | %s | 按请求角色/profile 对齐；值不写入报告 |\n\n", captureCCHStatus(*trace), captureCCHStatus(*synthetic))
 }
 
 func captureMethodPathStatus(summary captureRequestSummary) string {
@@ -1753,10 +1770,10 @@ func TestBuildSessionCompanionsAlignmentCaptureReportListsRolesAndRisks(t *testi
 		"## 上游识别风险",
 		"CCH",
 		"TLS 指纹、HTTP/2、IP/ASN",
-		"TTL 为 1 小时",
+		"按 2.1.161 profile 对最终 body 字节计算",
 		"system/messages 布局差异",
 		"tools schema/count 差异",
-		"独立受限连接池",
+		"连接复用",
 		"显式 opt-in capture",
 	} {
 		require.Contains(t, report, section)

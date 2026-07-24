@@ -117,6 +117,14 @@ type FingerprintAtomicRepairStore interface {
 	EnsureFingerprintClientID(ctx context.Context, accountID int64, candidate string) (*Fingerprint, error)
 }
 
+// AccountDeviceStore persists the Claude OAuth device identity independently
+// from the expiring SDK fingerprint. Production Redis stores this key without
+// a TTL so inactive accounts do not silently acquire a new device ID.
+type AccountDeviceStore interface {
+	GetClaudeOAuthDeviceID(ctx context.Context, accountID int64) (string, error)
+	TryClaimClaudeOAuthDeviceID(ctx context.Context, accountID int64, candidate string) (bool, error)
+}
+
 // IdentityService 管理OAuth账号的请求身份指纹
 type IdentityService struct {
 	cache IdentityCache
@@ -261,20 +269,75 @@ func (s *IdentityService) ResolveStableAccountIdentity(ctx context.Context, acco
 		return AccountIdentity{}, fmt.Errorf("%w: account_uuid", ErrIncompleteAccountIdentity)
 	}
 
-	fp, err := s.GetOrCreateFingerprint(ctx, account.ID, headers)
-	if err != nil {
-		return AccountIdentity{}, err
-	}
-
 	deviceID := strings.TrimSpace(account.GetClaudeUserID())
-	if deviceID == "" && fp != nil {
-		deviceID = strings.TrimSpace(fp.ClientID)
+	if deviceID == "" {
+		if store, ok := s.cache.(AccountDeviceStore); ok {
+			var err error
+			deviceID, err = store.GetClaudeOAuthDeviceID(ctx, account.ID)
+			if err != nil {
+				return AccountIdentity{}, fmt.Errorf("resolve persistent device ID for account %d: %w", account.ID, err)
+			}
+			if deviceID = strings.TrimSpace(deviceID); deviceID == "" {
+				fp, fingerprintErr := s.GetOrCreateFingerprint(ctx, account.ID, headers)
+				if fingerprintErr != nil {
+					return AccountIdentity{}, fingerprintErr
+				}
+				candidate := ""
+				if fp != nil {
+					candidate = strings.TrimSpace(fp.ClientID)
+				}
+				deviceID, err = getOrCreateClaudeOAuthDeviceID(ctx, store, account.ID, candidate)
+				if err != nil {
+					return AccountIdentity{}, fmt.Errorf("resolve persistent device ID for account %d: %w", account.ID, err)
+				}
+			}
+		} else {
+			fp, err := s.GetOrCreateFingerprint(ctx, account.ID, headers)
+			if err != nil {
+				return AccountIdentity{}, err
+			}
+			if fp != nil {
+				deviceID = strings.TrimSpace(fp.ClientID)
+			}
+		}
 	}
 	if deviceID == "" {
 		return AccountIdentity{}, fmt.Errorf("%w: device_id", ErrIncompleteAccountIdentity)
 	}
 
 	return AccountIdentity{DeviceID: deviceID, AccountUUID: accountUUID}, nil
+}
+
+func getOrCreateClaudeOAuthDeviceID(ctx context.Context, store AccountDeviceStore, accountID int64, candidate string) (string, error) {
+	if store == nil || accountID <= 0 {
+		return "", nil
+	}
+	current, err := store.GetClaudeOAuthDeviceID(ctx, accountID)
+	if err != nil {
+		return "", err
+	}
+	if current = strings.TrimSpace(current); current != "" {
+		return current, nil
+	}
+	candidate = strings.TrimSpace(candidate)
+	if candidate == "" {
+		candidate = generateClientID()
+	}
+	claimed, err := store.TryClaimClaudeOAuthDeviceID(ctx, accountID, candidate)
+	if err != nil {
+		return "", err
+	}
+	if claimed {
+		return candidate, nil
+	}
+	current, err = store.GetClaudeOAuthDeviceID(ctx, accountID)
+	if err != nil {
+		return "", err
+	}
+	if current = strings.TrimSpace(current); current == "" {
+		return "", errors.New("winning persistent device ID is unavailable")
+	}
+	return current, nil
 }
 
 // createFingerprintFromHeaders 从请求头创建指纹

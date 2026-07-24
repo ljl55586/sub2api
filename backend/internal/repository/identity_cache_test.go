@@ -152,6 +152,25 @@ func TestIdentityCacheTryClaimFingerprint_OnlyFirstClaimWinsAndSetsTTL(t *testin
 	require.Equal(t, first.ClientID, stored.ClientID)
 }
 
+func TestIdentityCacheClaudeOAuthDeviceID_IsPersistentAndFirstClaimWins(t *testing.T) {
+	cache, mr := newIdentityCacheWithMiniRedisForUnitTest(t)
+	ctx := context.Background()
+	const accountID = int64(127)
+
+	claimed, err := cache.TryClaimClaudeOAuthDeviceID(ctx, accountID, "device-first")
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.Equal(t, time.Duration(0), mr.TTL(claudeOAuthDeviceKey(accountID)))
+
+	claimed, err = cache.TryClaimClaudeOAuthDeviceID(ctx, accountID, "device-second")
+	require.NoError(t, err)
+	require.False(t, claimed)
+
+	stored, err := cache.GetClaudeOAuthDeviceID(ctx, accountID)
+	require.NoError(t, err)
+	require.Equal(t, "device-first", stored)
+}
+
 func TestIdentityCacheEnsureFingerprintClientID_RepairsOnlyOnceAndPreservesTTL(t *testing.T) {
 	cache, mr := newIdentityCacheWithMiniRedisForUnitTest(t)
 	ctx := context.Background()

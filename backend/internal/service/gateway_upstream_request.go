@@ -136,8 +136,8 @@ func (s *GatewayService) buildUpstreamRequestWithOptions(ctx context.Context, c 
 	//      与原“OAuth + mimicClaudeCode 跳过白名单透传”行为对齐）
 	//   2) 按 finalBeta 做能力维度 body sanitize（如 context-management beta 缺失 →
 	//      strip body.context_management，与 Bedrock 路径对称）
-	//   3) CCH 在此路径有意未建模；sanitize 后的 body 直接用于构造最终请求
-	//   4) NewRequest（body 至此最终敲定）
+	//   3) 对 OAuth mimic 的 2.1.161 billing placeholder 计算 CCH
+	//   4) NewRequest（body 至此最终敲定，CCH 之后不再改 body）
 	//   5) 透传白名单 / fingerprint / mimic header / 写入 finalBeta
 	policyFilterSet := s.getBetaPolicyFilterSet(ctx, c, account, modelID)
 	effectiveDropSet := mergeDropSets(policyFilterSet)
@@ -164,6 +164,13 @@ func (s *GatewayService) buildUpstreamRequestWithOptions(ctx context.Context, c 
 	// 能力维度 body sanitize：与最终 anthropic-beta header 对称
 	if sanitized, changed := sanitizeAnthropicBodyForBetaTokens(body, finalBetaHeader); changed {
 		body = sanitized
+	}
+	if tokenType == "oauth" && mimicClaudeCode {
+		var cchErr error
+		body, _, cchErr = finalizeClaudeCodeCCH(body, claude.CurrentClaudeCodeProfile())
+		if cchErr != nil {
+			return nil, nil, fmt.Errorf("finalize Claude Code CCH: %w", cchErr)
+		}
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST", targetURL, bytes.NewReader(body))
@@ -523,8 +530,8 @@ func mergeAnthropicBetaDropping(required []string, incoming string, drop map[str
 //
 // 设计动机：将原本在 buildUpstreamRequest 内联在一起、依赖 req.Header 的
 // anthropic-beta 计算逻辑抽成纯函数。这样调用方可以在 NewRequest 之前
-// 就提前拿到最终 beta header，进而能按它对 body 做能力维度 sanitize 后构造最终
-// 请求。CCH 在此路径有意未建模，因此不存在与最终 body 同步的签名步骤。
+// 就提前拿到最终 beta header，进而能按它对 body 做能力维度 sanitize；调用方随后
+// 对收敛后的 body 完成 CCH 签名，再构造最终请求。
 //
 // 返回 (value, shouldSet)：
 //   - shouldSet=false 意为“不主动设置 anthropic-beta header”，与原代码“

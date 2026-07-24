@@ -70,15 +70,49 @@ func extractFirstUserText(body []byte) string {
 	return first
 }
 
+// extractLastUserText returns the newest human input in the request history.
+// Title eligibility is evaluated against this value rather than the first user
+// message so a short opening turn does not permanently suppress a later title.
+func extractLastUserText(body []byte) string {
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.IsArray() {
+		return ""
+	}
+	last := ""
+	messages.ForEach(func(_, msg gjson.Result) bool {
+		if msg.Get("role").String() != "user" {
+			return true
+		}
+		// Bind the candidate to this exact user message. A tool continuation can
+		// have role=user but contain only tool_result blocks; in that case the
+		// latest candidate must be empty instead of inheriting older human text.
+		last = ""
+		content := msg.Get("content")
+		switch {
+		case content.Type == gjson.String:
+			last = content.String()
+		case content.IsArray():
+			content.ForEach(func(_, block gjson.Result) bool {
+				if block.Get("type").String() == "text" {
+					last = block.Get("text").String()
+					return false
+				}
+				return true
+			})
+		}
+		return true
+	})
+	return last
+}
+
 // buildBillingAttributionText 构造 system 数组的 billing attribution 文本。
 //
 // 形态对齐真实 Claude Code CLI：
 //
-//	x-anthropic-billing-header: cc_version=2.1.161.{fp}; cc_entrypoint=cli;
+//	x-anthropic-billing-header: cc_version=2.1.161.{fp}; cc_entrypoint=cli; cch=00000;
 //
-// 注意：CCH 在本请求路径中有意未建模，不会生成或注入 cch 段。cc_version +
-// cc_entrypoint=cli 仍保留：它们是客户端识别（claude_code_validator）与 Anthropic
-// 第一方判定都依赖的稳定信号。
+// CCH 此时仍是等长占位符。所有 body 改写完成后，
+// finalizeClaudeCodeCCH 会对最终序列化字节计算 token 并原位覆盖这五个零。
 //
 // 此 block 不带 cache_control（与真实 CLI 一致；cache breakpoint 由后续的
 // Claude Code prompt block 承担）。
@@ -88,7 +122,7 @@ func buildBillingAttributionText(body []byte, cliVersion string) (string, error)
 	}
 	fp := computeClaudeCodeFingerprint(body, cliVersion)
 	return fmt.Sprintf(
-		"x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=cli;",
+		"x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=cli; cch=00000;",
 		cliVersion, fp,
 	), nil
 }

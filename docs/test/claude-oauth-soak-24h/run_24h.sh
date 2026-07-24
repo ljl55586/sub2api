@@ -7,20 +7,17 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 run_stamp=$(date -u +%Y%m%dT%H%M%SZ)
 export SOAK_SCRIPT_DIR=$script_dir
 export SOAK_OUTPUT_DIR=${SOAK_OUTPUT_DIR:-"$script_dir/runs/$run_stamp"}
-export SOAK_PARALLEL_SESSIONS=${SOAK_PARALLEL_SESSIONS:-1}
+export SOAK_PARALLEL_SESSIONS=0
+export SOAK_CONFIRM_BEFORE_SEND=1
+export SOAK_CONFIRM_TIMEOUT_SECONDS=${SOAK_CONFIRM_TIMEOUT_SECONDS:-0}
 
-planned_session_count=5
+planned_session_count=1
 planned_turns_per_session=30
 planned_wave_count=10
 planned_request_count=$((planned_session_count * planned_turns_per_session))
 
 : "${SOAK_BASE_URL:?set SOAK_BASE_URL before starting the run}"
 : "${SOAK_API_KEY:?set SOAK_API_KEY before starting the run}"
-
-case "$SOAK_PARALLEL_SESSIONS" in
-  0|1) ;;
-  *) echo "SOAK_PARALLEL_SESSIONS must be 0 or 1" >&2; exit 64 ;;
-esac
 
 if [[ -d $SOAK_OUTPUT_DIR ]] && [[ -n $(find "$SOAK_OUTPUT_DIR" -mindepth 1 -maxdepth 1 -print -quit) ]]; then
   echo "SOAK_OUTPUT_DIR is not empty; choose a new directory: $SOAK_OUTPUT_DIR" >&2
@@ -34,8 +31,9 @@ export SOAK_SUCCESS_TIMES_FILE="$SOAK_OUTPUT_DIR/successful-request-times.txt"
 export SOAK_RESERVATIONS_FILE="$SOAK_OUTPUT_DIR/inflight-request-reservations.tsv"
 export SOAK_RUN_LOG="$SOAK_OUTPUT_DIR/run.log"
 export SOAK_USAGE_SAMPLES_FILE="$SOAK_OUTPUT_DIR/usage-samples.tsv"
-printf 'start_epoch=%s\ndeadline_epoch=%s\nparallel_sessions=%s\nscheduling_mode=continuous_waves\n' \
-  "$start_epoch" "$SOAK_DEADLINE_EPOCH" "$SOAK_PARALLEL_SESSIONS" >"$SOAK_OUTPUT_DIR/run.meta"
+printf 'start_epoch=%s\ndeadline_epoch=%s\nparallel_sessions=%s\nconfirmation_required=1\nconfirmation_timeout_seconds=%s\nscheduling_mode=single_session_confirmed_waves\n' \
+  "$start_epoch" "$SOAK_DEADLINE_EPOCH" "$SOAK_PARALLEL_SESSIONS" \
+  "$SOAK_CONFIRM_TIMEOUT_SECONDS" >"$SOAK_OUTPUT_DIR/run.meta"
 : >"$SOAK_SUCCESS_TIMES_FILE"
 : >"$SOAK_RESERVATIONS_FILE"
 
@@ -146,7 +144,7 @@ soak_validate_schedule() {
     return 1
   fi
 
-  soak_log "schedule validated: $planned_session_count sessions x $planned_turns_per_session turns in $planned_wave_count continuous parallel waves"
+  soak_log "schedule validated: $planned_session_count session x $planned_turns_per_session turns in $planned_wave_count confirmed waves"
 }
 
 if ! soak_validate_schedule; then
@@ -173,13 +171,12 @@ if [[ ${SOAK_VALIDATE_ONLY:-0} == 1 ]]; then
   exit 0
 fi
 
-soak_run_continuous_waves() {
-  local target_wave wave session first_turn expectation gap_min gap_max session_script rc pid
-  local wave_gap_min wave_gap_max wave_failed wave_processes_file
-  local start_skew_max=${SOAK_PARALLEL_START_SKEW_MAX_SECONDS:-20}
+soak_run_confirmed_waves() {
+  local target_wave wave session first_turn expectation gap_min gap_max session_script rc
+  local wave_gap_min wave_gap_max wave_failed
   local waves
 
-  soak_log "starting continuous waves; 5h usage guard controls pauses, not a phase clock"
+  soak_log "starting one-session confirmed waves; every request waits for SEND REQUEST"
   waves=$(awk -F '\t' '$1 !~ /^#/ && !seen[$1]++ { print $1 }' "$script_dir/schedule.tsv")
   for target_wave in $waves; do
     if [[ -s $SOAK_SUCCESS_TIMES_FILE ]]; then
@@ -190,7 +187,7 @@ soak_run_continuous_waves() {
 
     wave_gap_min=$(awk -F '\t' -v target_wave="$target_wave" '$1 == target_wave { print $5; exit }' "$script_dir/schedule.tsv")
     wave_gap_max=$(awk -F '\t' -v target_wave="$target_wave" '$1 == target_wave { print $6; exit }' "$script_dir/schedule.tsv")
-    soak_log "wave=$target_wave/$planned_wave_count waiting ${wave_gap_min}-${wave_gap_max}s before parallel launch"
+    soak_log "wave=$target_wave/$planned_wave_count waiting ${wave_gap_min}-${wave_gap_max}s before the session burst"
     soak_sleep_random "$wave_gap_min" "$wave_gap_max"
     soak_check_stop
     soak_check_deadline
@@ -200,62 +197,41 @@ soak_run_continuous_waves() {
       fi
     fi
 
-    wave_processes_file="$SOAK_OUTPUT_DIR/tmp/wave-${target_wave}-processes.tsv"
-    : >"$wave_processes_file"
     wave_failed=0
-    while IFS=$'\t' read -r wave session first_turn expectation gap_min gap_max; do
+    exec 6<"$script_dir/schedule.tsv"
+    while IFS=$'\t' read -r wave session first_turn expectation gap_min gap_max <&6; do
       [[ -z $wave || $wave == \#* ]] && continue
       [[ $wave == "$target_wave" ]] || continue
 
       session_script="$script_dir/sessions/$session.sh"
       soak_log "launching session=$session burst=${first_turn}-$((first_turn + 2)) wave=$wave"
-      if [[ $SOAK_PARALLEL_SESSIONS == 1 ]]; then
-        "$session_script" "$first_turn" "$expectation" 0 "$start_skew_max" &
-        pid=$!
-        printf '%s\t%s\n' "$pid" "$session" >>"$wave_processes_file"
+      set +e
+      "$session_script" "$first_turn" "$expectation" 0 0
+      rc=$?
+      set -e
+      if (( rc != 0 )); then
+        wave_failed=1
+        soak_log "session failed: wave=$target_wave session=$session exit=$rc"
       else
-        set +e
-        "$session_script" "$first_turn" "$expectation" 0 "$start_skew_max"
-        rc=$?
-        set -e
-        if (( rc != 0 )); then
-          wave_failed=1
-          soak_log "sequential session failed: wave=$target_wave session=$session exit=$rc"
-        else
-          soak_log "sequential session completed: wave=$target_wave session=$session"
-        fi
+        soak_log "session completed: wave=$target_wave session=$session"
       fi
-    done <"$script_dir/schedule.tsv"
+    done
+    exec 6<&-
 
-    if [[ $SOAK_PARALLEL_SESSIONS == 1 ]]; then
-      while IFS=$'\t' read -r pid session; do
-        set +e
-        wait "$pid"
-        rc=$?
-        set -e
-        if (( rc != 0 )); then
-          wave_failed=1
-          soak_log "parallel session failed: wave=$target_wave session=$session exit=$rc"
-        else
-          soak_log "parallel session completed: wave=$target_wave session=$session"
-        fi
-      done <"$wave_processes_file"
-    fi
-
-    if [[ -f "$SOAK_OUTPUT_DIR/control/STOP" ]]; then
-      soak_log "parallel wave stopped by a safety guard"
-      return 0
-    fi
     if (( wave_failed != 0 )); then
       printf 'wave=%s\n' "$target_wave" >"$SOAK_OUTPUT_DIR/control/STOPPED_ON_SESSION_ERROR"
       : >"$SOAK_OUTPUT_DIR/control/STOP"
       return 1
     fi
+    if [[ -f "$SOAK_OUTPUT_DIR/control/STOP" ]]; then
+      soak_log "wave stopped by a safety guard"
+      return 0
+    fi
     soak_log "wave=$target_wave/$planned_wave_count completed"
   done
 }
 
-soak_run_continuous_waves
+soak_run_confirmed_waves
 soak_check_stop
 soak_check_deadline
 soak_log "all $planned_request_count planned requests completed; the run ends even if the 5h threshold was not reached"

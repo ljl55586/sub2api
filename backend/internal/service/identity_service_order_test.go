@@ -3,11 +3,13 @@ package service
 import (
 	"context"
 	"errors"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
 	"github.com/stretchr/testify/require"
 )
 
@@ -19,6 +21,28 @@ type identityCacheStub struct {
 	fingerprintErr      error
 	setFingerprintErr   error
 	setFingerprintCall  int
+}
+
+type persistentDeviceIdentityCacheStub struct {
+	*identityCacheStub
+	mu       sync.Mutex
+	deviceID string
+}
+
+func (s *persistentDeviceIdentityCacheStub) GetClaudeOAuthDeviceID(context.Context, int64) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.deviceID, nil
+}
+
+func (s *persistentDeviceIdentityCacheStub) TryClaimClaudeOAuthDeviceID(_ context.Context, _ int64, candidate string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.deviceID != "" {
+		return false, nil
+	}
+	s.deviceID = candidate
+	return true, nil
 }
 
 func (s *identityCacheStub) GetFingerprint(_ context.Context, _ int64) (*Fingerprint, error) {
@@ -672,6 +696,30 @@ func TestIdentityService_GetOrCreateMaskedSessionID_FallsBackForLegacyIdentityCa
 	require.NoError(t, err)
 	require.NotEmpty(t, maskedSessionID)
 	require.Equal(t, maskedSessionID, cache.maskedSessionID)
+}
+
+func TestIdentityService_ResolveStableAccountIdentityPersistsDeviceBeyondFingerprint(t *testing.T) {
+	base := &identityCacheStub{fingerprint: &Fingerprint{
+		ClientID:  "persistent-device-a",
+		UserAgent: claude.DefaultHeaders["User-Agent"],
+		UpdatedAt: time.Now().Unix(),
+	}}
+	cache := &persistentDeviceIdentityCacheStub{identityCacheStub: base}
+	svc := NewIdentityService(cache)
+	account := &Account{
+		ID:    321,
+		Extra: map[string]any{"account_uuid": "account-321"},
+	}
+
+	first, err := svc.ResolveStableAccountIdentity(context.Background(), account, http.Header{})
+	require.NoError(t, err)
+	require.Equal(t, "persistent-device-a", first.DeviceID)
+
+	base.fingerprint = nil
+	base.fingerprintErr = errors.New("fingerprint cache is unavailable")
+	second, err := svc.ResolveStableAccountIdentity(context.Background(), account, http.Header{})
+	require.NoError(t, err)
+	require.Equal(t, "persistent-device-a", second.DeviceID)
 }
 
 func strconvQuote(v string) string {

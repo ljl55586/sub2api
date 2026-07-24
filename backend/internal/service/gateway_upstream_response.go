@@ -643,6 +643,7 @@ type streamingResult struct {
 	usage            *ClaudeUsage
 	firstTokenMs     *int
 	clientDisconnect bool // 客户端是否在流式传输过程中断开
+	assistantContent json.RawMessage
 }
 
 func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http.Response, c *gin.Context, account *Account, startTime time.Time, originalModel, mappedModel string, mimicClaudeCode bool) (*streamingResult, error) {
@@ -790,6 +791,10 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 	useNoopDeltaKeepalive := c != nil && c.Request != nil && shouldUseClaudeCodeNoopDeltaKeepalive(c.GetHeader("User-Agent"))
 	noopDeltaKeepaliveBlockIndex := -1
 	noopDeltaKeepaliveDeltaType := ""
+	var transcriptCollector *claudeOAuthStreamContentCollector
+	if mimicClaudeCode {
+		transcriptCollector = newClaudeOAuthStreamContentCollector()
+	}
 
 	pendingEventLines := make([]string, 0, 4)
 
@@ -843,6 +848,9 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 		eventType, _ := event["type"].(string)
 		if eventName == "" {
 			eventName = eventType
+		}
+		if transcriptCollector != nil {
+			transcriptCollector.Observe(event)
 		}
 		eventChanged := false
 
@@ -961,7 +969,12 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 				if !sawTerminalEvent {
 					return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}, fmt.Errorf("stream usage incomplete: missing terminal event")
 				}
-				return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}, nil
+				return &streamingResult{
+					usage:            usage,
+					firstTokenMs:     firstTokenMs,
+					clientDisconnect: clientDisconnected,
+					assistantContent: transcriptCollector.Content(),
+				}, nil
 			}
 			if ev.err != nil {
 				if sawTerminalEvent {
@@ -1346,6 +1359,9 @@ func (s *GatewayService) handleNonStreamingResponse(ctx context.Context, resp *h
 			return nil, s.invalidNonStreamingJSONFailoverError(ctx, resp, account, body, err, mappedModel)
 		}
 		return nil, fmt.Errorf("parse response: %w", err)
+	}
+	if content := gjson.GetBytes(body, "content"); c != nil && content.IsArray() {
+		c.Set(claudeOAuthAssistantContentContextKey, append([]byte(nil), content.Raw...))
 	}
 
 	// 解析嵌套的 cache_creation 对象中的 5m/1h 明细

@@ -96,9 +96,23 @@ func (s *GatewayService) ForwardAsResponses(
 	// 见 applyClaudeCodeOAuthMimicryToBody 的 godoc。
 	isClaudeCode := false
 	shouldMimicClaudeCode := account.IsOAuth() && !isClaudeCode
+	var oauthCompatRuntime *claudeOAuthCompatRuntime
 
 	if shouldMimicClaudeCode {
-		anthropicBody = s.applyClaudeCodeOAuthMimicryToBody(ctx, c, account, anthropicBody, anthropicReq.System, mappedModel)
+		anthropicBody, oauthCompatRuntime, err = s.prepareClaudeOAuthCompatRuntime(
+			ctx,
+			c,
+			parsed,
+			account,
+			body,
+			anthropicBody,
+			anthropicReq.System,
+			mappedModel,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("prepare Claude OAuth compatibility runtime: %w", err)
+		}
+		defer s.releaseClaudeOAuthCompatRuntime(context.WithoutCancel(ctx), account, oauthCompatRuntime)
 	}
 
 	// 7. Enforce cache_control block limit
@@ -115,6 +129,7 @@ func (s *GatewayService) ForwardAsResponses(
 	if account.ProxyID != nil && account.Proxy != nil {
 		proxyURL = account.Proxy.URL()
 	}
+	tlsProfile := s.tlsFPProfileService.ResolveTLSProfile(account)
 
 	// 10. Build upstream request
 	upstreamCtx, releaseUpstreamCtx := detachStreamUpstreamContext(ctx, reqStream)
@@ -123,9 +138,22 @@ func (s *GatewayService) ForwardAsResponses(
 	if err != nil {
 		return nil, fmt.Errorf("build upstream request: %w", err)
 	}
+	if shouldMimicClaudeCode {
+		s.dispatchClaudeOAuthCompatCompanions(
+			ctx,
+			c,
+			account,
+			oauthCompatRuntime,
+			mappedModel,
+			token,
+			tokenType,
+			proxyURL,
+			tlsProfile,
+		)
+	}
 
 	// 11. Send request
-	resp, err := s.httpUpstream.DoWithTLS(upstreamReq, proxyURL, account.ID, account.Concurrency, s.tlsFPProfileService.ResolveTLSProfile(account))
+	resp, err := s.httpUpstream.DoWithTLS(upstreamReq, proxyURL, account.ID, account.Concurrency, tlsProfile)
 	if err != nil {
 		if resp != nil && resp.Body != nil {
 			_ = resp.Body.Close()
@@ -186,6 +214,9 @@ func (s *GatewayService) ForwardAsResponses(
 	} else {
 		result, handleErr = s.handleResponsesBufferedStreamingResponse(resp, c, originalModel, mappedModel, reasoningEffort, startTime)
 	}
+	if handleErr == nil && shouldMimicClaudeCode {
+		s.commitClaudeOAuthCompatRuntime(context.WithoutCancel(ctx), c, account, oauthCompatRuntime)
+	}
 
 	return result, handleErr
 }
@@ -245,6 +276,8 @@ func (s *GatewayService) handleResponsesBufferedStreamingResponse(
 	// Accumulate the final Anthropic response from streaming events
 	var finalResp *apicompat.AnthropicResponse
 	var usage ClaudeUsage
+	transcriptCollector := newClaudeOAuthStreamContentCollector()
+	sawMessageStop := false
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -262,6 +295,7 @@ func (s *GatewayService) handleResponsesBufferedStreamingResponse(
 			continue
 		}
 		payload := dataLine[6:]
+		sawMessageStop = observeClaudeOAuthCompatStreamPayload(transcriptCollector, []byte(payload)) || sawMessageStop
 
 		var event apicompat.AnthropicStreamEvent
 		if err := json.Unmarshal([]byte(payload), &event); err != nil {
@@ -321,6 +355,7 @@ func (s *GatewayService) handleResponsesBufferedStreamingResponse(
 		writeResponsesError(c, http.StatusBadGateway, "server_error", "Upstream stream ended without a response")
 		return nil, fmt.Errorf("upstream stream ended without response")
 	}
+	storeClaudeOAuthCompatAssistantContent(c, transcriptCollector, sawMessageStop)
 
 	// Update usage from accumulated delta
 	if usage.InputTokens > 0 || usage.OutputTokens > 0 {
@@ -389,6 +424,8 @@ func (s *GatewayService) handleResponsesStreamingResponse(
 	var usage ClaudeUsage
 	var firstTokenMs *int
 	firstChunk := true
+	transcriptCollector := newClaudeOAuthStreamContentCollector()
+	sawMessageStop := false
 
 	scanner := bufio.NewScanner(resp.Body)
 	maxLineSize := defaultMaxLineSize
@@ -484,6 +521,7 @@ func (s *GatewayService) handleResponsesStreamingResponse(
 			continue
 		}
 		payload := dataLine[6:]
+		sawMessageStop = observeClaudeOAuthCompatStreamPayload(transcriptCollector, []byte(payload)) || sawMessageStop
 
 		var event apicompat.AnthropicStreamEvent
 		if err := json.Unmarshal([]byte(payload), &event); err != nil {
@@ -509,6 +547,7 @@ func (s *GatewayService) handleResponsesStreamingResponse(
 		}
 	}
 
+	storeClaudeOAuthCompatAssistantContent(c, transcriptCollector, sawMessageStop)
 	return finalizeStream()
 }
 

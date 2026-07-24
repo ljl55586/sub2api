@@ -397,7 +397,9 @@ soak_effective_cache_expectation() {
     exec 8>&-
   fi
 
-  local cache_ttl_seconds=${SOAK_CACHE_TTL_SECONDS:-300}
+  # The stream=true Claude OAuth no-tools profile rewrites the active cache
+  # breakpoints to the same 1h TTL observed in Claude Code.
+  local cache_ttl_seconds=${SOAK_CACHE_TTL_SECONDS:-3600}
   if [[ $last_finished =~ ^[0-9]+$ ]] && (( $(date +%s) - last_finished >= cache_ttl_seconds )); then
     printf '%s\n' ttl_miss
     return
@@ -436,7 +438,7 @@ soak_send_event() {
   reservation_id="${session}-t${turn}-$$-$(date +%s)"
   soak_reserve_rolling_slot "$reservation_id"
   soak_log "sending session=$session turn=$turn expected_cache=$expectation"
-  if ! "$SOAK_SCRIPT_DIR/send_turn.sh" "$session" "$prompt_file" "$expectation" | tee -a "$SOAK_RUN_LOG"; then
+  if ! "$SOAK_SCRIPT_DIR/send_turn.sh" "$session" "$prompt_file" "$expectation" 2>&1 | tee -a "$SOAK_RUN_LOG"; then
     soak_release_rolling_slot "$reservation_id"
     soak_log "request failed; stopping the whole run without automatic retry"
     printf '%s\n' "request failure at $(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$SOAK_OUTPUT_DIR/control/STOPPED_ON_ERROR"
