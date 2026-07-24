@@ -8,7 +8,8 @@ run_stamp=$(date -u +%Y%m%dT%H%M%SZ)
 export SOAK_SCRIPT_DIR=$script_dir
 export SOAK_OUTPUT_DIR=${SOAK_OUTPUT_DIR:-"$script_dir/runs/$run_stamp"}
 export SOAK_PARALLEL_SESSIONS=0
-export SOAK_CONFIRM_BEFORE_SEND=1
+export SOAK_CONFIRM_BEFORE_SEND=0
+export SOAK_UPSTREAM_APPROVAL_REQUIRED=1
 export SOAK_CONFIRM_TIMEOUT_SECONDS=${SOAK_CONFIRM_TIMEOUT_SECONDS:-0}
 
 planned_session_count=1
@@ -18,6 +19,8 @@ planned_request_count=$((planned_session_count * planned_turns_per_session))
 
 : "${SOAK_BASE_URL:?set SOAK_BASE_URL before starting the run}"
 : "${SOAK_API_KEY:?set SOAK_API_KEY before starting the run}"
+: "${SOAK_UPSTREAM_APPROVAL_DIR:?set SOAK_UPSTREAM_APPROVAL_DIR to the host side of the server approval directory}"
+: "${SOAK_UPSTREAM_APPROVAL_TOKEN:?set SOAK_UPSTREAM_APPROVAL_TOKEN to the same secret configured on the server}"
 
 if [[ -d $SOAK_OUTPUT_DIR ]] && [[ -n $(find "$SOAK_OUTPUT_DIR" -mindepth 1 -maxdepth 1 -print -quit) ]]; then
   echo "SOAK_OUTPUT_DIR is not empty; choose a new directory: $SOAK_OUTPUT_DIR" >&2
@@ -31,7 +34,7 @@ export SOAK_SUCCESS_TIMES_FILE="$SOAK_OUTPUT_DIR/successful-request-times.txt"
 export SOAK_RESERVATIONS_FILE="$SOAK_OUTPUT_DIR/inflight-request-reservations.tsv"
 export SOAK_RUN_LOG="$SOAK_OUTPUT_DIR/run.log"
 export SOAK_USAGE_SAMPLES_FILE="$SOAK_OUTPUT_DIR/usage-samples.tsv"
-printf 'start_epoch=%s\ndeadline_epoch=%s\nparallel_sessions=%s\nconfirmation_required=1\nconfirmation_timeout_seconds=%s\nscheduling_mode=single_session_confirmed_waves\n' \
+printf 'start_epoch=%s\ndeadline_epoch=%s\nparallel_sessions=%s\nconfirmation_required=1\nconfirmation_scope=final_upstream_stage\nconfirmation_timeout_seconds=%s\nscheduling_mode=single_session_confirmed_waves\n' \
   "$start_epoch" "$SOAK_DEADLINE_EPOCH" "$SOAK_PARALLEL_SESSIONS" \
   "$SOAK_CONFIRM_TIMEOUT_SECONDS" >"$SOAK_OUTPUT_DIR/run.meta"
 : >"$SOAK_SUCCESS_TIMES_FILE"
@@ -176,7 +179,7 @@ soak_run_confirmed_waves() {
   local wave_gap_min wave_gap_max wave_failed
   local waves
 
-  soak_log "starting one-session confirmed waves; every request waits for SEND REQUEST"
+  soak_log "starting one-session confirmed waves; every final upstream stage waits for SEND REQUEST"
   waves=$(awk -F '\t' '$1 !~ /^#/ && !seen[$1]++ { print $1 }' "$script_dir/schedule.tsv")
   for target_wave in $waves; do
     if [[ -s $SOAK_SUCCESS_TIMES_FILE ]]; then

@@ -186,6 +186,7 @@ type claudeOAuthCompanionDispatchInput struct {
 	proxyURL                   string
 	tlsProfile                 *tlsfingerprint.Profile
 	startDelay                 time.Duration
+	approvalStage              *claudeUpstreamApprovalStage
 }
 
 type claudeOAuthCompanionPendingRequest struct {
@@ -213,15 +214,15 @@ func claudeOAuthCompanionStartDelay(c *gin.Context) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
-func (s *GatewayService) dispatchClaudeOAuthSessionCompanions(ctx context.Context, in claudeOAuthCompanionDispatchInput) {
+func (s *GatewayService) dispatchClaudeOAuthSessionCompanions(ctx context.Context, in claudeOAuthCompanionDispatchInput) int {
 	if s == nil || in.account == nil || !in.mimicClaudeCode || in.tokenType != "oauth" ||
 		claude.NormalizeModelID(in.modelID) != "claude-opus-4-8" || !in.reqStream ||
 		in.metadataPassthroughEnabled || s.httpUpstream == nil {
-		return
+		return 0
 	}
 	metadata := ParseMetadataUserID(in.metadataUserID)
 	if metadata == nil || strings.TrimSpace(metadata.SessionID) == "" {
-		return
+		return 0
 	}
 	sessionID := strings.TrimSpace(metadata.SessionID)
 	titleEligible := claudeOAuthTitleCandidateEligible(in.titleCandidateText)
@@ -297,7 +298,7 @@ func (s *GatewayService) dispatchClaudeOAuthSessionCompanions(ctx context.Contex
 	}
 
 	if len(pending) == 0 {
-		return
+		return 0
 	}
 
 	// Build all bodies and requests before any network side effect: gin.Context
@@ -324,6 +325,24 @@ func (s *GatewayService) dispatchClaudeOAuthSessionCompanions(ctx context.Contex
 
 	if quotaRequest != nil {
 		go func(pending claudeOAuthCompanionPendingRequest) {
+			if in.approvalStage != nil {
+				if approvalErr := in.approvalStage.Await("quota", pending.req); approvalErr != nil {
+					s.completeClaudeOAuthCompanionAction(
+						baseCtx,
+						accountID,
+						sessionID,
+						in.runtimeKey,
+						claudeOAuthSessionActionQuota,
+						pending.claimID,
+						false,
+						0,
+						"",
+						approvalErr.Error(),
+						nil,
+					)
+					return
+				}
+			}
 			requestCtx, cancel := context.WithTimeout(pending.req.Context(), pending.timeout)
 			defer cancel()
 			req := pending.req.WithContext(requestCtx)
@@ -362,12 +381,35 @@ func (s *GatewayService) dispatchClaudeOAuthSessionCompanions(ctx context.Contex
 	if titleRequest != nil {
 		titleStarted := make(chan struct{})
 		go func(pending claudeOAuthCompanionPendingRequest) {
+			if in.approvalStage != nil {
+				// Let dispatch return so main can register the final bundle member.
+				// The network call still remains blocked in Await.
+				close(titleStarted)
+				if approvalErr := in.approvalStage.Await("title", pending.req); approvalErr != nil {
+					s.completeClaudeOAuthCompanionAction(
+						baseCtx,
+						accountID,
+						sessionID,
+						in.runtimeKey,
+						claudeOAuthSessionActionTitle,
+						pending.claimID,
+						false,
+						0,
+						"",
+						approvalErr.Error(),
+						nil,
+					)
+					return
+				}
+			}
 			if in.startDelay > 0 {
 				logger.LegacyPrintf("service.gateway", "Claude OAuth title companion delayed after runtime startup: account_id=%d session_id=%s delay=%s", accountID, sessionID, in.startDelay)
 				timer := time.NewTimer(in.startDelay)
 				<-timer.C
 			}
-			close(titleStarted)
+			if in.approvalStage == nil {
+				close(titleStarted)
+			}
 			requestCtx, cancel := context.WithTimeout(pending.req.Context(), pending.timeout)
 			defer cancel()
 			req := pending.req.WithContext(requestCtx)
@@ -408,6 +450,7 @@ func (s *GatewayService) dispatchClaudeOAuthSessionCompanions(ctx context.Contex
 			<-titleStarted
 		}
 	}
+	return len(pending)
 }
 
 func claudeOAuthTitleCandidateEligible(text string) bool {

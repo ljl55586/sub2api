@@ -1,5 +1,7 @@
 # Claude OAuth 单账号单会话逐请求确认压测
 
+以后每次修改源码或压测脚本时，请先阅读独立操作手册：[sub2api 源码同步、重新部署与压测运行手册](./SERVER_SYNC_AND_SOAK_RUNBOOK.md)。
+
 本测试包只通过 `curl` 调用 sub2api `/v1/messages`，用于观察单个 Claude OAuth/Pro 账号的连续多轮、粘性会话、Claude Code 1 小时提示缓存、会话启动伴生请求和用量保护。
 
 当前正式计划只运行一个新会话：
@@ -8,7 +10,7 @@
 
 Session F 共 30 个主请求，严格串行。首轮还会异步启动一次 quota 和一次 title；如果伴生请求首次成功，完整运行预计产生 32 个上游请求。
 
-每次主请求都会先把最终 JSON 完整打印到终端并明确标记为“尚未发送”。只有输入精确字符串 `SEND REQUEST` 后才会调用 `curl`；正式 runner 默认无限等待确认。输入其他内容、关闭输入、创建 `STOP` 文件或超过 24 小时截止时间都不会发送该请求，并会停止本轮运行。
+正式 runner 会先用 `curl` 把下游请求交给 sub2api，但 sub2api 会在真正访问 Anthropic 之前暂停。首轮完成所有改写、缓存断点、CCH 和 header 构造后，把 `quota + title + main` 三个最终上游请求一起展示，只确认一次；后续每轮只展示最终 `main`，每条分别确认。只有输入精确字符串 `SEND REQUEST`，后端才会放行同一批已经构造好的请求对象。输入其他内容、关闭输入、创建 `STOP` 文件或超过 24 小时截止时间都会写入 reject，Anthropic 不会收到该 stage。
 
 调度器不再划分固定的 5 个 phase，也没有“每个 phase 18 个请求”或“滚动 5h 最多 18 个请求”的默认限制。它连续执行 10 个 wave，真正控制发送的是上游用量保护：
 
@@ -118,15 +120,15 @@ metadata passthrough 必须保持关闭。下游 metadata 用于 sub2api 在选�
 
 ### 会话启动顺序
 
-Session F 的首轮使用 `stream:true`。它第一次命中所选 OAuth 账号时，网关会在 main 完成最终 body/header 构造和策略检查后，异步启动 quota/title 伴生请求，然后立即发送 main：
+Session F 的首轮使用 `stream:true`。它第一次命中所选 OAuth 账号时，网关会先完成 quota/title/main 的最终 body/header 构造，然后让三个发送 goroutine 一起停在上游 approval gate：
 
 ```text
-quota goroutine ─┐
-title goroutine ─┼─ 并发，不等待响应
-main request ────┘
+quota final request ─┐
+title final request ─┼─ 同一 preview、一次 SEND REQUEST ──> 并发放行
+main final request ──┘
 ```
 
-压测客户端不再发送私有的伴生延迟 header。goroutine 启动顺序不等于真实网络写入或上游到达顺序，因此本轮不把 `quota → title → main` 的严格先后作为通过条件。quota、title、main 使用相同的最终 `metadata.user_id` 和 `x-claude-code-session-id`，但 quota/title 的 messages 和响应不会拼进 main 历史。成功的伴生 action 状态保留在 30 小时 runtime 中；发送失败时允许后续轮次重试。
+确认前，三个请求都没有调用上游 transport。确认后，它们仍然并发发送，所以不保证 Anthropic 的网络到达顺序。quota、title、main 使用相同的最终 `metadata.user_id` 和 `x-claude-code-session-id`，但 quota/title 的 messages 和响应不会拼进 main 历史。成功的伴生 action 状态保留在 30 小时 runtime 中。main 的自动重试会形成新的 main-only approval stage；如果 quota/title 发送失败并在后续轮次重新出现，严格 runner 会因 bundle 不再是 main-only 而 reject 并停止，要求先调查失败原因。
 
 `send_turn.sh` 默认使用 `stream:false`，不会因为没有设置环境变量就意外触发伴生请求。本方案只有在第 7 节显式执行 `export SOAK_STREAM='true'` 后才使用上述启动流程；正式启动前务必检查该变量。
 
@@ -170,10 +172,16 @@ cd /Users/ling/sub2api
 git status --short --branch
 git add \
   backend/internal/service/gateway_claude_oauth_companion.go \
-  backend/internal/service/gateway_claude_oauth_companion_test.go \
   backend/internal/service/gateway_forward.go \
+  backend/internal/service/gateway_service.go \
+  backend/internal/service/gateway_claude_upstream_approval.go \
+  backend/internal/service/gateway_claude_upstream_approval_test.go \
+  deploy/docker-compose.yml \
+  deploy/docker-compose.local.yml \
+  deploy/docker-compose.dev.yml \
+  deploy/docker-compose.standalone.yml \
   docs/test/claude-oauth-soak-24h
-git commit -m "fix: align Claude session startup soak flow"
+git commit -m "test: approve final Claude upstream requests"
 git push myfork codex/claude-request-alignment
 ```
 
@@ -190,6 +198,47 @@ chmod 700 *.sh sessions/*.sh
 ```
 
 本次同时修改了 Go 网关和压测脚本。服务器拉取后必须按下方第 5.1 节重新构建 sub2api 镜像并重建应用容器，然后才能启动新的压测 run。
+
+### 5.0 配置最终上游请求 approval gate
+
+此功能默认关闭。正式压测前，在 `/root/sub2api-deploy/.env` 中设置一对只用于本机压测的配置：
+
+```bash
+cd /root/sub2api-deploy
+install -d -m 700 data/upstream-approval
+
+approval_token=$(openssl rand -hex 32)
+printf 'SUB2API_UPSTREAM_APPROVAL_DIR=/app/data/upstream-approval\n' >>.env
+printf 'SUB2API_UPSTREAM_APPROVAL_TOKEN=%s\n' "$approval_token" >>.env
+unset approval_token
+```
+
+如果 `.env` 已经有这两个键，应编辑原值，不能追加重复键。Compose 必须把 `./data` bind mount 到容器的 `/app/data`；可用以下命令确认：
+
+```bash
+docker compose config | sed -n '/sub2api:/,/^[^ ]/p' | grep -A4 -B2 '/app/data'
+```
+
+`/root/sub2api-deploy/docker-compose.yml` 中 sub2api 服务的 `environment` 还必须包含以下传递项（源码仓库的四份 Compose 模板已更新，但既有部署目录不会自动被覆盖）：
+
+```yaml
+- SUB2API_UPSTREAM_APPROVAL_DIR=${SUB2API_UPSTREAM_APPROVAL_DIR:-}
+- SUB2API_UPSTREAM_APPROVAL_TOKEN=${SUB2API_UPSTREAM_APPROVAL_TOKEN:-}
+```
+
+重建容器后确认配置进入了容器，但不要打印 token：
+
+```bash
+docker compose exec -T sub2api sh -c '
+  set -e
+  test "$SUB2API_UPSTREAM_APPROVAL_DIR" = /app/data/upstream-approval
+  test -n "$SUB2API_UPSTREAM_APPROVAL_TOKEN"
+'
+```
+
+正式 runner 读取的宿主机目录是 `/root/sub2api-deploy/data/upstream-approval`，后端使用的容器内目录是 `/app/data/upstream-approval`，二者必须是同一个 bind mount。命名 volume 部署不能直接使用这个 runner 路径，需先改为明确的宿主机 bind mount。
+
+approval token 只用于授权“把已暂停的最终上游请求写入共享目录并等待放行”，不能使用 sub2api API key 或 Claude OAuth token 代替。preview 中的 `Authorization` 和 `x-api-key` 会脱敏，token 本身也不会写入 preview。
 
 ### 5.1 每次修改后的重新部署与运行流程
 
@@ -223,8 +272,15 @@ pgrep -af '[r]un_24h.sh' || echo '没有正在运行的压测程序'
 cd /Users/ling/sub2api
 git status --short --branch
 
-# 只暂存本次压测包；不要把抓包、密钥或无关文件一起提交
-git add docs/test/claude-oauth-soak-24h
+# 只暂存本次 gate、Compose 模板和压测包；不要把抓包、密钥或无关文件一起提交
+git add \
+  backend/internal/service/gateway_claude_oauth_companion.go \
+  backend/internal/service/gateway_forward.go \
+  backend/internal/service/gateway_service.go \
+  backend/internal/service/gateway_claude_upstream_approval.go \
+  backend/internal/service/gateway_claude_upstream_approval_test.go \
+  deploy/docker-compose*.yml \
+  docs/test/claude-oauth-soak-24h
 git diff --cached --check
 git commit -m "test: update Claude OAuth soak scenarios"
 git push myfork codex/claude-request-alignment
@@ -341,6 +397,8 @@ curl -fsS http://127.0.0.1:8080/health
 command -v curl
 command -v jq
 command -v od
+command -v less
+command -v openssl
 command -v tmux
 ```
 
@@ -375,8 +433,16 @@ unset SOAK_MAX_TOKENS
 export SOAK_USER_AGENT='soak-curl/1.0'
 export SOAK_STREAM='true'
 export SOAK_CACHE_TTL_SECONDS='3600'
-# 0 表示请求展示后无限等待确认；正式 runner 强制逐请求确认
+# 0 表示最终上游 stage 展示后无限等待确认
 export SOAK_CONFIRM_TIMEOUT_SECONDS='0'
+export SOAK_UPSTREAM_APPROVAL_DIR='/root/sub2api-deploy/data/upstream-approval'
+SOAK_UPSTREAM_APPROVAL_TOKEN=$(
+  awk -F= '$1 == "SUB2API_UPSTREAM_APPROVAL_TOKEN" {
+    print substr($0, index($0, "=") + 1)
+  }' /root/sub2api-deploy/.env | tail -n 1
+)
+export SOAK_UPSTREAM_APPROVAL_TOKEN
+export SOAK_UPSTREAM_PREVIEW_PAGER='auto'
 
 export SOAK_ACCOUNT_ID='1'
 export SOAK_DEPLOY_DIR='/root/sub2api-deploy'
@@ -395,15 +461,16 @@ unset SOAK_VALIDATE_ONLY SOAK_DRY_RUN SOAK_SKIP_WAITS \
   SOAK_CONFIRM_BEFORE_SEND
 ```
 
-正式 `run_24h.sh` 会强制设置单会话、前台串行和逐请求确认；即使当前 shell 留有旧的并行变量，也不会并发启动请求。
+正式 `run_24h.sh` 会强制设置单会话、前台串行和最终上游 stage 确认；即使当前 shell 留有旧的并行变量，也不会并发启动主请求。
 
-API key 是调用 sub2api 的下游 `sk-...`，不是 Claude OAuth token。输入时没有回显是正常的。
+API key 是调用 sub2api 的下游 `sk-...`，不是 Claude OAuth token。approval token 是另一段本机共享密钥；两者都不会显示在 preview 中。
 
 检查变量但不显示密钥：
 
 ```bash
-printf 'BASE_URL=%s ACCOUNT_ID=%s API_KEY_LENGTH=%s\n' \
-  "$SOAK_BASE_URL" "$SOAK_ACCOUNT_ID" "${#SOAK_API_KEY}"
+printf 'BASE_URL=%s ACCOUNT_ID=%s API_KEY_LENGTH=%s APPROVAL_DIR=%s APPROVAL_TOKEN_LENGTH=%s\n' \
+  "$SOAK_BASE_URL" "$SOAK_ACCOUNT_ID" "${#SOAK_API_KEY}" \
+  "$SOAK_UPSTREAM_APPROVAL_DIR" "${#SOAK_UPSTREAM_APPROVAL_TOKEN}"
 ```
 
 ## 8. 启动前验证
@@ -454,23 +521,24 @@ printf 'formal output: %s\n' "$SOAK_OUTPUT_DIR"
 ./run_24h.sh
 ```
 
-启动后第一条请求会立即构造并完整打印。此时终端会显示：
+启动后，runner 先把下游请求提交给 sub2api；sub2api 完成最终上游构造后暂停。首轮终端会显示：
 
 ```text
-========== PREPARED REQUEST: NOT SENT ==========
+========== FINAL UPSTREAM REQUEST(S): NOT SENT ==========
+bundle: quota,title,main
 ...
-Type exactly SEND REQUEST to send this file:
+Type exactly SEND REQUEST to release this upstream stage:
 ```
 
-先检查完整 JSON，确认后在同一终端输入：
+交互终端默认用 `less` 打开完整 preview，方向键、PageUp/PageDown 可以上下浏览，按 `q` 返回确认提示。preview 包含最终 URL、脱敏 headers、完整 body、body SHA-256 和 `network_sent:false`。确认后在同一终端输入：
 
 ```text
 SEND REQUEST
 ```
 
-只有这条精确字符串会放行当前请求。每个请求都会重复上述流程，共需确认 30 次。输入其他内容或关闭 stdin 会以退出码 `75` 停止整个 run，当前 JSON 保留在 `requests/`，但不会调用 `curl`，也不会推进 `state/`。应使用新 `SOAK_OUTPUT_DIR` 修正后重跑，不能在旧目录继续。
+只有这条精确字符串会让后端调用 Anthropic transport。首轮的 quota/title/main 一次放行；后续 29 条 main 各确认一次，因此正常完成仍需输入 30 次。输入其他内容或关闭 stdin 会以退出码 `75` 停止整个 run，preview 保留在 `upstream-previews/`，后端收到 `.reject`，不会访问 Anthropic，也不会推进 `state/`。应使用新 `SOAK_OUTPUT_DIR` 修正后重跑，不能在旧目录继续。
 
-Session F 的 quota/title 会在首个 main 前被异步调度，但三者不等待彼此的响应，实际网络写入顺序可能交错。之后不会出现固定 5 小时静默，也不需要创建 `continue-phase-*` 文件。
+首轮批准后，quota/title/main 同时解除 gate；三者不等待彼此的响应，实际网络写入顺序仍可能交错。之后不会出现固定 5 小时静默，也不需要创建 `continue-phase-*` 文件。
 
 从 tmux 脱离但保持运行：按 `Ctrl-b`，松开后按 `d`。重新进入：
 
@@ -591,13 +659,14 @@ cd /root/sub2api-deploy
 docker compose logs --tail=100 -f sub2api
 ```
 
-查看上游请求快照：
+查看已经展示给 runner 的最终上游 preview：
 
 ```bash
-tail -F /root/sub2api-deploy/data/gateway_debug.log
+find /root/sub2api-soak-runs -path '*/upstream-previews/*.preview.json' \
+  -type f -print | sort | tail
 ```
 
-`gateway_debug.log` 是“请求构造完成”的快照，不是网络发送时间线。由于 main 必须先完成最终 body/header 与 beta 策略校验，文件中 `UPSTREAM_FORWARD` 可能出现在 quota/title 快照之前。真正的发送行为应查看容器运行日志：
+这些 preview 是 approval 时实际暂停的最终请求；除认证值脱敏外，URL、headers 和 body 与批准后交给 transport 的同一请求对象一致。`network_sent:false` 表示生成 preview 时尚未访问上游。批准后的真实发送行为查看容器运行日志：
 
 ```bash
 cd /root/sub2api-deploy
@@ -605,7 +674,7 @@ docker compose logs -f sub2api 2>&1 |
   grep -E 'Claude OAuth (quota|title|main|session startup)'
 ```
 
-同一个 `session_id` 应观察到 quota、title 和 main 各自的 `send start`；quota/title 的完成日志可以晚于 main。即使只有一个 session，三个请求仍由并发 goroutine 发出，因此不能用日志行顺序推断严格的网络到达先后。
+同一个 `session_id` 应在输入首轮 `SEND REQUEST` 后才观察到 quota、title 和 main 各自的 `send start`；quota/title 的完成日志可以晚于 main。三个请求由并发 goroutine 放行，因此不能用日志行顺序推断严格的网络到达先后。
 
 验证所有已生成请求的下游身份：
 
@@ -635,7 +704,7 @@ run_dir=$(ls -dt /root/sub2api-soak-runs/run-* | head -n 1)
 touch "$run_dir/control/STOP"
 ```
 
-等待随机间隔时，脚本最长约 30 秒发现 STOP；等待人工确认时，确认后的最后检查也会阻止发送。已经在途的最多一个主请求会等待响应完成或在 900 秒超时。
+等待随机间隔时，脚本最长约 30 秒发现 STOP；等待人工确认时，runner 会写 `.reject`，后端不会访问 Anthropic。approval 模式下下游 `curl` 不设置总时长上限，因为人工检查可能超过 900 秒；批准后的上游连接/响应超时仍由 sub2api 自身的 HTTP 配置负责。
 
 立即中断 tmux 中的在途请求：
 
@@ -686,8 +755,9 @@ find "$run_dir/control" -maxdepth 1 -type f -print
 - Session F 完成 30 轮，或明确因为人工拒绝、5h/7d/deadline/错误保护停止；
 - Session F 的下游 metadata session ID 跨 30 轮稳定；
 - Session F 的上游 session ID 跨 30 轮稳定；
-- 首轮观察到 quota、title、main；成功的 quota/title 不会无故重复，伴生失败不会阻塞 main；
-- 每个主请求都先完整展示，确认前没有对应的 `curl` 调用、manifest 行或 state 推进；
+- 首轮一个 preview 同时包含 quota、title、main；成功的 quota/title 不会无故重复；
+- 后续每个 preview 只包含一个 main，自动重试也必须形成新的 main-only stage；
+- 每个最终上游 stage 都先完整展示，确认前没有 Anthropic transport 调用、manifest 行或 state 推进；
 - quota、title、main 的最终 session ID 完全相同，title 内容没有进入 main 历史；
 - 计划 hit 大多数出现长前缀量级 cache read；
 - 计划 TTL miss/cold 大多数出现 cache creation；

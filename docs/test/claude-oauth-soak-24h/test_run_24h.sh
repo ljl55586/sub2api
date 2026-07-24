@@ -9,7 +9,8 @@ trap 'rm -rf "$test_dir"' EXIT
 
 fake_bin="$test_dir/bin"
 output_dir="$test_dir/run"
-mkdir -p "$fake_bin"
+approval_dir="$test_dir/upstream-approval"
+mkdir -p "$fake_bin" "$approval_dir"
 cp -- "$script_dir/testdata/fake_curl.sh" "$fake_bin/curl"
 chmod 700 "$fake_bin/curl"
 
@@ -27,6 +28,11 @@ done | \
   SOAK_SKIP_WAITS='1' \
   SOAK_STREAM='true' \
   SOAK_CONFIRM_BEFORE_SEND='0' \
+  SOAK_UPSTREAM_APPROVAL_DIR="$approval_dir" \
+  SOAK_UPSTREAM_APPROVAL_TOKEN='approval-secret' \
+  SOAK_UPSTREAM_PREVIEW_PAGER='0' \
+  FAKE_CURL_UPSTREAM_APPROVAL_DIR="$approval_dir" \
+  FAKE_CURL_EXPECT_APPROVAL_TOKEN='approval-secret' \
   FAKE_CURL_RESPONSE_FILE="$script_dir/testdata/valid-response.json" \
     "$script_dir/run_24h.sh" >"$test_dir/run.log" 2>&1
 runner_rc=$?
@@ -39,13 +45,31 @@ if (( runner_rc != 0 )); then
 fi
 
 request_count=$(find "$output_dir/requests" -type f -name '*.json' | wc -l | tr -d ' ')
-prepared_count=$(grep -Fc 'PREPARED REQUEST: NOT SENT' "$test_dir/run.log")
-accepted_count=$(grep -Fc 'confirmation accepted; sending the prepared request unchanged' "$test_dir/run.log")
+preview_count=$(find "$output_dir/upstream-previews" -type f -name '*.preview.json' | wc -l | tr -d ' ')
+prepared_count=$(grep -Fc 'FINAL UPSTREAM REQUEST(S): NOT SENT' "$test_dir/run.log")
+accepted_count=$(grep -Fc 'confirmation accepted; releasing exact upstream stage=' "$test_dir/run.log")
 manifest_rows=$(wc -l <"$output_dir/manifest.tsv" | tr -d ' ')
 state_user_turns=$(jq '[.[] | select(.role == "user")] | length' "$output_dir/state/session-f.messages.json")
 
-if [[ $request_count != 30 || $prepared_count != 30 || $accepted_count != 30 ]]; then
-  echo "runner counts differ: requests=$request_count prepared=$prepared_count accepted=$accepted_count" >&2
+if [[ $request_count != 30 || $preview_count != 30 || $prepared_count != 30 || $accepted_count != 30 ]]; then
+  echo "runner counts differ: requests=$request_count previews=$preview_count prepared=$prepared_count accepted=$accepted_count" >&2
+  exit 1
+fi
+first_bundle_count=0
+main_only_count=0
+while IFS= read -r preview; do
+  kinds=$(jq -r '[.requests[].kind] | join(",")' "$preview")
+  case "$kinds" in
+    quota,title,main) first_bundle_count=$((first_bundle_count + 1)) ;;
+    main) main_only_count=$((main_only_count + 1)) ;;
+    *)
+      echo "unexpected upstream approval bundle: $kinds ($preview)" >&2
+      exit 1
+      ;;
+  esac
+done < <(find "$output_dir/upstream-previews" -type f -name '*.preview.json' -print)
+if [[ $first_bundle_count != 1 || $main_only_count != 29 ]]; then
+  echo "approval bundle counts differ: first=$first_bundle_count main_only=$main_only_count" >&2
   exit 1
 fi
 if [[ $manifest_rows != 31 || $state_user_turns != 30 ]]; then
@@ -59,6 +83,7 @@ fi
 if ! jq -e '
   .parallel_sessions == 0
   and .confirmation_required == 1
+  and .confirmation_scope == "final_upstream_stage"
   and .confirmation_timeout_seconds == 0
   and .planned_sessions == 1
   and .planned_requests == 30

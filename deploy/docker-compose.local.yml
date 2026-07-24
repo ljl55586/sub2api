@@ -53,6 +53,8 @@ services:
       - SERVER_MODE=${SERVER_MODE:-release}
       - ENABLE_SERVER_TIMING=${ENABLE_SERVER_TIMING:-false}
       - RUN_MODE=${RUN_MODE:-standard}
+      - SUB2API_UPSTREAM_APPROVAL_DIR=${SUB2API_UPSTREAM_APPROVAL_DIR:-}
+      - SUB2API_UPSTREAM_APPROVAL_TOKEN=${SUB2API_UPSTREAM_APPROVAL_TOKEN:-}
 
       # =======================================================================
       # Database Configuration (PostgreSQL)

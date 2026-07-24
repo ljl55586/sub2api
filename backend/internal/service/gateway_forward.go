@@ -173,6 +173,22 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 	}
 	isClaudeCode := IsClaudeCodeClient(ctx) || isClaudeCodeClient(clientUserAgent, parsed.MetadataUserID)
 	shouldMimicClaudeCode := account.IsOAuth() && !isClaudeCode
+	upstreamApprovalSession, approvalErr := s.beginClaudeUpstreamApproval(
+		c,
+		shouldMimicClaudeCode && reqStream,
+	)
+	if approvalErr != nil {
+		if c != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"type": "error",
+				"error": gin.H{
+					"type":    "invalid_upstream_approval",
+					"message": approvalErr.Error(),
+				},
+			})
+		}
+		return nil, approvalErr
+	}
 	var oauthMimicMetadataUserID string
 	var oauthRuntimeTurn *claudeOAuthRuntimeTurn
 	oauthRuntimeTurnFinished := false
@@ -423,6 +439,7 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 	companionsDispatched := false
 	retryStart := time.Now()
 	for attempt := 1; attempt <= maxRetryAttempts; attempt++ {
+		approvalStage := upstreamApprovalSession.NewStage()
 		// 构建上游请求（每次重试需要重新构建，因为请求体需要重新读取）
 		upstreamCtx, releaseUpstreamCtx := detachStreamUpstreamContext(ctx, reqStream)
 		upstreamReq, wireBody, err := s.buildUpstreamRequest(upstreamCtx, c, account, body, token, tokenType, reqModel, reqStream, shouldMimicClaudeCode)
@@ -442,7 +459,7 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 			if oauthRuntimeTurn != nil {
 				runtimeKey = oauthRuntimeTurn.RuntimeKey
 			}
-			s.dispatchClaudeOAuthSessionCompanions(ctx, claudeOAuthCompanionDispatchInput{
+			companionCount := s.dispatchClaudeOAuthSessionCompanions(ctx, claudeOAuthCompanionDispatchInput{
 				c:                          c,
 				account:                    account,
 				modelID:                    reqModel,
@@ -457,8 +474,33 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 				proxyURL:                   proxyURL,
 				tlsProfile:                 tlsProfile,
 				startDelay:                 claudeOAuthCompanionStartDelay(c),
+				approvalStage:              approvalStage,
 			})
+			if approvalStage != nil {
+				if err := approvalStage.SetExpected(1 + companionCount); err != nil {
+					approvalStage.finish("error", err)
+				}
+			}
 			companionsDispatched = true
+		} else if approvalStage != nil {
+			if err := approvalStage.SetExpected(1); err != nil {
+				approvalStage.finish("error", err)
+			}
+		}
+
+		if approvalStage != nil {
+			if approvalErr := approvalStage.Await("main", upstreamReq); approvalErr != nil {
+				if c != nil {
+					c.JSON(http.StatusConflict, gin.H{
+						"type": "error",
+						"error": gin.H{
+							"type":    "upstream_approval_rejected",
+							"message": approvalErr.Error(),
+						},
+					})
+				}
+				return nil, approvalErr
+			}
 		}
 
 		// 发送请求

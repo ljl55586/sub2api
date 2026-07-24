@@ -76,6 +76,8 @@ export SOAK_MODEL='claude-opus-4-8'
 export SOAK_SESSION_IDENTITIES_FILE="$identity_file"
 export SOAK_PARALLEL_SESSIONS=0
 export SOAK_SKIP_WAITS=1
+unset SOAK_UPSTREAM_APPROVAL_REQUIRED SOAK_UPSTREAM_APPROVAL_DIR SOAK_UPSTREAM_APPROVAL_TOKEN
+unset FAKE_CURL_UPSTREAM_APPROVAL_DIR FAKE_CURL_EXPECT_APPROVAL_TOKEN
 
 latest_request_file() {
   find "$1/requests" -type f -name '*.json' -print | sort | tail -n 1
@@ -244,6 +246,72 @@ if [[ ! -f $confirmation_accept_called || ! -f "$confirmation_accept_output/stat
 fi
 if ! cmp -s "$confirmation_request" "$confirmation_capture"; then
   echo "the confirmed request differed from the prepared request file" >&2
+  exit 1
+fi
+
+upstream_approval_dir="$test_dir/upstream-approval"
+upstream_approval_output="$test_dir/upstream-approval-accept"
+mkdir -p "$upstream_approval_dir"
+printf '%s\n' 'SEND REQUEST' | \
+  SOAK_OUTPUT_DIR="$upstream_approval_output" \
+  SOAK_STREAM=true \
+  SOAK_CONFIRM_BEFORE_SEND=0 \
+  SOAK_UPSTREAM_APPROVAL_REQUIRED=1 \
+  SOAK_UPSTREAM_APPROVAL_DIR="$upstream_approval_dir" \
+  SOAK_UPSTREAM_APPROVAL_TOKEN='approval-secret' \
+  SOAK_UPSTREAM_PREVIEW_PAGER=0 \
+  FAKE_CURL_UPSTREAM_APPROVAL_DIR="$upstream_approval_dir" \
+  FAKE_CURL_EXPECT_APPROVAL_TOKEN='approval-secret' \
+  FAKE_CURL_RESPONSE_FILE="$valid_response" \
+  "$script_dir/send_turn.sh" session-a "$prompt_file" cold \
+  >"$test_dir/upstream-approval-accept.log" 2>&1
+
+upstream_preview=$(find "$upstream_approval_output/upstream-previews" -type f -name '*.preview.json' -print -quit)
+if [[ -z $upstream_preview ]]; then
+  echo "accepted upstream approval did not retain its audit preview" >&2
+  exit 1
+fi
+jq -e '
+  .network_sent == false
+  and [.requests[].kind] == ["quota", "title", "main"]
+  and all(.requests[]; .url == "https://api.anthropic.com/v1/messages?beta=true")
+' "$upstream_preview" >/dev/null
+if ! grep -F 'FINAL UPSTREAM REQUEST(S): NOT SENT' "$test_dir/upstream-approval-accept.log" >/dev/null ||
+  grep -F 'PREPARED REQUEST: NOT SENT' "$test_dir/upstream-approval-accept.log" >/dev/null; then
+  echo "upstream approval displayed the wrong request layer" >&2
+  exit 1
+fi
+if [[ $(find "$upstream_approval_dir" -type f -name '*.approve' | wc -l | tr -d ' ') != 1 ]]; then
+  echo "accepted upstream approval did not release exactly one stage" >&2
+  exit 1
+fi
+
+upstream_reject_dir="$test_dir/upstream-reject"
+upstream_reject_output="$test_dir/upstream-approval-reject"
+mkdir -p "$upstream_reject_dir"
+set +e
+printf '%s\n' 'DO NOT SEND' | \
+  SOAK_OUTPUT_DIR="$upstream_reject_output" \
+  SOAK_STREAM=true \
+  SOAK_CONFIRM_BEFORE_SEND=0 \
+  SOAK_UPSTREAM_APPROVAL_REQUIRED=1 \
+  SOAK_UPSTREAM_APPROVAL_DIR="$upstream_reject_dir" \
+  SOAK_UPSTREAM_APPROVAL_TOKEN='approval-secret' \
+  SOAK_UPSTREAM_PREVIEW_PAGER=0 \
+  FAKE_CURL_UPSTREAM_APPROVAL_DIR="$upstream_reject_dir" \
+  FAKE_CURL_EXPECT_APPROVAL_TOKEN='approval-secret' \
+  FAKE_CURL_RESPONSE_FILE="$valid_response" \
+  "$script_dir/send_turn.sh" session-a "$prompt_file" cold \
+  >"$test_dir/upstream-approval-reject.log" 2>&1
+upstream_reject_rc=$?
+set -e
+if (( upstream_reject_rc != 75 )); then
+  echo "upstream approval rejection returned $upstream_reject_rc instead of 75" >&2
+  exit 1
+fi
+if [[ $(find "$upstream_reject_dir" -type f -name '*.reject' | wc -l | tr -d ' ') != 1 ||
+  -e "$upstream_reject_output/state/session-a.messages.json" ]]; then
+  echo "rejected upstream approval did not remain blocked before state advancement" >&2
   exit 1
 fi
 
