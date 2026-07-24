@@ -27,9 +27,10 @@ const (
 
 	// The soak client uses this private, non-forwarded header to model the human
 	// pause between launching Claude Code (quota probe) and submitting the first
-	// prompt. Ordinary clients omit it and therefore incur no artificial delay.
+	// prompt. It is honored only for an authenticated upstream-approval bundle;
+	// ordinary clients cannot use it to delay their main request.
 	claudeOAuthCompanionDelayHeader     = "X-Sub2API-Claude-Companion-Delay-Seconds"
-	claudeOAuthCompanionMaxDelaySeconds = 59
+	claudeOAuthCompanionMaxDelaySeconds = 120
 
 	claudeOAuthSessionActionQuota = "quota"
 	claudeOAuthSessionActionTitle = "title"
@@ -196,6 +197,16 @@ type claudeOAuthCompanionPendingRequest struct {
 	claimID string
 }
 
+// claudeOAuthCompanionDispatchResult coordinates the authenticated first-turn
+// approval bundle. mainReady is closed only after the quota attempt has reached
+// a response/error boundary, the configured pause has elapsed, and the title
+// attempt has reached the same boundary. A nil channel preserves the ordinary
+// asynchronous companion behavior outside the approval soak path.
+type claudeOAuthCompanionDispatchResult struct {
+	count     int
+	mainReady <-chan struct{}
+}
+
 func claudeOAuthCompanionStartDelay(c *gin.Context) time.Duration {
 	if c == nil {
 		return 0
@@ -214,15 +225,15 @@ func claudeOAuthCompanionStartDelay(c *gin.Context) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
-func (s *GatewayService) dispatchClaudeOAuthSessionCompanions(ctx context.Context, in claudeOAuthCompanionDispatchInput) int {
+func (s *GatewayService) dispatchClaudeOAuthSessionCompanions(ctx context.Context, in claudeOAuthCompanionDispatchInput) claudeOAuthCompanionDispatchResult {
 	if s == nil || in.account == nil || !in.mimicClaudeCode || in.tokenType != "oauth" ||
 		claude.NormalizeModelID(in.modelID) != "claude-opus-4-8" || !in.reqStream ||
 		in.metadataPassthroughEnabled || s.httpUpstream == nil {
-		return 0
+		return claudeOAuthCompanionDispatchResult{}
 	}
 	metadata := ParseMetadataUserID(in.metadataUserID)
 	if metadata == nil || strings.TrimSpace(metadata.SessionID) == "" {
-		return 0
+		return claudeOAuthCompanionDispatchResult{}
 	}
 	sessionID := strings.TrimSpace(metadata.SessionID)
 	titleEligible := claudeOAuthTitleCandidateEligible(in.titleCandidateText)
@@ -298,14 +309,14 @@ func (s *GatewayService) dispatchClaudeOAuthSessionCompanions(ctx context.Contex
 	}
 
 	if len(pending) == 0 {
-		return 0
+		return claudeOAuthCompanionDispatchResult{}
 	}
 
 	// Build all bodies and requests before any network side effect: gin.Context
 	// is request-scoped and must not be accessed after the main handler returns.
-	// Both companions then run independently. Forward returns from this function
-	// as soon as their goroutines have started; main never waits for a companion
-	// request write or response.
+	// Ordinary requests keep the asynchronous behavior. An authenticated approval
+	// bundle additionally receives ordering channels below, so Forward can hold
+	// title behind quota and main behind title without rebuilding any request.
 	httpUpstream := s.httpUpstream
 	accountID := in.account.ID
 	accountConcurrency := in.account.Concurrency
@@ -323,8 +334,31 @@ func (s *GatewayService) dispatchClaudeOAuthSessionCompanions(ctx context.Contex
 		}
 	}
 
+	result := claudeOAuthCompanionDispatchResult{count: len(pending)}
+	strictApprovalOrder := in.approvalStage != nil
+	var quotaReachedUpstream chan struct{}
+	var titleReachedUpstream chan struct{}
+	if strictApprovalOrder {
+		if quotaRequest != nil {
+			quotaReachedUpstream = make(chan struct{})
+			result.mainReady = quotaReachedUpstream
+		}
+		if titleRequest != nil {
+			titleReachedUpstream = make(chan struct{})
+			result.mainReady = titleReachedUpstream
+		}
+	}
+
 	if quotaRequest != nil {
 		go func(pending claudeOAuthCompanionPendingRequest) {
+			signaled := false
+			signalReachedUpstream := func() {
+				if quotaReachedUpstream != nil && !signaled {
+					close(quotaReachedUpstream)
+					signaled = true
+				}
+			}
+			defer signalReachedUpstream()
 			if in.approvalStage != nil {
 				if approvalErr := in.approvalStage.Await("quota", pending.req); approvalErr != nil {
 					s.completeClaudeOAuthCompanionAction(
@@ -348,6 +382,9 @@ func (s *GatewayService) dispatchClaudeOAuthSessionCompanions(ctx context.Contex
 			req := pending.req.WithContext(requestCtx)
 			logger.LegacyPrintf("service.gateway", "Claude OAuth quota companion send start: account_id=%d session_id=%s", accountID, sessionID)
 			resp, transportErr := httpUpstream.DoWithTLS(req, proxyURL, accountID, accountConcurrency, tlsProfile)
+			// DoWithTLS returns after response headers arrive, or with a
+			// transport error. Either result is the ordering boundary for title.
+			signalReachedUpstream()
 			statusCode := 0
 			headers := map[string]string(nil)
 			if resp != nil {
@@ -381,6 +418,14 @@ func (s *GatewayService) dispatchClaudeOAuthSessionCompanions(ctx context.Contex
 	if titleRequest != nil {
 		titleStarted := make(chan struct{})
 		go func(pending claudeOAuthCompanionPendingRequest) {
+			signaled := false
+			signalReachedUpstream := func() {
+				if titleReachedUpstream != nil && !signaled {
+					close(titleReachedUpstream)
+					signaled = true
+				}
+			}
+			defer signalReachedUpstream()
 			if in.approvalStage != nil {
 				// Let dispatch return so main can register the final bundle member.
 				// The network call still remains blocked in Await.
@@ -402,10 +447,22 @@ func (s *GatewayService) dispatchClaudeOAuthSessionCompanions(ctx context.Contex
 					return
 				}
 			}
-			if in.startDelay > 0 {
-				logger.LegacyPrintf("service.gateway", "Claude OAuth title companion delayed after runtime startup: account_id=%d session_id=%s delay=%s", accountID, sessionID, in.startDelay)
+			if quotaReachedUpstream != nil {
+				select {
+				case <-quotaReachedUpstream:
+				case <-ctx.Done():
+					return
+				}
+			}
+			if strictApprovalOrder && quotaReachedUpstream != nil && in.startDelay > 0 {
+				logger.LegacyPrintf("service.gateway", "Claude OAuth title companion delayed after quota: account_id=%d session_id=%s delay=%s", accountID, sessionID, in.startDelay)
 				timer := time.NewTimer(in.startDelay)
-				<-timer.C
+				defer timer.Stop()
+				select {
+				case <-timer.C:
+				case <-ctx.Done():
+					return
+				}
 			}
 			if in.approvalStage == nil {
 				close(titleStarted)
@@ -415,6 +472,10 @@ func (s *GatewayService) dispatchClaudeOAuthSessionCompanions(ctx context.Contex
 			req := pending.req.WithContext(requestCtx)
 			logger.LegacyPrintf("service.gateway", "Claude OAuth title companion send start: account_id=%d session_id=%s", accountID, sessionID)
 			resp, transportErr := httpUpstream.DoWithTLS(req, proxyURL, accountID, accountConcurrency, tlsProfile)
+			// Main may proceed once Anthropic has returned title response
+			// headers (or the title transport has definitively failed). Title
+			// body parsing remains best-effort and must not extend main latency.
+			signalReachedUpstream()
 			title, titleGenerated := "", false
 			statusCode := 0
 			if resp != nil {
@@ -450,7 +511,7 @@ func (s *GatewayService) dispatchClaudeOAuthSessionCompanions(ctx context.Contex
 			<-titleStarted
 		}
 	}
-	return len(pending)
+	return result
 }
 
 func claudeOAuthTitleCandidateEligible(text string) bool {

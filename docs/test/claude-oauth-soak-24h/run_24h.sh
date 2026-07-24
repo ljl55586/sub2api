@@ -11,6 +11,8 @@ export SOAK_PARALLEL_SESSIONS=0
 export SOAK_CONFIRM_BEFORE_SEND=0
 export SOAK_UPSTREAM_APPROVAL_REQUIRED=1
 export SOAK_CONFIRM_TIMEOUT_SECONDS=${SOAK_CONFIRM_TIMEOUT_SECONDS:-0}
+export SOAK_COMPANION_DELAY_MIN_SECONDS=${SOAK_COMPANION_DELAY_MIN_SECONDS:-45}
+export SOAK_COMPANION_DELAY_MAX_SECONDS=${SOAK_COMPANION_DELAY_MAX_SECONDS:-90}
 
 planned_session_count=1
 planned_turns_per_session=30
@@ -34,9 +36,10 @@ export SOAK_SUCCESS_TIMES_FILE="$SOAK_OUTPUT_DIR/successful-request-times.txt"
 export SOAK_RESERVATIONS_FILE="$SOAK_OUTPUT_DIR/inflight-request-reservations.tsv"
 export SOAK_RUN_LOG="$SOAK_OUTPUT_DIR/run.log"
 export SOAK_USAGE_SAMPLES_FILE="$SOAK_OUTPUT_DIR/usage-samples.tsv"
-printf 'start_epoch=%s\ndeadline_epoch=%s\nparallel_sessions=%s\nconfirmation_required=1\nconfirmation_scope=final_upstream_stage\nconfirmation_timeout_seconds=%s\nscheduling_mode=single_session_confirmed_waves\n' \
+printf 'start_epoch=%s\ndeadline_epoch=%s\nparallel_sessions=%s\nconfirmation_required=1\nconfirmation_scope=final_upstream_stage\nconfirmation_timeout_seconds=%s\ncompanion_delay_min_seconds=%s\ncompanion_delay_max_seconds=%s\nscheduling_mode=single_session_confirmed_waves\n' \
   "$start_epoch" "$SOAK_DEADLINE_EPOCH" "$SOAK_PARALLEL_SESSIONS" \
-  "$SOAK_CONFIRM_TIMEOUT_SECONDS" >"$SOAK_OUTPUT_DIR/run.meta"
+  "$SOAK_CONFIRM_TIMEOUT_SECONDS" "$SOAK_COMPANION_DELAY_MIN_SECONDS" \
+  "$SOAK_COMPANION_DELAY_MAX_SECONDS" >"$SOAK_OUTPUT_DIR/run.meta"
 : >"$SOAK_SUCCESS_TIMES_FILE"
 : >"$SOAK_RESERVATIONS_FILE"
 

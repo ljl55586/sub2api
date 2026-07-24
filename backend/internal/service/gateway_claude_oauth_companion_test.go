@@ -222,7 +222,7 @@ func TestClaudeOAuthCompanionStartDelay(t *testing.T) {
 		{name: "negative", header: "-1", expected: 0},
 		{name: "zero", header: "0", expected: 0},
 		{name: "valid", header: "37", expected: 37 * time.Second},
-		{name: "capped", header: "600", expected: 59 * time.Second},
+		{name: "capped", header: "600", expected: 120 * time.Second},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

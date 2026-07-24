@@ -176,6 +176,5 @@ func (s *GatewayService) dispatchClaudeOAuthCompatCompanions(
 		metadataPassthroughEnabled: state.metadataPassthroughEnabled,
 		proxyURL:                   proxyURL,
 		tlsProfile:                 tlsProfile,
-		startDelay:                 claudeOAuthCompanionStartDelay(c),
 	})
 }

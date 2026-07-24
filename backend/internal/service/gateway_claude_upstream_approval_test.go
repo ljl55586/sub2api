@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -193,6 +194,11 @@ func TestGatewayServiceForward_UpstreamApprovalFirstBundleThenMainOnly(t *testin
 	require.NoError(t, firstOutcome.err)
 	require.NotNil(t, firstOutcome.result)
 	require.Eventually(t, func() bool { return upstream.Count() == 3 }, time.Second, 5*time.Millisecond)
+	require.Equal(t, []string{"quota", "title", "main"}, []string{
+		upstream.Snapshot()[0].kind,
+		upstream.Snapshot()[1].kind,
+		upstream.Snapshot()[2].kind,
+	})
 	require.Eventually(t, func() bool {
 		store := svc.cache.(*companionClaimStoreForTest)
 		store.mu.Lock()
@@ -233,6 +239,171 @@ func TestGatewayServiceForward_UpstreamApprovalFirstBundleThenMainOnly(t *testin
 	require.NoError(t, secondOutcome.err)
 	require.NotNil(t, secondOutcome.result)
 	require.Eventually(t, func() bool { return upstream.Count() == 4 }, time.Second, 5*time.Millisecond)
+}
+
+func TestGatewayServiceForward_UpstreamApprovalStrictlyOrdersFirstBundle(t *testing.T) {
+	svc, c, account, parsed, upstream := newClaudeOAuthCompanionForwardHarness(t)
+	approvalDir := t.TempDir()
+	svc.claudeUpstreamApproval = &claudeUpstreamApprovalGate{
+		dir:          approvalDir,
+		token:        "approval-secret",
+		pollInterval: 5 * time.Millisecond,
+	}
+	c.Request.Header.Set("conversation_id", "strict-order-conversation")
+	c.Request.Header.Set(claudeUpstreamApprovalTokenHeader, "approval-secret")
+	c.Request.Header.Set(claudeUpstreamApprovalIDHeader, "strict-order-turn")
+	c.Request.Header.Set(claudeOAuthCompanionDelayHeader, "0")
+
+	quotaRelease := make(chan struct{})
+	titleRelease := make(chan struct{})
+	upstream.quotaStarted = make(chan struct{})
+	upstream.quotaRelease = quotaRelease
+	upstream.titleRelease = titleRelease
+
+	var releaseQuotaOnce sync.Once
+	var releaseTitleOnce sync.Once
+	releaseQuota := func() {
+		releaseQuotaOnce.Do(func() { close(quotaRelease) })
+	}
+	releaseTitle := func() {
+		releaseTitleOnce.Do(func() { close(titleRelease) })
+	}
+	t.Cleanup(func() {
+		releaseQuota()
+		releaseTitle()
+	})
+
+	type forwardOutcome struct {
+		result *ForwardResult
+		err    error
+	}
+	forwardDone := make(chan forwardOutcome, 1)
+	go func() {
+		result, err := svc.Forward(context.Background(), c, account, parsed)
+		forwardDone <- forwardOutcome{result: result, err: err}
+	}()
+
+	waitForClaudeUpstreamApprovalPreview(
+		t,
+		filepath.Join(approvalDir, "strict-order-turn-s01.preview.json"),
+	)
+	require.Equal(t, 0, upstream.Count(), "approval must precede every network attempt")
+	writeClaudeUpstreamApprovalMarker(
+		t,
+		filepath.Join(approvalDir, "strict-order-turn-s01.approve"),
+	)
+
+	select {
+	case <-upstream.quotaStarted:
+	case <-time.After(time.Second):
+		t.Fatal("quota did not start after approval")
+	}
+	require.Equal(t, []string{"quota"}, []string{upstream.Snapshot()[0].kind})
+	select {
+	case <-upstream.titleStarted:
+		t.Fatal("title started before quota reached its response/error boundary")
+	default:
+	}
+	select {
+	case outcome := <-forwardDone:
+		t.Fatalf("main completed while quota was blocked: result=%v err=%v", outcome.result, outcome.err)
+	default:
+	}
+
+	releaseQuota()
+	select {
+	case <-upstream.titleStarted:
+	case <-time.After(time.Second):
+		t.Fatal("title did not start after quota completed")
+	}
+	require.Equal(t, []string{"quota", "title"}, []string{
+		upstream.Snapshot()[0].kind,
+		upstream.Snapshot()[1].kind,
+	})
+	select {
+	case outcome := <-forwardDone:
+		t.Fatalf("main completed while title was blocked: result=%v err=%v", outcome.result, outcome.err)
+	default:
+	}
+
+	releaseTitle()
+	outcome := <-forwardDone
+	require.NoError(t, outcome.err)
+	require.NotNil(t, outcome.result)
+	require.Equal(t, []string{"quota", "title", "main"}, []string{
+		upstream.Snapshot()[0].kind,
+		upstream.Snapshot()[1].kind,
+		upstream.Snapshot()[2].kind,
+	})
+}
+
+func TestGatewayServiceForward_UpstreamApprovalHonorsDelayAndCompanionFailuresFailOpen(t *testing.T) {
+	svc, c, account, parsed, upstream := newClaudeOAuthCompanionForwardHarness(t)
+	approvalDir := t.TempDir()
+	svc.claudeUpstreamApproval = &claudeUpstreamApprovalGate{
+		dir:          approvalDir,
+		token:        "approval-secret",
+		pollInterval: 5 * time.Millisecond,
+	}
+	c.Request.Header.Set("conversation_id", "delayed-order-conversation")
+	c.Request.Header.Set(claudeUpstreamApprovalTokenHeader, "approval-secret")
+	c.Request.Header.Set(claudeUpstreamApprovalIDHeader, "delayed-order-turn")
+	c.Request.Header.Set(claudeOAuthCompanionDelayHeader, "1")
+	upstream.quotaStatus = http.StatusTooManyRequests
+	upstream.titleErr = errors.New("synthetic title transport error")
+	upstream.quotaStarted = make(chan struct{})
+	upstream.titleStarted = make(chan struct{})
+
+	type forwardOutcome struct {
+		result *ForwardResult
+		err    error
+	}
+	forwardDone := make(chan forwardOutcome, 1)
+	go func() {
+		result, err := svc.Forward(context.Background(), c, account, parsed)
+		forwardDone <- forwardOutcome{result: result, err: err}
+	}()
+
+	waitForClaudeUpstreamApprovalPreview(
+		t,
+		filepath.Join(approvalDir, "delayed-order-turn-s01.preview.json"),
+	)
+	approvedAt := time.Now()
+	writeClaudeUpstreamApprovalMarker(
+		t,
+		filepath.Join(approvalDir, "delayed-order-turn-s01.approve"),
+	)
+
+	select {
+	case <-upstream.quotaStarted:
+	case <-time.After(time.Second):
+		t.Fatal("quota did not start after approval")
+	}
+	select {
+	case <-upstream.titleStarted:
+		t.Fatal("title ignored the configured quota-to-title delay")
+	case <-time.After(300 * time.Millisecond):
+	}
+	select {
+	case <-upstream.titleStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("title did not start after the configured delay")
+	}
+	require.GreaterOrEqual(t, time.Since(approvedAt), 900*time.Millisecond)
+
+	var outcome forwardOutcome
+	select {
+	case outcome = <-forwardDone:
+	case <-time.After(time.Second):
+		t.Fatal("main remained blocked after companion failures")
+	}
+	require.NoError(t, outcome.err)
+	require.NotNil(t, outcome.result)
+	require.Equal(t, []string{"quota", "title", "main"}, []string{
+		upstream.Snapshot()[0].kind,
+		upstream.Snapshot()[1].kind,
+		upstream.Snapshot()[2].kind,
+	})
 }
 
 func TestGatewayServiceForward_UpstreamApprovalWithoutCompanionsIsMainOnly(t *testing.T) {

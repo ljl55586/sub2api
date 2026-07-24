@@ -440,6 +440,7 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 	retryStart := time.Now()
 	for attempt := 1; attempt <= maxRetryAttempts; attempt++ {
 		approvalStage := upstreamApprovalSession.NewStage()
+		var startupMainReady <-chan struct{}
 		// 构建上游请求（每次重试需要重新构建，因为请求体需要重新读取）
 		upstreamCtx, releaseUpstreamCtx := detachStreamUpstreamContext(ctx, reqStream)
 		upstreamReq, wireBody, err := s.buildUpstreamRequest(upstreamCtx, c, account, body, token, tokenType, reqModel, reqStream, shouldMimicClaudeCode)
@@ -459,7 +460,14 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 			if oauthRuntimeTurn != nil {
 				runtimeKey = oauthRuntimeTurn.RuntimeKey
 			}
-			companionCount := s.dispatchClaudeOAuthSessionCompanions(ctx, claudeOAuthCompanionDispatchInput{
+			companionStartDelay := time.Duration(0)
+			if upstreamApprovalSession != nil {
+				// Only a token-authenticated approval run may delay main. The
+				// private soak header must not become a public request-stalling
+				// primitive for ordinary API clients.
+				companionStartDelay = claudeOAuthCompanionStartDelay(c)
+			}
+			companionDispatch := s.dispatchClaudeOAuthSessionCompanions(ctx, claudeOAuthCompanionDispatchInput{
 				c:                          c,
 				account:                    account,
 				modelID:                    reqModel,
@@ -473,11 +481,12 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 				metadataPassthroughEnabled: metadataPassthroughEnabled,
 				proxyURL:                   proxyURL,
 				tlsProfile:                 tlsProfile,
-				startDelay:                 claudeOAuthCompanionStartDelay(c),
+				startDelay:                 companionStartDelay,
 				approvalStage:              approvalStage,
 			})
+			startupMainReady = companionDispatch.mainReady
 			if approvalStage != nil {
-				if err := approvalStage.SetExpected(1 + companionCount); err != nil {
+				if err := approvalStage.SetExpected(1 + companionDispatch.count); err != nil {
 					approvalStage.finish("error", err)
 				}
 			}
@@ -500,6 +509,17 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 					})
 				}
 				return nil, approvalErr
+			}
+		}
+		if startupMainReady != nil {
+			logger.LegacyPrintf("service.gateway", "Claude OAuth main waiting for ordered startup companions: account_id=%d", account.ID)
+			select {
+			case <-startupMainReady:
+			case <-upstreamApprovalSession.ctx.Done():
+				return nil, upstreamApprovalSession.ctx.Err()
+			}
+			if err := upstreamApprovalSession.ctx.Err(); err != nil {
+				return nil, err
 			}
 		}
 

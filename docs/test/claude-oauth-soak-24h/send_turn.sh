@@ -54,6 +54,9 @@ upstream_approval_required=${SOAK_UPSTREAM_APPROVAL_REQUIRED:-0}
 upstream_approval_dir=${SOAK_UPSTREAM_APPROVAL_DIR:-}
 upstream_approval_token=${SOAK_UPSTREAM_APPROVAL_TOKEN:-}
 upstream_preview_pager=${SOAK_UPSTREAM_PREVIEW_PAGER:-auto}
+companion_delay_min_seconds=${SOAK_COMPANION_DELAY_MIN_SECONDS:-45}
+companion_delay_max_seconds=${SOAK_COMPANION_DELAY_MAX_SECONDS:-90}
+claude_oauth_companion_delay_header='X-Sub2API-Claude-Companion-Delay-Seconds'
 
 if [[ -n $max_tokens && ! $max_tokens =~ ^[1-9][0-9]*$ ]]; then
   echo "SOAK_MAX_TOKENS must be unset, empty, or a positive integer" >&2
@@ -93,6 +96,13 @@ if [[ ! $confirm_timeout_seconds =~ ^[0-9]+$ ]]; then
 fi
 if [[ ! $cache_ttl_seconds =~ ^[1-9][0-9]*$ ]]; then
   echo "SOAK_CACHE_TTL_SECONDS must be a positive integer" >&2
+  exit 64
+fi
+if [[ ! $companion_delay_min_seconds =~ ^[0-9]+$ ||
+  ! $companion_delay_max_seconds =~ ^[0-9]+$ ||
+  $companion_delay_max_seconds -lt $companion_delay_min_seconds ||
+  $companion_delay_max_seconds -gt 120 ]]; then
+  echo "SOAK_COMPANION_DELAY_MIN_SECONDS/MAX_SECONDS must satisfy 0 <= min <= max <= 120" >&2
   exit 64
 fi
 if [[ $confirm_before_send == 1 && ${SOAK_DRY_RUN:-0} == 1 ]]; then
@@ -270,8 +280,13 @@ if [[ $upstream_approval_required == 1 ]]; then
     --header "X-Sub2API-Upstream-Approval-Token: $upstream_approval_token"
   )
 fi
-if [[ $stream == true && $turn_number == 1 ]]; then
-  echo "session startup profile: session=$session_name asynchronous_companions synthetic_delay=0s"
+if [[ $upstream_approval_required == 1 && $stream == true && $turn_number == 1 ]]; then
+  companion_delay_seconds=$((companion_delay_min_seconds +
+    RANDOM % (companion_delay_max_seconds - companion_delay_min_seconds + 1)))
+  curl_headers+=(
+    --header "$claude_oauth_companion_delay_header: $companion_delay_seconds"
+  )
+  echo "session startup profile: session=$session_name strict_order=quota,title,main quota_to_title_delay=${companion_delay_seconds}s"
 fi
 
 check_confirmation_safety_guards() {
@@ -317,6 +332,9 @@ show_upstream_preview() {
   printf 'bundle: %s\n' "$kinds"
   printf 'audit copy: %s\n' "$audit_file"
   printf 'Authorization/x-api-key values are redacted; URL, other headers, and JSON body are final.\n'
+  if [[ $kinds == "quota,title,main" ]]; then
+    printf 'approved send order: quota -> wait %ss -> title -> main\n' "$companion_delay_seconds"
+  fi
 
   if [[ $upstream_preview_pager == 1 ]] ||
     [[ $upstream_preview_pager == auto && -t 0 && -t 1 && -r /dev/tty ]] &&
