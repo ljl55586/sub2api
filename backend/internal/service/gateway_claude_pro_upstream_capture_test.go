@@ -47,6 +47,7 @@ var expectedCaptureTitleBetas = claude.ClaudeCodeOAuthTitleMimicryBetas()
 var expectedCaptureMainBetas = []string{
 	"claude-code-20250219",
 	"oauth-2025-04-20",
+	"context-1m-2025-08-07",
 	"interleaved-thinking-2025-05-14",
 	"redact-thinking-2026-02-12",
 	"thinking-token-count-2026-05-13",

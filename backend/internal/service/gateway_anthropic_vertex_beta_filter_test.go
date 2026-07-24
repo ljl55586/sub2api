@@ -46,7 +46,7 @@ func newVertexServiceAccount(id int64) *Account {
 // 本用例在 Commit 1 之前 FAIL、之后 PASS。
 func TestVertexBetaFilter_StripsUnsupportedClaudeCodeTokens(t *testing.T) {
 	mainProfile := claude.ClaudeCodeOAuthMainMimicryBetas()
-	require.Len(t, mainProfile, 11)
+	require.Len(t, mainProfile, 12)
 	c := newVertexBetaTestContext(t, strings.Join(mainProfile, ","))
 
 	body := []byte(`{"model":"claude-opus-4-7","max_tokens":32,"messages":[{"role":"user","content":"hi"}]}`)
@@ -77,6 +77,7 @@ func TestVertexBetaFilter_StripsUnsupportedClaudeCodeTokens(t *testing.T) {
 
 	// 白名单内的 token 必须保留。
 	for _, keep := range []string{
+		"context-1m-2025-08-07",
 		"interleaved-thinking-2025-05-14",
 		"context-management-2025-06-27",
 	} {

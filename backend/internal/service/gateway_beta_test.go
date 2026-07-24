@@ -128,6 +128,7 @@ func TestClaudeCodeOAuthMainMimicryBetas_Exact21161Order(t *testing.T) {
 	require.Equal(t, []string{
 		"claude-code-20250219",
 		"oauth-2025-04-20",
+		"context-1m-2025-08-07",
 		"interleaved-thinking-2025-05-14",
 		"redact-thinking-2026-02-12",
 		"thinking-token-count-2026-05-13",
@@ -252,10 +253,11 @@ func TestIsCountTokensUnsupported404(t *testing.T) {
 	}
 }
 
-// TestDefaultBetaPolicy_Context1M_Sonnet5Whitelist 验证默认策略下 context-1m-2025-08-07 的分模型行为：
+// TestDefaultBetaPolicy_Context1M_SupportedModelsWhitelist 验证默认策略下 context-1m-2025-08-07 的分模型行为：
 //   - claude-sonnet-5 及后续版本：pass（放行），保留 1M 上下文能力
-//   - 其他 sonnet 版本（4.x 及以下）、opus、haiku：filter（过滤），因为上游不支持
-func TestDefaultBetaPolicy_Context1M_Sonnet5Whitelist(t *testing.T) {
+//   - claude-opus-4-8：pass（放行），对齐 Claude Code 2.1.161 的真实 OAuth 流量
+//   - 其他 sonnet 版本（4.x 及以下）、opus、haiku：filter（过滤）
+func TestDefaultBetaPolicy_Context1M_SupportedModelsWhitelist(t *testing.T) {
 	settings := DefaultBetaPolicySettings()
 
 	// 找到 context-1m-2025-08-07 规则
@@ -269,7 +271,7 @@ func TestDefaultBetaPolicy_Context1M_Sonnet5Whitelist(t *testing.T) {
 	require.NotNil(t, rule, "default policy must include context-1m-2025-08-07 rule")
 	require.Equal(t, BetaPolicyActionPass, rule.Action, "primary action for whitelisted models is pass")
 	require.Equal(t, BetaPolicyActionFilter, rule.FallbackAction, "non-whitelisted models must be filtered")
-	require.NotEmpty(t, rule.ModelWhitelist, "context-1m must be scoped to sonnet-5+ via whitelist")
+	require.NotEmpty(t, rule.ModelWhitelist, "context-1m must be scoped to supported models via whitelist")
 
 	// 表驱动：模型 → 期望 action
 	// 覆盖每种上游路径下的模型 ID 变形：直连 Anthropic API、Vertex AI（"@YYYYMMDD" 后缀）、
@@ -294,6 +296,8 @@ func TestDefaultBetaPolicy_Context1M_Sonnet5Whitelist(t *testing.T) {
 		{"us-gov.anthropic.claude-sonnet-5-v1", BetaPolicyActionPass, "bedrock us-gov. sonnet-5"},
 		{"global.anthropic.claude-sonnet-5-v1", BetaPolicyActionPass, "bedrock global. sonnet-5"},
 		{"anthropic.claude-sonnet-5-v1", BetaPolicyActionPass, "bedrock no-region sonnet-5"},
+		// —— Claude Code 2.1.161 直连 OAuth 的 Opus 4.8 应放行 ——
+		{"claude-opus-4-8", BetaPolicyActionPass, "official Claude Code OAuth trace carries context-1m for opus 4.8"},
 
 		// —— sonnet-4.x 及以下必须过滤 ——
 		{"claude-sonnet-4-6", BetaPolicyActionFilter, "sonnet-4.6 must be filtered"},
@@ -302,10 +306,9 @@ func TestDefaultBetaPolicy_Context1M_Sonnet5Whitelist(t *testing.T) {
 		{"claude-sonnet-4-5@20250929", BetaPolicyActionFilter, "sonnet-4.5 Vertex format must be filtered"},
 		{"us.anthropic.claude-sonnet-4-6", BetaPolicyActionFilter, "bedrock us. sonnet-4.6 must be filtered"},
 		{"us.anthropic.claude-sonnet-4-5-20250929-v1:0", BetaPolicyActionFilter, "bedrock us. sonnet-4.5 must be filtered"},
-		// —— Opus / Haiku 必须过滤（无 1M） ——
-		{"claude-opus-4-8", BetaPolicyActionFilter, "opus must be filtered"},
+		// —— 其他 Opus / Haiku 必须过滤 ——
 		{"claude-opus-4-7", BetaPolicyActionFilter, "opus 4.7 must be filtered"},
-		{"us.anthropic.claude-opus-4-8-v1", BetaPolicyActionFilter, "bedrock opus 4.8 must be filtered"},
+		{"us.anthropic.claude-opus-4-8-v1", BetaPolicyActionFilter, "bedrock opus 4.8 is not covered by the direct OAuth trace"},
 		{"claude-haiku-4-5", BetaPolicyActionFilter, "haiku must be filtered"},
 		{"us.anthropic.claude-haiku-4-5-20251001-v1:0", BetaPolicyActionFilter, "bedrock haiku must be filtered"},
 		{"claude-3-5-sonnet-20241022", BetaPolicyActionFilter, "legacy sonnet 3.5 must be filtered"},

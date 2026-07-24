@@ -1237,7 +1237,6 @@ func assertClaudeOAuthQuotaWireShape(t *testing.T, req claudeOAuthCompanionRecor
 		claude.BetaThinkingTokenCount,
 		claude.BetaContextManagement,
 		claude.BetaPromptCachingScope,
-		claude.BetaMidConversationSystem,
 	}, ","))
 	assertClaudeOAuthCompanionTopLevelKeys(t, req.body, "max_tokens", "messages", "metadata", "model")
 	require.Equal(t, "claude-opus-4-8", gjson.GetBytes(req.body, "model").String())
@@ -1251,6 +1250,7 @@ func assertClaudeOAuthTitleWireShape(t *testing.T, req claudeOAuthCompanionRecor
 	assertClaudeOAuthCompanionCommonWireShape(t, req, strings.Join([]string{
 		claude.BetaClaudeCode,
 		claude.BetaOAuth,
+		claude.BetaContext1M,
 		claude.BetaInterleavedThinking,
 		claude.BetaRedactThinking,
 		claude.BetaThinkingTokenCount,

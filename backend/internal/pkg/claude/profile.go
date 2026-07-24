@@ -52,6 +52,7 @@ var claudeCodeProfile21161 = ClaudeCodeProfile{
 	MainBetas: []string{
 		BetaClaudeCode,
 		BetaOAuth,
+		BetaContext1M,
 		BetaInterleavedThinking,
 		BetaRedactThinking,
 		BetaThinkingTokenCount,
@@ -70,11 +71,11 @@ var claudeCodeProfile21161 = ClaudeCodeProfile{
 		BetaThinkingTokenCount,
 		BetaContextManagement,
 		BetaPromptCachingScope,
-		BetaMidConversationSystem,
 	},
 	TitleBetas: []string{
 		BetaClaudeCode,
 		BetaOAuth,
+		BetaContext1M,
 		BetaInterleavedThinking,
 		BetaRedactThinking,
 		BetaThinkingTokenCount,
