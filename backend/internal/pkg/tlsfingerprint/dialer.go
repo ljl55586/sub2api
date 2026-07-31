@@ -32,6 +32,17 @@ type Profile struct {
 	Extensions          []uint16 // Extension type IDs in order; empty uses default Node.js 24.x order
 }
 
+const ClaudeCode21208CompatibilityProfileName = "Claude Code 2.1.208 compatibility (provisional Node.js 24 ClientHello)"
+
+// ClaudeCode21208CompatibilityProfile returns the transport profile associated
+// with the HTTP-layer Claude Code 2.1.208 profile. The 2.1.208 binary's exact
+// ClientHello and HTTP/2 SETTINGS have not been independently captured, so this
+// deliberately reuses the existing verified Node.js 24 ClientHello defaults
+// under an explicitly provisional name.
+func ClaudeCode21208CompatibilityProfile() *Profile {
+	return &Profile{Name: ClaudeCode21208CompatibilityProfileName}
+}
+
 // Dialer creates TLS connections with custom fingerprints.
 type Dialer struct {
 	profile    *Profile

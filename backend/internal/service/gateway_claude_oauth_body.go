@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/anthropicfp"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
@@ -521,8 +522,14 @@ func (s *GatewayService) applyClaudeCodeOAuthMimicryToBodyWithMetadata(
 	}
 
 	systemPromptInjectionEnabled, systemPrompt, systemPromptBlocks := s.claudeOAuthSystemPromptInjectionSettings(ctx)
+	useClaudeCode208SimpleProfile := systemPromptInjectionEnabled &&
+		isClaudeOAuthNoToolsMainCandidate(body, model) &&
+		isClaudeCode208DirectOAuthAccount(account) &&
+		strings.TrimSpace(metadataUserID) != "" &&
+		strings.TrimSpace(systemPrompt) == "" &&
+		strings.TrimSpace(systemPromptBlocks) == ""
 	systemRewritten := false
-	if systemPromptInjectionEnabled && !strings.Contains(strings.ToLower(model), "haiku") {
+	if systemPromptInjectionEnabled && !useClaudeCode208SimpleProfile && !strings.Contains(strings.ToLower(model), "haiku") {
 		body = rewriteSystemForNonClaudeCodeWithPromptBlocks(body, normalizeSystemParam(systemRaw), systemPrompt, systemPromptBlocks)
 		systemRewritten = true
 	}
@@ -537,6 +544,24 @@ func (s *GatewayService) applyClaudeCodeOAuthMimicryToBodyWithMetadata(
 	}
 
 	body, _ = normalizeClaudeOAuthRequestBody(body, model, normalizeOpts)
+	if useClaudeCode208SimpleProfile {
+		startedAt := time.Time{}
+		if c != nil {
+			if value, ok := c.Get(claudeCode208StartedAtKey); ok {
+				if unix, ok := value.(int64); ok && unix > 0 {
+					startedAt = time.Unix(unix, 0)
+				}
+			}
+		}
+		facts := resolveClaudeCode208SessionFacts(c, account, startedAt)
+		if profiledBody, applied := applyClaudeOAuthNoToolsMainProfileWithFacts(body, model, true, facts); applied {
+			if c != nil {
+				c.Set(claudeCode208Context1MKey, resolveClaudeCode208Context1M(c, model))
+				c.Set(claudeCode208SimpleProfileKey, true)
+			}
+			return profiledBody
+		}
+	}
 
 	// Phase D+E+F: messages cache 策略 + 工具名混淆 + tools[-1] 断点
 	// 对齐 Parrot transform_request 里剩余的字段级改写。顺序有语义约束：
@@ -1012,7 +1037,7 @@ func rewriteSystemForNonClaudeCodeWithPromptBlocks(body []byte, system any, expa
 	//    接近真实，同时不注入会污染被代理用户行为的工具专属指令。
 	//
 	//    缺失 billing block 的系统 payload 是 Anthropic 判定第三方的关键信号之一
-	//    （真实 CLI 每个请求都带）。2.1.161 profile 先注入 cch=00000，
+	//    （真实 CLI 每个请求都带）。2.1.208 profile 先注入 cch=00000，
 	//    最终 wire body 在 buildUpstreamRequest 中完成原位签名。
 	systemBlocks, blockErr := buildClaudeOAuthSystemPromptBlocksJSON(body, expansionPrompt, blocksConfig)
 	if blockErr != nil {

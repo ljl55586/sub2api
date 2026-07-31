@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf16"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
@@ -256,11 +257,13 @@ Good examples:
 {"title": "Add OAuth authentication"}
 {"title": "Debug failing CI tests"}
 {"title": "Refactor API client error handling"}
+Good (Korean session): {"title": "결제 모듈 리팩토링"}
 
 Bad (too vague): {"title": "Code changes"}
 Bad (too long): {"title": "Investigate and fix the issue where the login button does not respond on mobile devices"}
 Bad (wrong case): {"title": "Fix Login Button On Mobile"}
-Bad (refusal): {"title": "I can't access that URL"}`
+Bad (refusal): {"title": "I can't access that URL"}
+Bad (English title for a Korean session): {"title": "Refactor payment module"}`
 
 type claudeOAuthCompanionUpstreamRecorder struct {
 	mu              sync.Mutex
@@ -447,6 +450,9 @@ func newClaudeOAuthCompanionForwardHarness(t *testing.T) (*GatewayService, *gin.
 	c.Request.Header.Set("User-Agent", "curl/8.4.0")
 	c.Request.Header.Set("x-client-request-id", "must-not-leak")
 	c.Request.Header.Set("x-stainless-helper-method", "must-not-leak")
+	// Companion lifecycle tests opt into the explicit startup event. Ordinary
+	// curl main requests intentionally do not synthesize the CLI quota probe.
+	c.Request.Header.Set(claudeOAuthSessionInitHeader, "true")
 
 	parsed := newClaudeOAuthCompanionParsedRequest(t, "claude-opus-4-8", true, "Fix flaky OAuth tests")
 	upstream := &claudeOAuthCompanionUpstreamRecorder{titleStarted: make(chan struct{})}
@@ -510,6 +516,7 @@ func newClaudeOAuthCompatTestContext(t *testing.T, path, sessionID string) *gin.
 	c.Request = httptest.NewRequest(http.MethodPost, path, nil)
 	c.Request.Header.Set("User-Agent", "curl/8.4.0")
 	c.Request.Header.Set("X-Claude-Code-Session-Id", sessionID)
+	c.Request.Header.Set(claudeOAuthSessionInitHeader, "true")
 	return c
 }
 
@@ -575,8 +582,9 @@ func claudeOAuthRecordedMessageText(message gjson.Result) string {
 	}
 	var text string
 	content.ForEach(func(_, block gjson.Result) bool {
-		if block.Get("type").String() == "text" {
-			text = block.Get("text").String()
+		candidate := block.Get("text").String()
+		if block.Get("type").String() == "text" && !isClaudeCode208MetaText(candidate) {
+			text = candidate
 			return false
 		}
 		return true
@@ -648,7 +656,8 @@ func TestGatewayServiceForward_InitialOAuthMimicSendsQuotaTitleAndMain(t *testin
 	assertClaudeOAuthTitleWireShape(t, title, "Fix flaky OAuth tests")
 	assertExistingClaudeOAuthMainWireShape(t, main)
 	require.Len(t, gjson.GetBytes(main.body, "messages").Array(), 1)
-	require.Equal(t, "Fix flaky OAuth tests", gjson.GetBytes(main.body, "messages.0.content.0.text").String())
+	require.Equal(t, "Fix flaky OAuth tests", claudeOAuthMessageTextForTest(main.body, 0))
+	require.Contains(t, gjson.GetBytes(main.body, "messages.0.content.0.text").String(), "<system-reminder>")
 	require.NotContains(t, string(main.body), "<session>")
 	require.NotContains(t, string(main.body), claudeOAuthCompanionTitleSystemPrompt)
 	require.Equal(t, parseClaudeOAuthCompanionWireSession(t, quota), parseClaudeOAuthCompanionWireSession(t, title))
@@ -658,6 +667,19 @@ func TestGatewayServiceForward_InitialOAuthMimicSendsQuotaTitleAndMain(t *testin
 		upstream.Snapshot()[1].kind,
 		upstream.Snapshot()[2].kind,
 	})
+}
+
+func TestGatewayServiceForward_OrdinaryOAuthMimicMainDoesNotSynthesizeQuota(t *testing.T) {
+	svc, c, account, parsed, upstream := newClaudeOAuthCompanionForwardHarness(t)
+	c.Request.Header.Del(claudeOAuthSessionInitHeader)
+
+	result, err := svc.Forward(context.Background(), c, account, parsed)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Eventually(t, func() bool { return upstream.Count() == 2 }, time.Second, 10*time.Millisecond)
+	require.False(t, upstream.HasKind("quota"))
+	require.True(t, upstream.HasKind("title"))
+	require.True(t, upstream.HasKind("main"))
 }
 
 func TestGatewayServiceForward_OAuthMimicTitleCompanionDoesNotBlockMain(t *testing.T) {
@@ -838,7 +860,16 @@ func claudeOAuthMessageTextForTest(body []byte, index int) string {
 	if content.Type == gjson.String {
 		return content.String()
 	}
-	return content.Get("0.text").String()
+	var text string
+	content.ForEach(func(_, block gjson.Result) bool {
+		candidate := block.Get("text").String()
+		if block.Get("type").String() == "text" && !isClaudeCode208MetaText(candidate) {
+			text = candidate
+			return false
+		}
+		return true
+	})
+	return text
 }
 
 func TestGatewayServiceForward_OAuthMimicMaskedSessionsClaimFinalWireSession(t *testing.T) {
@@ -964,8 +995,8 @@ func TestGatewayServiceForward_OAuthMimicCompanionCandidateGates(t *testing.T) {
 			},
 		},
 		{
-			name:          "non Opus 4.8",
-			expectedCount: 1,
+			name:          "non Opus 4.8 still uses direct auxiliary model",
+			expectedCount: 3,
 			mutate: func(t *testing.T, _ *gin.Context, _ *Account, parsed **ParsedRequest) {
 				*parsed = newClaudeOAuthCompanionParsedRequest(t, "claude-sonnet-4-6", true, "Fix flaky OAuth tests")
 			},
@@ -1039,7 +1070,7 @@ func TestGatewayServiceForward_OAuthMimicShortFirstPromptDefersTitleUntilEligibl
 		"stream":true,
 		"messages":[
 			{"role":"user","content":"hi"},
-			{"role":"assistant","content":"Hello!"},
+			{"role":"assistant","content":"ok"},
 			{"role":"user","content":"what is your name?"}
 		]
 	}`)
@@ -1056,7 +1087,9 @@ func TestGatewayServiceForward_OAuthMimicShortFirstPromptDefersTitleUntilEligibl
 		kinds = append(kinds, request.kind)
 	}
 	require.ElementsMatch(t, []string{"quota", "main", "title", "main"}, kinds)
-	require.Equal(t, "<session>\nwhat is your name?\n</session>", gjson.GetBytes(upstream.Find(t, "title").body, "messages.0.content.0.text").String())
+	titlePrompt := gjson.GetBytes(upstream.Find(t, "title").body, "messages.0.content.0.text").String()
+	require.Contains(t, titlePrompt, "<session>\nhi\nok\nwhat is your name?\n</session>")
+	require.Contains(t, titlePrompt, "Write the title in the predominant language of the session")
 }
 
 func TestGatewayServiceForward_OAuthMimicCompanionFailuresFailOpenToMain(t *testing.T) {
@@ -1227,10 +1260,52 @@ func TestGatewayServiceForward_OAuthMimicCompanionBetaPolicyBlockSkipsOnlyTitleF
 	require.Equal(t, "main", upstream.Find(t, "main").kind)
 }
 
+func TestClaudeOAuthTitleCandidateEligibleUsesUTF16CodeUnits(t *testing.T) {
+	require.False(t, claudeOAuthTitleCandidateEligible("hello!!"))
+	require.False(t, claudeOAuthTitleCandidateEligible("123456789"))
+	require.True(t, claudeOAuthTitleCandidateEligible("1234567890"))
+	require.True(t, claudeOAuthTitleCandidateEligible("😀😀😀😀😀"))
+}
+
+func TestExtractClaudeOAuthTitleTranscriptSkipsMetaAndSystemRoles(t *testing.T) {
+	reminder := buildClaudeCode208SystemReminder(claudeCode208SessionFacts{CurrentDate: "2026-07-29"})
+	body, err := json.Marshal(map[string]any{
+		"messages": []map[string]any{
+			{"role": "system", "content": "ignore system role"},
+			{"role": "user", "content": []map[string]any{
+				{"type": "text", "text": reminder},
+				{"type": "text", "text": "<command-name>/help</command-name>"},
+				{"type": "text", "text": "human question"},
+			}},
+			{"role": "assistant", "content": []map[string]any{
+				{"type": "thinking", "thinking": "ignore reasoning"},
+				{"type": "text", "text": "assistant answer"},
+			}},
+			{"role": "user", "content": "<local-command-stdout>ignore stdout</local-command-stdout>"},
+		},
+	})
+	require.NoError(t, err)
+
+	require.Equal(t, "human question\nassistant answer", extractClaudeOAuthTitleTranscript(body))
+}
+
+func TestExtractClaudeOAuthTitleTranscriptKeepsLast1000UTF16CodeUnits(t *testing.T) {
+	body, err := json.Marshal(map[string]any{
+		"messages": []map[string]any{{
+			"role":    "user",
+			"content": strings.Repeat("a", 1005) + "😀",
+		}},
+	})
+	require.NoError(t, err)
+
+	transcript := extractClaudeOAuthTitleTranscript(body)
+	require.Len(t, utf16.Encode([]rune(transcript)), 1000)
+	require.Equal(t, strings.Repeat("a", 998)+"😀", transcript)
+}
+
 func assertClaudeOAuthQuotaWireShape(t *testing.T, req claudeOAuthCompanionRecordedRequest) {
 	t.Helper()
 	assertClaudeOAuthCompanionCommonWireShape(t, req, strings.Join([]string{
-		claude.BetaClaudeCode,
 		claude.BetaOAuth,
 		claude.BetaInterleavedThinking,
 		claude.BetaRedactThinking,
@@ -1239,7 +1314,7 @@ func assertClaudeOAuthQuotaWireShape(t *testing.T, req claudeOAuthCompanionRecor
 		claude.BetaPromptCachingScope,
 	}, ","))
 	assertClaudeOAuthCompanionTopLevelKeys(t, req.body, "max_tokens", "messages", "metadata", "model")
-	require.Equal(t, "claude-opus-4-8", gjson.GetBytes(req.body, "model").String())
+	require.Equal(t, claude.ClaudeCodeDirectSmallModel, gjson.GetBytes(req.body, "model").String())
 	require.Equal(t, int64(1), gjson.GetBytes(req.body, "max_tokens").Int())
 	require.Equal(t, "user", gjson.GetBytes(req.body, "messages.0.role").String())
 	require.Equal(t, "quota", gjson.GetBytes(req.body, "messages.0.content").String())
@@ -1248,28 +1323,24 @@ func assertClaudeOAuthQuotaWireShape(t *testing.T, req claudeOAuthCompanionRecor
 func assertClaudeOAuthTitleWireShape(t *testing.T, req claudeOAuthCompanionRecordedRequest, firstUserText string) {
 	t.Helper()
 	assertClaudeOAuthCompanionCommonWireShape(t, req, strings.Join([]string{
-		claude.BetaClaudeCode,
 		claude.BetaOAuth,
-		claude.BetaContext1M,
 		claude.BetaInterleavedThinking,
 		claude.BetaRedactThinking,
 		claude.BetaThinkingTokenCount,
 		claude.BetaContextManagement,
 		claude.BetaPromptCachingScope,
-		claude.BetaMidConversationSystem,
-		claude.BetaAdvisorTool,
-		claude.BetaEffort,
 		"structured-outputs-2025-12-15",
 	}, ","))
-	assertClaudeOAuthCompanionTopLevelKeys(t, req.body, "max_tokens", "messages", "metadata", "model", "output_config", "stream", "system", "tools")
+	assertClaudeOAuthCompanionTopLevelKeys(t, req.body, "max_tokens", "messages", "metadata", "model", "output_config", "stream", "system", "thinking", "tools")
 	require.True(t, gjson.GetBytes(req.body, "stream").Bool())
-	require.Equal(t, int64(64000), gjson.GetBytes(req.body, "max_tokens").Int())
+	require.Equal(t, claude.ClaudeCodeDirectSmallModel, gjson.GetBytes(req.body, "model").String())
+	require.Equal(t, int64(32000), gjson.GetBytes(req.body, "max_tokens").Int())
 	require.True(t, gjson.GetBytes(req.body, "tools").IsArray())
 	require.Empty(t, gjson.GetBytes(req.body, "tools").Array())
-	require.False(t, gjson.GetBytes(req.body, "thinking").Exists())
+	require.Equal(t, "disabled", gjson.GetBytes(req.body, "thinking.type").String())
 	require.False(t, gjson.GetBytes(req.body, "context_management").Exists())
 	require.False(t, gjson.GetBytes(req.body, "temperature").Exists())
-	require.Equal(t, "high", gjson.GetBytes(req.body, "output_config.effort").String())
+	require.False(t, gjson.GetBytes(req.body, "output_config.effort").Exists())
 	require.Equal(t, "json_schema", gjson.GetBytes(req.body, "output_config.format.type").String())
 	require.Equal(t, "object", gjson.GetBytes(req.body, "output_config.format.schema.type").String())
 	require.Equal(t, "string", gjson.GetBytes(req.body, "output_config.format.schema.properties.title.type").String())
@@ -1279,7 +1350,8 @@ func assertClaudeOAuthTitleWireShape(t *testing.T, req claudeOAuthCompanionRecor
 	require.True(t, messageContent.IsArray())
 	require.Len(t, messageContent.Array(), 1)
 	require.Equal(t, "text", messageContent.Get("0.type").String())
-	require.Equal(t, "<session>\n"+firstUserText+"\n</session>", messageContent.Get("0.text").String())
+	require.Contains(t, messageContent.Get("0.text").String(), "<session>\n"+firstUserText+"\n</session>")
+	require.Contains(t, messageContent.Get("0.text").String(), "Write the title in the predominant language of the session")
 
 	system := gjson.GetBytes(req.body, "system")
 	require.True(t, system.IsArray())
@@ -1290,7 +1362,7 @@ func assertClaudeOAuthTitleWireShape(t *testing.T, req claudeOAuthCompanionRecor
 		require.False(t, block.Get("cache_control").Exists())
 	}
 	require.Contains(t, system.Get("0.text").String(), "x-anthropic-billing-header:")
-	require.Equal(t, claudeCodeSystemPrompt, system.Get("1.text").String())
+	require.Equal(t, claudeCode208IdentityPrompt, system.Get("1.text").String())
 	require.Equal(t, claudeOAuthCompanionExpectedTitleSystemPrompt, system.Get("2.text").String())
 }
 
@@ -1308,9 +1380,11 @@ func assertClaudeOAuthCompanionCommonWireShape(t *testing.T, req claudeOAuthComp
 	require.Equal(t, "Bearer synthetic-oauth-token", getHeaderRaw(req.header, "authorization"))
 	require.Equal(t, expectedBeta, getHeaderRaw(req.header, "anthropic-beta"))
 	require.Empty(t, getHeaderRaw(req.header, claudeOAuthCompanionDelayHeader))
+	require.Empty(t, getHeaderRaw(req.header, claudeOAuthSessionInitHeader))
 	require.Equal(t, claude.DefaultHeaders["User-Agent"], getHeaderRaw(req.header, "user-agent"))
 	require.Equal(t, claude.DefaultStainlessOS, getHeaderRaw(req.header, "x-stainless-os"))
-	require.Empty(t, getHeaderRaw(req.header, "x-client-request-id"))
+	clientRequestID := getHeaderRaw(req.header, "x-client-request-id")
+	require.NoError(t, uuid.Validate(clientRequestID))
 	require.Empty(t, getHeaderRaw(req.header, "x-stainless-helper-method"))
 	if req.kind == "quota" {
 		require.NotContains(t, string(req.body), "cch=")

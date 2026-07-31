@@ -61,15 +61,15 @@ const APIKeyBetaHeader = BetaClaudeCode + "," + BetaInterleavedThinking + "," + 
 // APIKeyHaikuBetaHeader Haiku 模型在 API-key 账号下使用的 anthropic-beta header（不包含 oauth / claude-code）
 const APIKeyHaikuBetaHeader = BetaInterleavedThinking
 
-// DefaultCacheControlTTL 是网关代理为自己生成的 cache_control 块默认使用的 ttl。
-// 真实 Claude Code CLI 当前使用 "1h"，但本仓策略是"客户端透传 ttl 优先；
-// 客户端缺省时统一使用 5m"，这样既不浪费 1h 缓存额度，也保留客户端自定义能力。
+// DefaultCacheControlTTL 是网关通用缓存重写路径使用的 ttl。
+// Claude Code 2.1.208 Simple profile has its own source-backed 1h marker and
+// does not pass through this legacy path.
 const DefaultCacheControlTTL = "5m"
 
 // CLICurrentVersion 是 sub2api 当前对外伪装的 Claude Code CLI 版本号（三段 semver）。
 // 用于 billing attribution block 中的 cc_version=X.Y.Z.{fp} 前缀以及 fingerprint 计算。
 // 必须与 DefaultHeaders["User-Agent"] 中的版本号严格一致；不一致会被 Anthropic 判第三方。
-const CLICurrentVersion = "2.1.161"
+const CLICurrentVersion = "2.1.208"
 
 // DefaultStainlessOS is the operating system declared by the Claude Code OAuth
 // mimic profile. Cached account fingerprints may retain their historical value;

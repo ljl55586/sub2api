@@ -706,7 +706,7 @@ func (s *SettingService) getGatewayForwardingSettingsCached(ctx context.Context)
 // Uses in-process atomic.Value cache with 60s TTL, zero-lock hot path.
 // Returns (fingerprintUnification, metadataPassthrough, legacyCCHSetting).
 // The third value is retained for configuration compatibility; the atomic
-// 2.1.161 mimic profile always signs CCH regardless of this legacy setting.
+// 2.1.208 mimic profile always signs CCH regardless of this legacy setting.
 func (s *SettingService) GetGatewayForwardingSettings(ctx context.Context) (fingerprintUnification, metadataPassthrough, cchSigning bool) {
 	result := s.getGatewayForwardingSettingsCached(ctx)
 	return result.fp, result.mp, result.cch

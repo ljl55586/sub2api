@@ -31,6 +31,7 @@ const (
 	// ordinary clients cannot use it to delay their main request.
 	claudeOAuthCompanionDelayHeader     = "X-Sub2API-Claude-Companion-Delay-Seconds"
 	claudeOAuthCompanionMaxDelaySeconds = 120
+	claudeOAuthSessionInitHeader        = "X-Sub2API-Claude-Session-Init"
 
 	claudeOAuthSessionActionQuota = "quota"
 	claudeOAuthSessionActionTitle = "title"
@@ -47,11 +48,13 @@ Good examples:
 {"title": "Add OAuth authentication"}
 {"title": "Debug failing CI tests"}
 {"title": "Refactor API client error handling"}
+Good (Korean session): {"title": "결제 모듈 리팩토링"}
 
 Bad (too vague): {"title": "Code changes"}
 Bad (too long): {"title": "Investigate and fix the issue where the login button does not respond on mobile devices"}
 Bad (wrong case): {"title": "Fix Login Button On Mobile"}
-Bad (refusal): {"title": "I can't access that URL"}`
+Bad (refusal): {"title": "I can't access that URL"}
+Bad (English title for a Korean session): {"title": "Refactor payment module"}`
 
 type claudeOAuthCompanionMetadata struct {
 	UserID string `json:"user_id"`
@@ -88,6 +91,10 @@ type claudeOAuthCompanionOutputConfig struct {
 	Format claudeOAuthCompanionOutputFormat `json:"format"`
 }
 
+type claudeOAuthCompanionThinking struct {
+	Type string `json:"type"`
+}
+
 func buildClaudeOAuthQuotaCompanionBody(modelID, metadataUserID string) ([]byte, error) {
 	body := struct {
 		Model     string                        `json:"model"`
@@ -106,16 +113,27 @@ func buildClaudeOAuthQuotaCompanionBody(modelID, metadataUserID string) ([]byte,
 	return json.Marshal(body)
 }
 
-func buildClaudeOAuthTitleCompanionBody(modelID, metadataUserID, firstUserText string) ([]byte, error) {
-	return buildClaudeOAuthTitleCompanionBodyWithEffort(modelID, metadataUserID, firstUserText, true)
+func buildClaudeOAuthTitleCompanionBody(modelID, metadataUserID, sessionText string) ([]byte, error) {
+	return buildClaudeOAuthTitleCompanionBodyWithOptions(modelID, metadataUserID, sessionText, "", true)
 }
 
-func buildClaudeOAuthTitleCompanionBodyWithEffort(modelID, metadataUserID, firstUserText string, includeEffort bool) ([]byte, error) {
+func buildClaudeOAuthTitleCompanionBodyWithEffort(modelID, metadataUserID, sessionText string, includeEffort bool) ([]byte, error) {
+	return buildClaudeOAuthTitleCompanionBodyWithOptions(modelID, metadataUserID, sessionText, "", includeEffort)
+}
+
+func buildClaudeOAuthTitleCompanionBodyWithOptions(
+	modelID, metadataUserID, sessionText, language string,
+	includeEffort bool,
+) ([]byte, error) {
+	languageInstruction := "Write the title in the predominant language of the session — a stray word or code token in another language doesn't change it. Ignore the language of the examples above."
+	if language = strings.TrimSpace(language); language != "" {
+		languageInstruction = "Write the title in " + language + ". Keep technical terms and code identifiers in their original form."
+	}
 	messages := []claudeOAuthCompanionMessage{{
 		Role: "user",
 		Content: []claudeOAuthCompanionTextBlock{{
 			Type: "text",
-			Text: "<session>\n" + firstUserText + "\n</session>",
+			Text: "<session>\n" + strings.TrimSpace(sessionText) + "\n</session>\n\n" + languageInstruction,
 		}},
 	}}
 	temporaryBody, err := json.Marshal(struct {
@@ -135,25 +153,26 @@ func buildClaudeOAuthTitleCompanionBodyWithEffort(modelID, metadataUserID, first
 
 	body := struct {
 		Model        string                           `json:"model"`
-		MaxTokens    int                              `json:"max_tokens"`
-		Stream       bool                             `json:"stream"`
 		Messages     []claudeOAuthCompanionMessage    `json:"messages"`
 		System       []claudeOAuthCompanionTextBlock  `json:"system"`
 		Tools        []struct{}                       `json:"tools"`
 		Metadata     claudeOAuthCompanionMetadata     `json:"metadata"`
+		MaxTokens    int                              `json:"max_tokens"`
+		Thinking     claudeOAuthCompanionThinking     `json:"thinking"`
 		OutputConfig claudeOAuthCompanionOutputConfig `json:"output_config"`
+		Stream       bool                             `json:"stream"`
 	}{
 		Model:     modelID,
 		MaxTokens: claude.CurrentClaudeCodeModelTokenLimits(modelID).DefaultMaxTokens,
-		Stream:    true,
 		Messages:  messages,
 		System: []claudeOAuthCompanionTextBlock{
 			{Type: "text", Text: billingText},
-			{Type: "text", Text: claudeCodeSystemPrompt},
+			{Type: "text", Text: claudeCode208IdentityPrompt},
 			{Type: "text", Text: claudeOAuthCompanionTitleSystemPrompt},
 		},
 		Tools:    []struct{}{},
 		Metadata: claudeOAuthCompanionMetadata{UserID: metadataUserID},
+		Thinking: claudeOAuthCompanionThinking{Type: "disabled"},
 		OutputConfig: claudeOAuthCompanionOutputConfig{
 			Effort: effort,
 			Format: claudeOAuthCompanionOutputFormat{
@@ -168,6 +187,7 @@ func buildClaudeOAuthTitleCompanionBodyWithEffort(modelID, metadataUserID, first
 				},
 			},
 		},
+		Stream: true,
 	}
 	return json.Marshal(body)
 }
@@ -227,8 +247,7 @@ func claudeOAuthCompanionStartDelay(c *gin.Context) time.Duration {
 
 func (s *GatewayService) dispatchClaudeOAuthSessionCompanions(ctx context.Context, in claudeOAuthCompanionDispatchInput) claudeOAuthCompanionDispatchResult {
 	if s == nil || in.account == nil || !in.mimicClaudeCode || in.tokenType != "oauth" ||
-		claude.NormalizeModelID(in.modelID) != "claude-opus-4-8" || !in.reqStream ||
-		in.metadataPassthroughEnabled || s.httpUpstream == nil {
+		!in.reqStream || in.metadataPassthroughEnabled || s.httpUpstream == nil {
 		return claudeOAuthCompanionDispatchResult{}
 	}
 	metadata := ParseMetadataUserID(in.metadataUserID)
@@ -237,57 +256,91 @@ func (s *GatewayService) dispatchClaudeOAuthSessionCompanions(ctx context.Contex
 	}
 	sessionID := strings.TrimSpace(metadata.SessionID)
 	titleEligible := claudeOAuthTitleCandidateEligible(in.titleCandidateText)
+	directFirstParty := isClaudeCode208DirectOAuthAccount(in.account)
+	companionModelID := claude.NormalizeModelID(in.modelID)
+	if directFirstParty {
+		companionModelID = claude.ClaudeCodeDirectSmallModel
+	}
+	context1M := false
+	language := ""
+	quotaRequested := false
+	if in.c != nil {
+		if value, ok := in.c.Get(claudeCode208Context1MKey); ok {
+			context1M, _ = value.(bool)
+		}
+		language = strings.TrimSpace(in.c.GetHeader(claudeCode208LanguageHeader))
+		quotaRequested = strings.EqualFold(strings.TrimSpace(in.c.GetHeader(claudeOAuthSessionInitHeader)), "true")
+	}
 
-	effectiveDropSet := mergeDropSets(s.getBetaPolicyFilterSet(ctx, in.c, in.account, in.modelID))
+	effectiveDropSet := mergeDropSets(s.getBetaPolicyFilterSet(ctx, in.c, in.account, companionModelID))
 	baseCtx := context.WithoutCancel(ctx)
 	pending := make([]claudeOAuthCompanionPendingRequest, 0, 2)
-	quotaBetas := filterBetaTokens(claude.ClaudeCodeOAuthQuotaMimicryBetas(), effectiveDropSet)
-	quotaBetaHeader := strings.Join(quotaBetas, ",")
-	quotaPolicy := s.evaluateBetaPolicy(ctx, quotaBetaHeader, in.account, in.modelID)
-	if quotaPolicy.blockErr != nil {
-		logger.LegacyPrintf("service.gateway", "Claude OAuth quota companion skipped by beta policy")
-	} else if quotaBody, err := buildClaudeOAuthQuotaCompanionBody(in.modelID, in.metadataUserID); err != nil {
-		logger.LegacyPrintf("service.gateway", "Claude OAuth quota companion body build failed: %v", err)
-	} else {
-		quotaReq, _, buildErr := s.buildUpstreamRequestWithOptions(
-			baseCtx, in.c, in.account, quotaBody, in.token, in.tokenType, in.modelID, false, true,
-			upstreamRequestBuildOptions{
-				finalAnthropicBetaOverride:         &quotaBetaHeader,
-				debugSnapshotTag:                   "UPSTREAM_SESSION_COMPANION_QUOTA",
-				oauthMimicMetadataFinal:            true,
-				oauthMimicMetadataPassthrough:      in.metadataPassthroughEnabled,
-				oauthMimicMetadataPassthroughKnown: true,
-			},
-		)
-		if buildErr != nil {
-			logger.LegacyPrintf("service.gateway", "Claude OAuth quota companion request build failed: %v", buildErr)
-		} else if claimID, claimed := s.claimClaudeOAuthCompanionAction(ctx, in.account.ID, sessionID, in.runtimeKey, claudeOAuthSessionActionQuota); claimed {
-			quotaReq = quotaReq.WithContext(WithHTTPUpstreamProfile(quotaReq.Context(), HTTPUpstreamProfileClaudeOAuthCompanion))
-			pending = append(pending, claudeOAuthCompanionPendingRequest{
-				kind:    "quota",
-				req:     quotaReq,
-				timeout: 2 * time.Second,
-				claimID: claimID,
-			})
+	if quotaRequested {
+		quotaBetas := filterBetaTokens(claude.ClaudeCodeOAuthBetasForRequest(
+			claude.ClaudeCodeRequestQuota,
+			companionModelID,
+			claude.ClaudeCodeRequestFeatures{},
+		), effectiveDropSet)
+		quotaBetaHeader := strings.Join(quotaBetas, ",")
+		quotaPolicy := s.evaluateBetaPolicy(ctx, quotaBetaHeader, in.account, companionModelID)
+		if quotaPolicy.blockErr != nil {
+			logger.LegacyPrintf("service.gateway", "Claude OAuth quota companion skipped by beta policy")
+		} else if quotaBody, err := buildClaudeOAuthQuotaCompanionBody(companionModelID, in.metadataUserID); err != nil {
+			logger.LegacyPrintf("service.gateway", "Claude OAuth quota companion body build failed: %v", err)
+		} else {
+			quotaReq, _, buildErr := s.buildUpstreamRequestWithOptions(
+				baseCtx, in.c, in.account, quotaBody, in.token, in.tokenType, companionModelID, false, true,
+				upstreamRequestBuildOptions{
+					finalAnthropicBetaOverride:         &quotaBetaHeader,
+					debugSnapshotTag:                   "UPSTREAM_SESSION_COMPANION_QUOTA",
+					oauthMimicMetadataFinal:            true,
+					oauthMimicMetadataPassthrough:      in.metadataPassthroughEnabled,
+					oauthMimicMetadataPassthroughKnown: true,
+				},
+			)
+			if buildErr != nil {
+				logger.LegacyPrintf("service.gateway", "Claude OAuth quota companion request build failed: %v", buildErr)
+			} else if claimID, claimed := s.claimClaudeOAuthCompanionAction(ctx, in.account.ID, sessionID, in.runtimeKey, claudeOAuthSessionActionQuota); claimed {
+				quotaReq = quotaReq.WithContext(WithHTTPUpstreamProfile(quotaReq.Context(), HTTPUpstreamProfileClaudeOAuthCompanion))
+				pending = append(pending, claudeOAuthCompanionPendingRequest{
+					kind:    "quota",
+					req:     quotaReq,
+					timeout: 2 * time.Second,
+					claimID: claimID,
+				})
+			}
 		}
 	}
 
 	if titleEligible {
-		titleBetas := filterBetaTokens(claude.ClaudeCodeOAuthTitleMimicryBetas(), effectiveDropSet)
+		titleCaps := claude.ResolveClaudeCodeModelCapabilities(companionModelID)
+		titleFeatures := claude.ClaudeCodeRequestFeatures{
+			Context1M:           context1M && !directFirstParty,
+			Effort:              titleCaps.SupportsEffort,
+			StructuredOutput:    true,
+			MidConversationRole: true,
+			Advisor:             true,
+		}
+		titleBetas := filterBetaTokens(claude.ClaudeCodeOAuthBetasForRequest(
+			claude.ClaudeCodeRequestTitle,
+			companionModelID,
+			titleFeatures,
+		), effectiveDropSet)
 		titleBetaHeader := strings.Join(titleBetas, ",")
 		if !containsBetaToken(titleBetaHeader, claude.BetaStructuredOutputs) {
 			logger.LegacyPrintf("service.gateway", "Claude OAuth title companion skipped because its required beta is unavailable")
-		} else if titlePolicy := s.evaluateBetaPolicy(ctx, titleBetaHeader, in.account, in.modelID); titlePolicy.blockErr != nil {
+		} else if titlePolicy := s.evaluateBetaPolicy(ctx, titleBetaHeader, in.account, companionModelID); titlePolicy.blockErr != nil {
 			logger.LegacyPrintf("service.gateway", "Claude OAuth title companion skipped by beta policy")
-		} else if titleBody, err := buildClaudeOAuthTitleCompanionBodyWithEffort(
-			in.modelID,
+		} else if titleBody, err := buildClaudeOAuthTitleCompanionBodyWithOptions(
+			companionModelID,
 			in.metadataUserID,
 			strings.TrimSpace(in.titleCandidateText),
+			language,
 			containsBetaToken(titleBetaHeader, claude.BetaEffort),
 		); err != nil {
 			logger.LegacyPrintf("service.gateway", "Claude OAuth title companion body build failed: %v", err)
 		} else if titleReq, _, err := s.buildUpstreamRequestWithOptions(
-			baseCtx, in.c, in.account, titleBody, in.token, in.tokenType, in.modelID, true, true,
+			baseCtx, in.c, in.account, titleBody, in.token, in.tokenType, companionModelID, true, true,
 			upstreamRequestBuildOptions{
 				finalAnthropicBetaOverride:         &titleBetaHeader,
 				debugSnapshotTag:                   "UPSTREAM_SESSION_COMPANION_TITLE",
@@ -528,6 +581,52 @@ func claudeOAuthTitleCandidateEligible(text string) bool {
 		length += runeLength
 	}
 	return length >= claude.CurrentClaudeCodeProfile().TitleMinUTF16CodeUnits
+}
+
+// extractClaudeOAuthTitleTranscript mirrors 2.1.208's A0o(): collect only
+// human/assistant text, omit harness meta blocks, join with newlines, then keep
+// the final 1000 JavaScript UTF-16 code units.
+func extractClaudeOAuthTitleTranscript(body []byte) string {
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.IsArray() {
+		return ""
+	}
+	parts := make([]string, 0, len(messages.Array()))
+	messages.ForEach(func(_, message gjson.Result) bool {
+		role := message.Get("role").String()
+		if role != "user" && role != "assistant" {
+			return true
+		}
+		content := message.Get("content")
+		if content.Type == gjson.String {
+			text := content.String()
+			if role != "user" || !isClaudeCode208MetaText(text) {
+				parts = append(parts, text)
+			}
+			return true
+		}
+		if !content.IsArray() {
+			return true
+		}
+		content.ForEach(func(_, block gjson.Result) bool {
+			if block.Get("type").String() != "text" || block.Get("text").Type != gjson.String {
+				return true
+			}
+			text := block.Get("text").String()
+			if role == "user" && isClaudeCode208MetaText(text) {
+				return true
+			}
+			parts = append(parts, text)
+			return true
+		})
+		return true
+	})
+
+	units := utf16.Encode([]rune(strings.Join(parts, "\n")))
+	if len(units) > 1000 {
+		units = units[len(units)-1000:]
+	}
+	return string(utf16.Decode(units))
 }
 
 func drainClaudeOAuthCompanionResponse(resp *http.Response) {

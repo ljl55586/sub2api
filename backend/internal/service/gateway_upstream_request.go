@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -12,6 +13,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/util/urlvalidator"
+	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 
 	"github.com/gin-gonic/gin"
@@ -23,6 +25,26 @@ type upstreamRequestBuildOptions struct {
 	oauthMimicMetadataFinal            bool
 	oauthMimicMetadataPassthrough      bool
 	oauthMimicMetadataPassthroughKnown bool
+}
+
+type claudeCodeRetryCountContextKey struct{}
+
+func withClaudeCodeRetryCount(ctx context.Context, retryCount int) context.Context {
+	if retryCount < 0 {
+		retryCount = 0
+	}
+	return context.WithValue(ctx, claudeCodeRetryCountContextKey{}, retryCount)
+}
+
+func claudeCodeRetryCount(ctx context.Context) int {
+	if ctx == nil {
+		return 0
+	}
+	value, _ := ctx.Value(claudeCodeRetryCountContextKey{}).(int)
+	if value < 0 {
+		return 0
+	}
+	return value
 }
 
 const (
@@ -72,6 +94,7 @@ func (s *GatewayService) buildUpstreamRequestWithOptions(ctx context.Context, c 
 		}
 		targetURL = s.buildCustomRelayURL(validatedURL, "/v1/messages", account)
 	}
+	directFirstParty := isClaudeCodeDirectTargetURL(targetURL)
 
 	clientHeaders := http.Header{}
 	if c != nil && c.Request != nil {
@@ -136,7 +159,7 @@ func (s *GatewayService) buildUpstreamRequestWithOptions(ctx context.Context, c 
 	//      与原“OAuth + mimicClaudeCode 跳过白名单透传”行为对齐）
 	//   2) 按 finalBeta 做能力维度 body sanitize（如 context-management beta 缺失 →
 	//      strip body.context_management，与 Bedrock 路径对称）
-	//   3) 对 OAuth mimic 的 2.1.161 billing placeholder 计算 CCH
+	//   3) 对 OAuth mimic 的 2.1.208 billing placeholder 计算 CCH
 	//   4) NewRequest（body 至此最终敲定，CCH 之后不再改 body）
 	//   5) 透传白名单 / fingerprint / mimic header / 写入 finalBeta
 	policyFilterSet := s.getBetaPolicyFilterSet(ctx, c, account, modelID)
@@ -165,12 +188,14 @@ func (s *GatewayService) buildUpstreamRequestWithOptions(ctx context.Context, c 
 	if sanitized, changed := sanitizeAnthropicBodyForBetaTokens(body, finalBetaHeader); changed {
 		body = sanitized
 	}
-	if tokenType == "oauth" && mimicClaudeCode {
+	if tokenType == "oauth" && mimicClaudeCode && directFirstParty {
 		var cchErr error
 		body, _, cchErr = finalizeClaudeCodeCCH(body, claude.CurrentClaudeCodeProfile())
 		if cchErr != nil {
 			return nil, nil, fmt.Errorf("finalize Claude Code CCH: %w", cchErr)
 		}
+	} else if tokenType == "oauth" && mimicClaudeCode {
+		body = stripClaudeCodeCCH(body)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST", targetURL, bytes.NewReader(body))
@@ -235,7 +260,11 @@ func (s *GatewayService) buildUpstreamRequestWithOptions(ctx context.Context, c 
 	// OAuth mimic 的 header session 必须来自最终 body，避免分别生成导致身份漂移。
 	// metadata passthrough 是显式兼容模式，保留其既有行为：不生成或强制该 header。
 	if tokenType == "oauth" && mimicClaudeCode && !enableMPT {
-		deleteHeaderAllForms(req.Header, "x-client-request-id")
+		if directFirstParty && claude.CurrentClaudeCodeProfile().DirectFirstPartyClientRequestID {
+			setHeaderRaw(req.Header, "x-client-request-id", uuid.NewString())
+		} else {
+			deleteHeaderAllForms(req.Header, "x-client-request-id")
+		}
 		parsedUserID := ParseMetadataUserID(gjson.GetBytes(body, "metadata.user_id").String())
 		if parsedUserID == nil || strings.TrimSpace(parsedUserID.SessionID) == "" {
 			return nil, nil, fmt.Errorf("OAuth mimic request is missing a valid metadata session")
@@ -271,6 +300,14 @@ func (s *GatewayService) buildUpstreamRequestWithOptions(ctx context.Context, c 
 	}
 
 	return req, body, nil
+}
+
+func isClaudeCodeDirectTargetURL(raw string) bool {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(parsed.Hostname(), "api.anthropic.com")
 }
 
 // vertexSupportedBetaTokens 是 Vertex AI 的 Anthropic 端点接受的 anthropic-beta
@@ -558,12 +595,32 @@ func (s *GatewayService) computeFinalAnthropicBeta(
 
 	if tokenType == "oauth" {
 		if mimicClaudeCode {
-			// mimic 路径：原代码跳过白名单透传，incomingBeta 总是空字符串。
-			// 这里传空 string 以严格对齐原行为。
-			requiredBetas := []string{claude.BetaOAuth, claude.BetaInterleavedThinking}
-			if !strings.Contains(strings.ToLower(modelID), "haiku") {
-				requiredBetas = claude.ClaudeCodeOAuthMainMimicryBetas()
+			caps := claude.ResolveClaudeCodeModelCapabilities(modelID)
+			context1M := caps.Context1M
+			switch strings.ToLower(strings.TrimSpace(clientHeaders.Get(claudeCode208Context1MHeader))) {
+			case "true", "1", "yes", "on":
+				context1M = caps.SupportsContext1M
+			case "false", "0", "no", "off":
+				context1M = false
+			default:
+				// The selected 2.1.208 curl profile defaults Opus 4.8 to
+				// the captured [1m] selector, whose suffix is absent on wire.
+				context1M = context1M || strings.Contains(caps.APIModelID(), "opus-4-8")
 			}
+			requiredBetas := claude.ClaudeCodeOAuthBetasForRequest(
+				claude.ClaudeCodeRequestMain,
+				modelID,
+				claude.ClaudeCodeRequestFeatures{
+					Context1M:           context1M,
+					Thinking:            gjson.GetBytes(body, "thinking.type").String() == "adaptive" || gjson.GetBytes(body, "thinking.type").String() == "enabled",
+					ContextManagement:   gjson.GetBytes(body, "context_management").Exists(),
+					Effort:              gjson.GetBytes(body, "output_config.effort").String() != "",
+					StructuredOutput:    gjson.GetBytes(body, "output_config.format").Exists(),
+					ExtendedCacheTTL:    claudeCodeBodyUsesCacheTTL(body, cacheTTLTarget1h),
+					MidConversationRole: true,
+					Advisor:             true,
+				},
+			)
 			return mergeAnthropicBetaDropping(requiredBetas, "", effectiveDropSet), true
 		}
 		// 真 Claude Code 客户端透传路径
@@ -582,6 +639,40 @@ func (s *GatewayService) computeFinalAnthropicBeta(
 		}
 	}
 	return "", false
+}
+
+func claudeCodeBodyUsesCacheTTL(body []byte, ttl string) bool {
+	if strings.TrimSpace(ttl) == "" {
+		return false
+	}
+	var value any
+	if json.Unmarshal(body, &value) != nil {
+		return false
+	}
+	return claudeCodeValueUsesCacheTTL(value, ttl)
+}
+
+func claudeCodeValueUsesCacheTTL(value any, ttl string) bool {
+	switch current := value.(type) {
+	case map[string]any:
+		if cacheControl, ok := current["cache_control"].(map[string]any); ok {
+			if cacheTTL, ok := cacheControl["ttl"].(string); ok && cacheTTL == ttl {
+				return true
+			}
+		}
+		for _, child := range current {
+			if claudeCodeValueUsesCacheTTL(child, ttl) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range current {
+			if claudeCodeValueUsesCacheTTL(child, ttl) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // computeFinalCountTokensAnthropicBeta 是 count_tokens 路径上 anthropic-beta header 的
@@ -609,12 +700,27 @@ func (s *GatewayService) computeFinalCountTokensAnthropicBeta(
 
 	if tokenType == "oauth" {
 		if mimicClaudeCode {
-			// 与原代码严格等价：original buildCountTokensRequest 在 count_tokens mimic
-			// 分支上**不**会跳过白名单透传（与 messages mimic 路径不同），所以
-			// incomingBeta = req.Header[anthropic-beta] = 客户端透传过来的 client beta。
-			// 重构后直接从 clientHeaders 拿同一个值，保持行为一致。
-			requiredBetas := append(claude.ClaudeCodeOAuthCountTokensMimicryBetas(), claude.BetaTokenCounting)
-			return mergeAnthropicBetaDropping(requiredBetas, clientBeta, effectiveDropSet), true
+			caps := claude.ResolveClaudeCodeModelCapabilities(modelID)
+			context1M := caps.Context1M
+			switch strings.ToLower(strings.TrimSpace(clientHeaders.Get(claudeCode208Context1MHeader))) {
+			case "true", "1", "yes", "on":
+				context1M = caps.SupportsContext1M
+			case "false", "0", "no", "off":
+				context1M = false
+			default:
+				context1M = context1M || strings.Contains(caps.APIModelID(), "opus-4-8")
+			}
+			requiredBetas := claude.ClaudeCodeOAuthBetasForRequest(
+				claude.ClaudeCodeRequestCountTokens,
+				modelID,
+				claude.ClaudeCodeRequestFeatures{
+					Context1M:         context1M,
+					ContextManagement: gjson.GetBytes(body, "context_management").Exists(),
+					Effort:            gjson.GetBytes(body, "output_config.effort").String() != "",
+					ExtendedCacheTTL:  claudeCodeBodyUsesCacheTTL(body, cacheTTLTarget1h),
+				},
+			)
+			return mergeAnthropicBetaDropping(requiredBetas, "", effectiveDropSet), true
 		}
 		if clientBeta == "" {
 			return claude.CountTokensBetaHeader, true
@@ -928,6 +1034,7 @@ func applyClaudeCodeMimicHeaders(req *http.Request) {
 	}
 	// Real Claude CLI uses Accept: application/json (even for streaming).
 	setHeaderRaw(req.Header, "Accept", "application/json")
+	setHeaderRaw(req.Header, "x-stainless-retry-count", strconv.Itoa(claudeCodeRetryCount(req.Context())))
 }
 
 func truncateForLog(b []byte, maxBytes int) string {

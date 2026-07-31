@@ -9,6 +9,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 )
@@ -70,7 +71,13 @@ func TestBuildCountTokensRequest_OAuthMimicUsesAtomicProfileBeforeCCH(t *testing
 		Type:        AccountTypeOAuth,
 		Credentials: map[string]any{"access_token": "oauth-token"},
 	}
-	body := []byte(`{"model":"claude-opus-4-8","system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.78.abc; cc_entrypoint=cli; cch=00000;"}],"messages":[{"role":"user","content":"count this"}]}`)
+	metadata := FormatMetadataUserID(
+		"count-device",
+		"count-account",
+		"11111111-2222-4333-8444-555555555555",
+		claude.CLICurrentVersion,
+	)
+	body := []byte(`{"model":"claude-opus-4-8","system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.78.abc; cc_entrypoint=cli; cch=00000;"}],"metadata":{"user_id":` + strconvQuote(metadata) + `},"messages":[{"role":"user","content":"count this"}]}`)
 	svc := &GatewayService{cfg: &config.Config{}}
 
 	req, wireBody, err := svc.buildCountTokensRequest(
@@ -87,7 +94,55 @@ func TestBuildCountTokensRequest_OAuthMimicUsesAtomicProfileBeforeCCH(t *testing
 	require.NoError(t, err)
 	require.NotNil(t, req)
 	billing := gjson.GetBytes(wireBody, "system.0.text").String()
-	require.Contains(t, billing, "cc_version=2.1.161.abc;")
+	require.Contains(t, billing, "cc_version=2.1.208.abc;")
 	require.NotContains(t, billing, claudeCodeCCHPlaceholder)
+	require.NoError(t, uuid.Validate(getHeaderRaw(req.Header, "x-client-request-id")))
+	require.Equal(t, "11111111-2222-4333-8444-555555555555", getHeaderRaw(req.Header, "x-claude-code-session-id"))
+	require.Equal(t, int64(len(wireBody)), req.ContentLength)
+}
+
+func TestBuildCountTokensRequest_OAuthMimicCustomRelayOmitsDirectOnlyArtifacts(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", nil)
+
+	account := &Account{
+		ID:       919,
+		Platform: PlatformAnthropic,
+		Type:     AccountTypeOAuth,
+		Credentials: map[string]any{
+			"access_token": "oauth-token",
+		},
+		Extra: map[string]any{
+			"custom_base_url_enabled": true,
+			"custom_base_url":         "https://relay.example.com",
+		},
+	}
+	metadata := FormatMetadataUserID(
+		"count-device",
+		"count-account",
+		"11111111-2222-4333-8444-555555555555",
+		claude.CLICurrentVersion,
+	)
+	body := []byte(`{"model":"claude-opus-4-8","system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.208.abc; cc_entrypoint=cli; cch=12345;"}],"metadata":{"user_id":` + strconvQuote(metadata) + `},"messages":[{"role":"user","content":"count this"}]}`)
+	svc := &GatewayService{cfg: &config.Config{}}
+
+	req, wireBody, err := svc.buildCountTokensRequest(
+		context.Background(),
+		c,
+		account,
+		body,
+		"oauth-token",
+		"oauth",
+		"claude-opus-4-8",
+		true,
+	)
+
+	require.NoError(t, err)
+	require.Equal(t, "relay.example.com", req.URL.Hostname())
+	require.Empty(t, getHeaderRaw(req.Header, "x-client-request-id"))
+	require.NotContains(t, billingSystemText(wireBody), "cch=")
+	require.Equal(t, "11111111-2222-4333-8444-555555555555", getHeaderRaw(req.Header, "x-claude-code-session-id"))
 	require.Equal(t, int64(len(wireBody)), req.ContentLength)
 }

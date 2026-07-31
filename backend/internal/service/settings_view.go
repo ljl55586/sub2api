@@ -192,7 +192,7 @@ type SystemSettings struct {
 	// Gateway forwarding behavior
 	EnableFingerprintUnification           bool   // 是否统一 OAuth 账号的指纹头（默认 true）
 	EnableMetadataPassthrough              bool   // 是否透传客户端原始 metadata（默认 false）
-	EnableCCHSigning                       bool   // 已废弃 no-op：2.1.161 原子 profile 始终签名 CCH，不能单独关闭
+	EnableCCHSigning                       bool   // 已废弃 no-op：2.1.208 原子 profile 始终签名 CCH，不能单独关闭
 	EnableClaudeOAuthSystemPromptInjection bool   // 是否对 Claude OAuth mimic 路径注入 Claude Code system blocks（默认 true）
 	ClaudeOAuthSystemPrompt                string // Claude OAuth mimic 路径注入的通用扩展 system prompt；空值使用内置默认
 	ClaudeOAuthSystemPromptBlocks          string // Claude OAuth mimic 路径注入的 system blocks JSON 配置；空值使用内置默认
@@ -514,7 +514,7 @@ func DefaultRateLimit429CooldownSettings() *RateLimit429CooldownSettings {
 //
 // context-1m-2025-08-07 的默认策略：
 //   - Sonnet 系列中仅 claude-sonnet-5 及后续版本（如 claude-sonnet-5-*）默认支持 1M 上下文。
-//   - Claude Code 2.1.161 的真实 OAuth 流量也会为 claude-opus-4-8 携带该 beta。
+//   - Claude Code 2.1.208 的真实 OAuth 流量也会为 claude-opus-4-8 携带该 beta。
 //   - 因此默认对 sonnet-5* 和直连 claude-opus-4-8 放行，其余全部过滤。
 //
 // 白名单需要覆盖每个上游路径的模型 ID 变形：
@@ -544,7 +544,7 @@ func DefaultBetaPolicySettings() *BetaPolicySettings {
 					// 直连 Anthropic API（客户端请求 model 原样）
 					"claude-sonnet-5",
 					"claude-sonnet-5-*",
-					// Claude Code 2.1.161 OAuth 真实流量
+					// Claude Code 2.1.208 OAuth 真实流量
 					"claude-opus-4-8",
 					// Vertex AI 走 normalizeVertexAnthropicModelID 后 "@YYYYMMDD" 格式
 					"claude-sonnet-5@*",

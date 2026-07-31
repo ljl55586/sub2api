@@ -186,17 +186,15 @@ func oauthMimicMetadataForBetaTest(t *testing.T) string {
 	return string(encoded)
 }
 
-func TestComputeFinalAnthropicBeta_OAuthMimic_NonHaiku_UsesExactMainProfileOrder(t *testing.T) {
+func TestComputeFinalAnthropicBeta_OAuthMimic_NonHaiku_UsesDynamicMainProfileOrder(t *testing.T) {
 	s := newTestGatewayServiceForBeta(false)
 	final, ok := s.computeFinalAnthropicBeta("oauth", true, "claude-sonnet-4-6", http.Header{}, []byte(`{}`), nil)
 	require.True(t, ok)
 	require.Equal(t,
-		"claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,"+
-			"interleaved-thinking-2025-05-14,"+
+		"claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,"+
 			"redact-thinking-2026-02-12,thinking-token-count-2026-05-13,"+
 			"context-management-2025-06-27,prompt-caching-scope-2026-01-05,"+
-			"mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,"+
-			"effort-2025-11-24,extended-cache-ttl-2025-04-11",
+			"advisor-tool-2026-03-01",
 		final,
 	)
 }
@@ -209,21 +207,23 @@ func TestComputeFinalAnthropicBeta_OAuthMimic_AccountBetaPolicyFilterPreservesPr
 	)
 	require.True(t, ok)
 	require.Equal(t,
-		"claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,"+
-			"interleaved-thinking-2025-05-14,"+
+		"claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,"+
 			"redact-thinking-2026-02-12,thinking-token-count-2026-05-13,"+
-			"context-management-2025-06-27,mid-conversation-system-2026-04-07,"+
-			"advisor-tool-2026-03-01,effort-2025-11-24,extended-cache-ttl-2025-04-11",
+			"context-management-2025-06-27,advisor-tool-2026-03-01",
 		final,
 	)
 }
 
-func TestComputeFinalAnthropicBeta_OAuthMimic_Haiku_ExcludesContextManagement(t *testing.T) {
+func TestComputeFinalAnthropicBeta_OAuthMimic_HaikuUses208AuxiliaryBaseBetas(t *testing.T) {
 	s := newTestGatewayServiceForBeta(false)
 	final, ok := s.computeFinalAnthropicBeta("oauth", true, "claude-haiku-4-5", http.Header{}, []byte(`{}`), nil)
 	require.True(t, ok)
-	require.Equal(t, "oauth-2025-04-20,interleaved-thinking-2025-05-14", final,
-		"OAuth mimic haiku 仅注入 oauth + interleaved-thinking")
+	require.Equal(t,
+		"oauth-2025-04-20,interleaved-thinking-2025-05-14,"+
+			"redact-thinking-2026-02-12,thinking-token-count-2026-05-13,"+
+			"context-management-2025-06-27,prompt-caching-scope-2026-01-05",
+		final,
+	)
 }
 
 func TestComputeFinalAnthropicBeta_OAuthMimic_IgnoresClientBeta(t *testing.T) {
@@ -281,50 +281,45 @@ func TestComputeFinalAnthropicBeta_APIKey_NoClientBetaInjectOff_ShouldNotSet(t *
 // ============================================================================
 
 func TestComputeFinalCountTokensAnthropicBeta_OAuthMimic_UsesCountTokensProfileExactOrder(t *testing.T) {
-	// count_tokens 路径下 mimic 不按 haiku 排除：始终注入独立的 count-tokens profile。
+	// 2.1.208 count_tokens derives the base profile from the selected model and
+	// adds token-counting; it does not reuse the main request's optional fields.
 	s := newTestGatewayServiceForBeta(false)
 	final, ok := s.computeFinalCountTokensAnthropicBeta("oauth", true, "claude-haiku-4-5", http.Header{}, []byte(`{}`), nil)
 	require.True(t, ok)
 	require.Equal(t,
-		"claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,"+
-			"prompt-caching-scope-2026-01-05,effort-2025-11-24,"+
-			"context-management-2025-06-27,extended-cache-ttl-2025-04-11,"+
+		"oauth-2025-04-20,interleaved-thinking-2025-05-14,"+
+			"redact-thinking-2026-02-12,thinking-token-count-2026-05-13,"+
+			"context-management-2025-06-27,prompt-caching-scope-2026-01-05,"+
 			"token-counting-2024-11-01",
 		final,
 	)
 	for _, mainOnlyBeta := range []string{
-		"thinking-token-count-2026-05-13",
 		"mid-conversation-system-2026-04-07",
 		"advisor-tool-2026-03-01",
+		"effort-2025-11-24",
+		"extended-cache-ttl-2025-04-11",
 	} {
 		require.False(t, anthropicBetaTokensContains(final, mainOnlyBeta),
 			"count_tokens OAuth mimic 不应获得主请求专属 beta %q", mainOnlyBeta)
 	}
 }
 
-// 重构等价性回归：
-// 原 main buildCountTokensRequest 在 count_tokens mimic 分支上不跳过白名单透传
-// （与 messages mimic 不同），incomingBeta 取自客户端透传。重构后必须从 clientHeaders
-// 拿同一个值并 merge，否则会丢失客户端 beta。
-func TestComputeFinalCountTokensAnthropicBeta_OAuthMimic_PreservesClientBeta(t *testing.T) {
+func TestComputeFinalCountTokensAnthropicBeta_OAuthMimic_IgnoresClientBeta(t *testing.T) {
 	s := newTestGatewayServiceForBeta(false)
 	hdr := http.Header{}
 	hdr.Set("anthropic-beta", "custom-experimental-beta,context-1m-2025-08-07")
 	final, ok := s.computeFinalCountTokensAnthropicBeta("oauth", true, "claude-haiku-4-5", hdr, []byte(`{}`), nil)
 	require.True(t, ok)
-	require.True(t, anthropicBetaTokensContains(final, "custom-experimental-beta"),
-		"count_tokens mimic 不同于 messages mimic：原代码会保留客户端透传的 beta")
-	require.True(t, anthropicBetaTokensContains(final, "context-1m-2025-08-07"),
-		"客户端透传的其他 beta token 同样需要保留")
+	require.False(t, anthropicBetaTokensContains(final, "custom-experimental-beta"))
+	require.False(t, anthropicBetaTokensContains(final, "context-1m-2025-08-07"))
 	require.True(t, anthropicBetaTokensContains(final, claude.BetaContextManagement),
-		"同时 count-tokens mimicry profile 保留 context-management")
+		"count-tokens 2.1.208 Haiku profile保留 context-management")
 	require.True(t, anthropicBetaTokensContains(final, claude.BetaTokenCounting),
-		"同时补齐 token-counting beta")
+		"count_tokens 必须补齐 token-counting beta")
 }
 
-// messages mimic 路径反向验证：原代码会跳过白名单透传，
-// 客户端 beta 不会进入 mimic 计算。重构后 messages computeFinalAnthropicBeta
-// mimic 分支依然不该使用 clientBeta。
+// messages mimic path also ignores downstream beta input: both request kinds
+// are assembled from the 2.1.208 profile rather than curl/SDK headers.
 func TestComputeFinalAnthropicBeta_OAuthMimic_IgnoresClientBetaExplicit(t *testing.T) {
 	s := newTestGatewayServiceForBeta(false)
 	hdr := http.Header{}
@@ -332,8 +327,7 @@ func TestComputeFinalAnthropicBeta_OAuthMimic_IgnoresClientBetaExplicit(t *testi
 	final, ok := s.computeFinalAnthropicBeta("oauth", true, "claude-sonnet-4-6", hdr, []byte(`{}`), nil)
 	require.True(t, ok)
 	require.False(t, anthropicBetaTokensContains(final, "custom-experimental-beta"),
-		"messages mimic 原代码跳过白名单透传 → 客户端 beta 不进入计算。"+
-			"与 count_tokens mimic 是不同的设计，不能合并为同一函数。")
+		"mimic 请求不能继承客户端 anthropic-beta")
 }
 
 func TestComputeFinalCountTokensAnthropicBeta_OAuthTransparent_NoClientBetaInjectsDefault(t *testing.T) {
@@ -586,7 +580,7 @@ func TestBuildUpstreamRequest_AccountBetaOverrideBlockFailsBeforeWireRequest(t *
 	require.Equal(t, "overridden effort is blocked", err.Error())
 }
 
-func TestBuildUpstreamRequest_OAuthMimicHaiku_StripsContextManagementEndToEnd(t *testing.T) {
+func TestBuildUpstreamRequest_OAuthMimicHaikuPreservesSupportedContextManagementEndToEnd(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
@@ -597,8 +591,8 @@ func TestBuildUpstreamRequest_OAuthMimicHaiku_StripsContextManagementEndToEnd(t 
 		Status:      StatusActive,
 		Schedulable: true,
 	}
-	// haiku + mimic CC → final beta = HaikuBetaHeader（不含 context-management）→
-	// body 必须 strip。
+	// 2.1.208 Haiku auxiliary profile declares context-management, so the body
+	// and header must preserve the same capability.
 	body := []byte(`{"model":"claude-haiku-4-5","metadata":{"user_id":` + oauthMimicMetadataForBetaTest(t) + `},"context_management":{"edits":[{"type":"clear_thinking_20251015"}]},"messages":[]}`)
 	svc := &GatewayService{cfg: &config.Config{}}
 	req, _, err := svc.buildUpstreamRequest(
@@ -610,10 +604,8 @@ func TestBuildUpstreamRequest_OAuthMimicHaiku_StripsContextManagementEndToEnd(t 
 	outBody := readUpstreamBodyForTest(t, req)
 	outBeta := getHeaderRaw(req.Header, "anthropic-beta")
 
-	require.False(t, gjson.GetBytes(outBody, "context_management").Exists(),
-		"OAuth mimic + haiku 端到端：outgoing body 不应含 context_management")
-	require.False(t, anthropicBetaTokensContains(outBeta, claude.BetaContextManagement),
-		"对称约束：outgoing anthropic-beta header 也不带 context-management beta")
+	require.True(t, gjson.GetBytes(outBody, "context_management").Exists())
+	require.True(t, anthropicBetaTokensContains(outBeta, claude.BetaContextManagement))
 }
 
 func TestBuildUpstreamRequest_OAuthMimicNonHaiku_PreservesContextManagementEndToEnd(t *testing.T) {
@@ -712,7 +704,7 @@ func TestBuildCountTokensRequest_OAuthMimicHaiku_PreservesContextManagementEndTo
 		Credentials: map[string]any{"access_token": "oauth-tok"},
 		Status:      StatusActive, Schedulable: true,
 	}
-	body := []byte(`{"model":"claude-haiku-4-5","context_management":{"edits":[{"type":"clear_thinking_20251015"}]},"messages":[]}`)
+	body := []byte(`{"model":"claude-haiku-4-5","metadata":{"user_id":` + oauthMimicMetadataForBetaTest(t) + `},"context_management":{"edits":[{"type":"clear_thinking_20251015"}]},"messages":[]}`)
 	svc := &GatewayService{cfg: &config.Config{}}
 	req, _, err := svc.buildCountTokensRequest(
 		context.Background(), c, account, body,
@@ -740,10 +732,10 @@ func TestBuildCountTokensRequest_OAuthMimicGeneratedBetaBlockFailsBeforeWireRequ
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", nil)
 
 	svc := newTestGatewayServiceWithBetaPolicy(t, []BetaPolicyRule{{
-		BetaToken:    claude.BetaEffort,
+		BetaToken:    claude.BetaRedactThinking,
 		Action:       BetaPolicyActionBlock,
 		Scope:        BetaPolicyScopeOAuth,
-		ErrorMessage: "generated effort is blocked",
+		ErrorMessage: "generated redact-thinking is blocked",
 	}})
 	account := &Account{ID: 413, Platform: PlatformAnthropic, Type: AccountTypeOAuth}
 	body := []byte(`{"model":"claude-opus-4-8","metadata":{"user_id":` + oauthMimicMetadataForBetaTest(t) + `},"messages":[]}`)
@@ -757,7 +749,7 @@ func TestBuildCountTokensRequest_OAuthMimicGeneratedBetaBlockFailsBeforeWireRequ
 	require.Nil(t, wireBody)
 	var blocked *BetaBlockedError
 	require.ErrorAs(t, err, &blocked)
-	require.Equal(t, "generated effort is blocked", err.Error())
+	require.Equal(t, "generated redact-thinking is blocked", err.Error())
 }
 
 // 除 OAuth 自动注入外，count_tokens 还必须拒绝 API-key 客户端直接透传的

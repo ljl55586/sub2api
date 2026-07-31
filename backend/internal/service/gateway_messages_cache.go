@@ -49,8 +49,8 @@ func stripMessageCacheControl(body []byte) []byte {
 //  1. 最后一条 message
 //  2. 当 messages 数量 ≥ 4 时，倒数第二个 role=user 的 message
 //
-// 与 Parrot add_cache_breakpoints 一致。两个断点 + system prompt block 的断点
-// + tools[-1] 的断点共同构成最多 4 个断点（Anthropic 上限）。
+// Claude Code 2.1.208 Simple profile bypasses this legacy helper and applies
+// its source-backed single-marker algorithm independently.
 //
 // cache_control ttl 策略：
 //   - 若目标 block 已有 cache_control.ttl → 不覆盖
@@ -82,7 +82,6 @@ func addMessageCacheBreakpoints(body []byte) []byte {
 			}
 		}
 	}
-
 	return body
 }
 

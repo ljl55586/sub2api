@@ -32,6 +32,7 @@ const (
 )
 
 var errClaudeOAuthRuntimeCASConflict = errors.New("Claude OAuth runtime CAS conflict")
+var errClaudeOAuthRuntimeTurnBusy = errors.New("Claude OAuth session already has an active main turn")
 
 type ClaudeOAuthRuntimeAction struct {
 	State          string            `json:"state"`
@@ -74,6 +75,7 @@ type ClaudeOAuthRuntimeStore interface {
 type claudeOAuthRuntimeTurn struct {
 	RuntimeKey      string
 	SessionID       string
+	StartedAtUnix   int64
 	TurnID          string
 	Claimed         bool
 	RequestMessages json.RawMessage
@@ -222,8 +224,9 @@ func (s *GatewayService) prepareClaudeOAuthRuntimeWithLocatorBody(
 	}
 
 	turn := &claudeOAuthRuntimeTurn{
-		RuntimeKey: runtimeKey,
-		SessionID:  runtime.SessionID,
+		RuntimeKey:    runtimeKey,
+		SessionID:     runtime.SessionID,
+		StartedAtUnix: runtime.CreatedAtUnix,
 	}
 	turnID := uuid.NewString()
 	claimedRuntime, claimed, err := s.claimClaudeOAuthRuntimeTurn(ctx, accountID, runtimeKey, turnID)
@@ -231,10 +234,10 @@ func (s *GatewayService) prepareClaudeOAuthRuntimeWithLocatorBody(
 		return nil, body, err
 	}
 	if !claimed {
-		// A concurrent turn keeps the canonical session identity but does not
-		// read or overwrite transcript state. The downstream request can still
-		// proceed with its own complete history.
-		return turn, body, nil
+		// A real Claude Code process serializes main turns within one session.
+		// Allowing a second request to proceed with the same session ID but
+		// without the canonical transcript creates an impossible lifecycle.
+		return turn, body, errClaudeOAuthRuntimeTurnBusy
 	}
 	turn.Claimed = true
 	turn.TurnID = turnID
@@ -244,8 +247,56 @@ func (s *GatewayService) prepareClaudeOAuthRuntimeWithLocatorBody(
 		s.releaseClaudeOAuthRuntimeTurn(context.WithoutCancel(ctx), accountID, turn)
 		return nil, body, err
 	}
+	// This is a fallback for callers that do not run the 2.1.208 finalizer.
+	// Production main paths overwrite it after all semantic transformations.
 	turn.RequestMessages = requestMessages
 	return turn, hydratedBody, nil
+}
+
+// finalizeClaudeOAuthRuntimeRequestMessages records the final semantic message
+// history after reminder/cache/system normalization, rather than the earlier
+// hydration snapshot. Generated reminder blocks and wire-only cache markers are
+// stripped before storage so the next turn can rebuild them from fresh session
+// facts without duplicating meta content.
+func finalizeClaudeOAuthRuntimeRequestMessages(turn *claudeOAuthRuntimeTurn, body []byte) error {
+	if turn == nil || !turn.Claimed {
+		return nil
+	}
+	messages, err := claudeCode208RuntimeMessagesForStorage(body)
+	if err != nil {
+		return err
+	}
+	turn.RequestMessages = messages
+	return nil
+}
+
+func claudeCode208RuntimeMessagesForStorage(body []byte) (json.RawMessage, error) {
+	messages, err := parseClaudeCode208Messages(body)
+	if err != nil {
+		return nil, err
+	}
+	for messageIndex := range messages {
+		blocks, blockErr := claudeCode208ContentBlocks(messages[messageIndex].Content)
+		if blockErr != nil {
+			return nil, blockErr
+		}
+		nextBlocks := make([]json.RawMessage, 0, len(blocks))
+		for _, rawBlock := range blocks {
+			block := stripClaudeCode208BlockCacheControl(rawBlock)
+			text := gjson.GetBytes(block, "text")
+			if gjson.GetBytes(block, "type").String() == "text" &&
+				text.Type == gjson.String &&
+				isClaudeCode208GeneratedReminder(text.String()) {
+				continue
+			}
+			nextBlocks = append(nextBlocks, block)
+		}
+		messages[messageIndex].Content, blockErr = marshalClaudeCode208ContentBlocks(nextBlocks)
+		if blockErr != nil {
+			return nil, blockErr
+		}
+	}
+	return json.Marshal(messages)
 }
 
 func (s *GatewayService) claimClaudeOAuthRuntimeTurn(
@@ -534,7 +585,40 @@ func claudeOAuthIncomingContainsRuntimeHistory(incoming, stored []json.RawMessag
 	// clients intentionally remove old markers before replaying full history;
 	// treating that normalization as a different anchor would prepend the
 	// runtime transcript and duplicate every completed turn.
-	return len(incoming) >= len(stored) && jsonRawSemanticallyEqualIgnoringCacheControl(incoming[0], stored[0])
+	return len(incoming) >= len(stored) && claudeOAuthRuntimeAnchorEqual(incoming[0], stored[0])
+}
+
+func claudeOAuthRuntimeAnchorEqual(left, right json.RawMessage) bool {
+	leftRole, leftText, leftOK := claudeOAuthRuntimeAnchor(left)
+	rightRole, rightText, rightOK := claudeOAuthRuntimeAnchor(right)
+	if leftOK && rightOK {
+		return leftRole == rightRole && leftText == rightText
+	}
+	return jsonRawSemanticallyEqualIgnoringCacheControl(left, right)
+}
+
+func claudeOAuthRuntimeAnchor(raw json.RawMessage) (string, string, bool) {
+	var message claudeCode208WireMessage
+	if err := json.Unmarshal(raw, &message); err != nil {
+		return "", "", false
+	}
+	blocks, err := claudeCode208ContentBlocks(message.Content)
+	if err != nil {
+		return "", "", false
+	}
+	var texts []string
+	for _, block := range blocks {
+		text := gjson.GetBytes(block, "text")
+		if gjson.GetBytes(block, "type").String() != "text" || text.Type != gjson.String ||
+			isClaudeCode208GeneratedReminder(text.String()) {
+			continue
+		}
+		texts = append(texts, text.String())
+	}
+	if len(texts) == 0 {
+		return "", "", false
+	}
+	return message.Role, strings.Join(texts, "\n"), true
 }
 
 func jsonRawSemanticallyEqualIgnoringCacheControl(left, right json.RawMessage) bool {

@@ -31,9 +31,7 @@ func (s *GatewayService) prepareClaudeOAuthCompatRuntime(
 	systemRaw any,
 	modelID string,
 ) ([]byte, *claudeOAuthCompatRuntime, error) {
-	state := &claudeOAuthCompatRuntime{
-		titleCandidateText: extractLastUserText(anthropicBody),
-	}
+	state := &claudeOAuthCompatRuntime{}
 	if s.settingService != nil {
 		_, state.metadataPassthroughEnabled, _ = s.settingService.GetGatewayForwardingSettings(ctx)
 	}
@@ -68,6 +66,9 @@ func (s *GatewayService) prepareClaudeOAuthCompatRuntime(
 		} else {
 			state.turn = runtimeTurn
 			anthropicBody = hydratedBody
+			if c != nil && runtimeTurn != nil && runtimeTurn.StartedAtUnix > 0 {
+				c.Set(claudeCode208StartedAtKey, runtimeTurn.StartedAtUnix)
+			}
 		}
 
 		runtimeSessionID := ""
@@ -96,6 +97,7 @@ func (s *GatewayService) prepareClaudeOAuthCompatRuntime(
 			c.Set(oauthMimicMetadataFinalContextKey, true)
 		}
 	}
+	state.titleCandidateText = extractClaudeOAuthTitleTranscript(anthropicBody)
 
 	anthropicBody = s.applyClaudeCodeOAuthMimicryToBodyWithMetadata(
 		ctx,
@@ -106,6 +108,12 @@ func (s *GatewayService) prepareClaudeOAuthCompatRuntime(
 		modelID,
 		state.metadataUserID,
 	)
+	if state.turn != nil && state.turn.Claimed {
+		if err := finalizeClaudeOAuthRuntimeRequestMessages(state.turn, anthropicBody); err != nil {
+			s.releaseClaudeOAuthCompatRuntime(ctx, account, state)
+			return nil, nil, err
+		}
+	}
 	return anthropicBody, state, nil
 }
 

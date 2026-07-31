@@ -4,6 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"strings"
+	"unicode/utf16"
 
 	"github.com/tidwall/gjson"
 )
@@ -26,15 +28,16 @@ const fingerprintSalt = "59cf53e54c78"
 func computeClaudeCodeFingerprint(body []byte, version string) string {
 	firstText := extractFirstUserText(body)
 	indices := []int{4, 7, 20}
-	chars := make([]byte, 0, 3)
+	units := utf16.Encode([]rune(firstText))
+	var chars strings.Builder
 	for _, i := range indices {
-		if i < len(firstText) {
-			chars = append(chars, firstText[i])
+		if i < len(units) {
+			chars.WriteString(string(utf16.Decode([]uint16{units[i]})))
 		} else {
-			chars = append(chars, '0')
+			chars.WriteByte('0')
 		}
 	}
-	sum := sha256.Sum256([]byte(fingerprintSalt + string(chars) + version))
+	sum := sha256.Sum256([]byte(fingerprintSalt + chars.String() + version))
 	return hex.EncodeToString(sum[:])[:3]
 }
 
@@ -52,20 +55,26 @@ func extractFirstUserText(body []byte) string {
 		}
 		content := msg.Get("content")
 		if content.Type == gjson.String {
-			first = content.String()
-			return false
+			if !isClaudeCode208MetaText(content.String()) {
+				first = content.String()
+				return false
+			}
+			return true
 		}
 		if content.IsArray() {
 			content.ForEach(func(_, block gjson.Result) bool {
-				if block.Get("type").String() == "text" {
-					first = block.Get("text").String()
+				text := block.Get("text")
+				if block.Get("type").String() == "text" &&
+					text.Type == gjson.String &&
+					!isClaudeCode208MetaText(text.String()) {
+					first = text.String()
 					return false
 				}
 				return true
 			})
-			return false
+			return first == ""
 		}
-		return false
+		return true
 	})
 	return first
 }
@@ -109,7 +118,7 @@ func extractLastUserText(body []byte) string {
 //
 // 形态对齐真实 Claude Code CLI：
 //
-//	x-anthropic-billing-header: cc_version=2.1.161.{fp}; cc_entrypoint=cli; cch=00000;
+//	x-anthropic-billing-header: cc_version=2.1.208.{fp}; cc_entrypoint=cli; cch=00000;
 //
 // CCH 此时仍是等长占位符。所有 body 改写完成后，
 // finalizeClaudeCodeCCH 会对最终序列化字节计算 token 并原位覆盖这五个零。

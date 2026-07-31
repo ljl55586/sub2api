@@ -223,8 +223,13 @@ func TestGatewayCacheTTLGlobalSetting_RequestInjectionScope(t *testing.T) {
 }
 
 func TestEnforceCacheControlLimit_PreservesClaudeOAuthNoToolsMainProfile(t *testing.T) {
-	raw := []byte(`{"alpha":1,"model":"claude-opus-4-8","stream":true,"messages":[{"role":"user","content":"Hello"}],"omega":2}`)
-	body := rewriteSystemForNonClaudeCodeWithPromptBlocks(raw, nil, "", "")
+	metadata := FormatMetadataUserID(
+		"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		"account",
+		"11111111-2222-4333-8444-555555555555",
+		claude.CLICurrentVersion,
+	)
+	body := []byte(`{"model":"claude-opus-4-8","stream":true,"metadata":{"user_id":` + strconvQuote(metadata) + `},"messages":[{"role":"user","content":"Hello"}]}`)
 	body, modelID := normalizeClaudeOAuthRequestBody(body, "claude-opus-4-8", claudeOAuthNormalizeOptions{
 		alignClaudeCodeMainRequest: true,
 	})
@@ -235,14 +240,14 @@ func TestEnforceCacheControlLimit_PreservesClaudeOAuthNoToolsMainProfile(t *test
 	require.Equal(t, 3, strings.Count(string(out), `"cache_control"`))
 	require.True(t, gjson.GetBytes(out, "system.1.cache_control").Exists())
 	require.True(t, gjson.GetBytes(out, "system.2.cache_control").Exists())
-	require.True(t, gjson.GetBytes(out, "messages.0.content.0.cache_control").Exists())
+	require.True(t, gjson.GetBytes(out, "messages.0.content.1.cache_control").Exists())
 	require.Equal(t, cacheTTLTarget1h, gjson.GetBytes(out, "system.1.cache_control.ttl").String())
 	require.Equal(t, cacheTTLTarget1h, gjson.GetBytes(out, "system.2.cache_control.ttl").String())
-	require.Equal(t, cacheTTLTarget1h, gjson.GetBytes(out, "messages.0.content.0.cache_control.ttl").String())
+	require.Equal(t, cacheTTLTarget1h, gjson.GetBytes(out, "messages.0.content.1.cache_control.ttl").String())
 	require.True(t, gjson.GetBytes(out, "tools").IsArray())
 	require.Empty(t, gjson.GetBytes(out, "tools").Array())
 	require.False(t, gjson.GetBytes(out, "tool_choice").Exists())
-	assertJSONTokenOrder(t, string(out), `"alpha"`, `"model"`, `"stream"`, `"messages"`, `"omega"`)
+	assertJSONTokenOrder(t, string(out), `"model"`, `"messages"`, `"system"`, `"tools"`, `"metadata"`, `"max_tokens"`, `"thinking"`, `"context_management"`, `"output_config"`, `"stream"`)
 }
 
 func TestEnforceCacheControlLimit_PreservesClaudeOAuthNoToolsProfileWithHistoricalAnchors(t *testing.T) {
@@ -257,7 +262,14 @@ func TestEnforceCacheControlLimit_PreservesClaudeOAuthNoToolsProfileWithHistoric
 			{"role":"user","content":"Hello"}
 		]
 	}`)
-	body := rewriteSystemForNonClaudeCodeWithPromptBlocks(raw, nil, "", "")
+	metadata := FormatMetadataUserID(
+		"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		"account",
+		"11111111-2222-4333-8444-555555555555",
+		claude.CLICurrentVersion,
+	)
+	body, ok := setJSONValueBytes(raw, "metadata.user_id", metadata)
+	require.True(t, ok)
 	body, modelID := normalizeClaudeOAuthRequestBody(body, "claude-opus-4-8", claudeOAuthNormalizeOptions{
 		alignClaudeCodeMainRequest: true,
 	})

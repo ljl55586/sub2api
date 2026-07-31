@@ -10,6 +10,7 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
+	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 
 	"github.com/gin-gonic/gin"
@@ -190,7 +191,8 @@ func (s *GatewayService) ForwardCountTokens(ctx context.Context, c *gin.Context,
 		logger.LegacyPrintf("service.gateway", "Account %d: detected thinking block signature error on count_tokens, retrying with filtered thinking blocks", account.ID)
 
 		filteredBody := FilterThinkingBlocksForRetry(body, reqModel)
-		retryReq, retryWireBody, buildErr := s.buildCountTokensRequest(ctx, c, account, filteredBody, token, tokenType, reqModel, shouldMimicClaudeCode)
+		retryCtx := withClaudeCodeRetryCount(ctx, claudeCodeRetryCount(ctx)+1)
+		retryReq, retryWireBody, buildErr := s.buildCountTokensRequest(retryCtx, c, account, filteredBody, token, tokenType, reqModel, shouldMimicClaudeCode)
 		if buildErr == nil {
 			retryResp, retryErr := s.httpUpstream.DoWithTLS(retryReq, proxyURL, account.ID, account.Concurrency, s.tlsFPProfileService.ResolveTLSProfile(account))
 			if retryErr == nil {
@@ -474,6 +476,7 @@ func (s *GatewayService) buildCountTokensRequest(ctx context.Context, c *gin.Con
 		}
 		targetURL = s.buildCustomRelayURL(validatedURL, "/v1/messages/count_tokens", account)
 	}
+	directFirstParty := isClaudeCodeDirectTargetURL(targetURL)
 
 	clientHeaders := http.Header{}
 	if c != nil && c.Request != nil {
@@ -538,12 +541,14 @@ func (s *GatewayService) buildCountTokensRequest(ctx context.Context, c *gin.Con
 	}
 
 	body = sanitizeCountTokensRequestBody(body)
-	if tokenType == "oauth" && mimicClaudeCode {
+	if tokenType == "oauth" && mimicClaudeCode && directFirstParty {
 		var cchErr error
 		body, _, cchErr = finalizeClaudeCodeCCH(body, claude.CurrentClaudeCodeProfile())
 		if cchErr != nil {
 			return nil, nil, fmt.Errorf("finalize Claude Code count_tokens CCH: %w", cchErr)
 		}
+	} else if tokenType == "oauth" && mimicClaudeCode {
+		body = stripClaudeCodeCCH(body)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST", targetURL, bytes.NewReader(body))
@@ -558,13 +563,16 @@ func (s *GatewayService) buildCountTokensRequest(ctx context.Context, c *gin.Con
 		setAnthropicAPIKeyAuthHeader(req.Header, account, token)
 	}
 
-	// 白名单透传 headers（恢复真实 wire casing）
-	for key, values := range clientHeaders {
-		lowerKey := strings.ToLower(key)
-		if allowedHeaders[lowerKey] {
-			wireKey := resolveWireCasing(key)
-			for _, v := range values {
-				addHeaderRaw(req.Header, wireKey, v)
+	// Mimic requests are assembled from the atomic CLI profile and must not
+	// inherit curl/SDK headers from the downstream request.
+	if tokenType != "oauth" || !mimicClaudeCode {
+		for key, values := range clientHeaders {
+			lowerKey := strings.ToLower(key)
+			if allowedHeaders[lowerKey] {
+				wireKey := resolveWireCasing(key)
+				for _, v := range values {
+					addHeaderRaw(req.Header, wireKey, v)
+				}
 			}
 		}
 	}
@@ -596,13 +604,17 @@ func (s *GatewayService) buildCountTokensRequest(ctx context.Context, c *gin.Con
 		setHeaderRaw(req.Header, "anthropic-beta", finalBetaHeader)
 	}
 
-	// 同步 X-Claude-Code-Session-Id 头：取 body 中已处理的 metadata.user_id 的 session_id 覆盖
-	if sessionHeader := getHeaderRaw(req.Header, "X-Claude-Code-Session-Id"); sessionHeader != "" {
-		if uid := gjson.GetBytes(body, "metadata.user_id").String(); uid != "" {
-			if parsed := ParseMetadataUserID(uid); parsed != nil {
-				setHeaderRaw(req.Header, "X-Claude-Code-Session-Id", parsed.SessionID)
-			}
+	if tokenType == "oauth" && mimicClaudeCode && !ctEnableMPT {
+		if directFirstParty && claude.CurrentClaudeCodeProfile().DirectFirstPartyClientRequestID {
+			setHeaderRaw(req.Header, "x-client-request-id", uuid.NewString())
+		} else {
+			deleteHeaderAllForms(req.Header, "x-client-request-id")
 		}
+		parsedUserID := ParseMetadataUserID(gjson.GetBytes(body, "metadata.user_id").String())
+		if parsedUserID == nil || strings.TrimSpace(parsedUserID.SessionID) == "" {
+			return nil, nil, fmt.Errorf("OAuth mimic count_tokens request is missing a valid metadata session")
+		}
+		setHeaderRaw(req.Header, "X-Claude-Code-Session-Id", parsedUserID.SessionID)
 	}
 
 	// 账号级请求头覆写（仅 anthropic/openai api_key 账号启用时生效；OAuth 路径 no-op）

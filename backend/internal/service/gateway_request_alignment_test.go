@@ -12,6 +12,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 )
@@ -127,10 +128,8 @@ func TestClaudeOAuthNoToolsMainProfile_ForwardAppliesDefaultProfile(t *testing.T
 	require.False(t, blocks[0].Get("cache_control").Exists())
 	require.Equal(t, "ephemeral", blocks[1].Get("cache_control.type").String())
 	require.Equal(t, cacheTTLTarget1h, blocks[1].Get("cache_control.ttl").String())
-	require.Equal(t,
-		"You are an interactive assistant that helps users with software engineering tasks. Follow the conversation instructions, give concise and accurate answers, and do not claim that you can run tools or take actions outside this conversation.",
-		blocks[2].Get("text").String(),
-	)
+	require.Equal(t, claudeCode208IdentityPrompt, blocks[1].Get("text").String())
+	require.Contains(t, blocks[2].Get("text").String(), "CWD: "+claudeCode208DefaultVirtualCWD+"\nDate: ")
 	require.Equal(t, "ephemeral", blocks[2].Get("cache_control.type").String())
 	require.Equal(t, cacheTTLTarget1h, blocks[2].Get("cache_control.ttl").String())
 
@@ -140,11 +139,12 @@ func TestClaudeOAuthNoToolsMainProfile_ForwardAppliesDefaultProfile(t *testing.T
 	require.Equal(t, "user", lastMessage.Get("role").String())
 	content := lastMessage.Get("content")
 	require.True(t, content.IsArray())
-	require.Len(t, content.Array(), 1)
-	require.Equal(t, "text", content.Get("0.type").String())
-	require.Equal(t, "Hello", content.Get("0.text").String())
-	require.Equal(t, "ephemeral", content.Get("0.cache_control.type").String())
-	require.Equal(t, cacheTTLTarget1h, content.Get("0.cache_control.ttl").String())
+	require.Len(t, content.Array(), 2)
+	require.Contains(t, content.Get("0.text").String(), "<system-reminder>")
+	require.Equal(t, "text", content.Get("1.type").String())
+	require.Equal(t, "Hello", content.Get("1.text").String())
+	require.Equal(t, "ephemeral", content.Get("1.cache_control.type").String())
+	require.Equal(t, cacheTTLTarget1h, content.Get("1.cache_control.ttl").String())
 
 	require.True(t, gjson.GetBytes(out, "tools").IsArray())
 	require.Empty(t, gjson.GetBytes(out, "tools").Array())
@@ -158,19 +158,94 @@ func TestClaudeOAuthNoToolsMainProfile_ForwardAppliesDefaultProfile(t *testing.T
 	require.Equal(t, 3, strings.Count(string(out), `"cache_control"`))
 }
 
+func TestResolveClaudeCode208SessionFactsUsesExplicitSessionInputs(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	c.Request.Header.Set(claudeCode208CWDHeader, "repo/subdir")
+	c.Request.Header.Set(claudeCode208LanguageHeader, "zh-CN")
+	account := &Account{
+		Credentials: map[string]any{"email": "user@example.com\n"},
+		Extra:       map[string]any{"claude_cwd": "/must-not-win"},
+	}
+	startedAt := time.Date(2026, time.July, 14, 2, 55, 30, 0, time.UTC)
+
+	facts := resolveClaudeCode208SessionFacts(c, account, startedAt)
+
+	require.Equal(t, "/repo/subdir", facts.CWD)
+	require.Equal(t, "2026-07-14", facts.StartDate)
+	require.Equal(t, time.Now().Format("2006-01-02"), facts.CurrentDate)
+	require.Equal(t, "user@example.com", facts.UserEmail)
+	require.Equal(t, "zh-CN", facts.Language)
+	reminder := buildClaudeCode208SystemReminder(facts)
+	require.Contains(t, reminder, "# userEmail\nThe user's email address is user@example.com.")
+	require.Contains(t, reminder, "# currentDate\nToday's date is "+facts.CurrentDate+".")
+}
+
+func TestBuildClaudeCode208SystemReminder_FinalWireGolden(t *testing.T) {
+	facts := claudeCode208SessionFacts{
+		UserEmail:   "user@example.com",
+		CurrentDate: "2026-07-29",
+	}
+
+	require.Equal(t, `<system-reminder>
+As you answer the user's questions, you can use the following context:
+# userEmail
+The user's email address is user@example.com.
+# currentDate
+Today's date is 2026-07-29.
+
+      IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.
+</system-reminder>
+
+`, buildClaudeCode208SystemReminder(facts))
+}
+
+func TestClaudeOAuthNoToolsMainProfile_OfficialSimpleSystemPromptGolden(t *testing.T) {
+	metadata := FormatMetadataUserID(
+		"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		"account",
+		"11111111-2222-4333-8444-555555555555",
+		claude.CLICurrentVersion,
+	)
+	body := []byte(`{"model":"claude-opus-4-8","max_tokens":64000,"stream":true,"metadata":{"user_id":` + strconvQuote(metadata) + `},"messages":[{"role":"user","content":"Hello, please introduce yourself."}]}`)
+	facts := claudeCode208SessionFacts{
+		CWD:         "/Users/ling/sub2api",
+		StartDate:   "2026-07-14",
+		CurrentDate: "2026-07-29",
+		UserEmail:   "user@example.com",
+	}
+
+	out, applied := applyClaudeOAuthNoToolsMainProfileWithFacts(body, "claude-opus-4-8", true, facts)
+
+	require.True(t, applied)
+	require.Equal(t, claudeCode208IdentityPrompt, gjson.GetBytes(out, "system.1.text").String())
+	require.Equal(t, "CWD: /Users/ling/sub2api\nDate: 2026-07-14", gjson.GetBytes(out, "system.2.text").String())
+	require.Equal(t, cacheTTLTarget1h, gjson.GetBytes(out, "system.1.cache_control.ttl").String())
+	require.Equal(t, cacheTTLTarget1h, gjson.GetBytes(out, "system.2.cache_control.ttl").String())
+	require.Equal(t, buildClaudeCode208SystemReminder(facts), gjson.GetBytes(out, "messages.0.content.0.text").String())
+	require.Equal(t, "Hello, please introduce yourself.", gjson.GetBytes(out, "messages.0.content.1.text").String())
+	require.Equal(t, cacheTTLTarget1h, gjson.GetBytes(out, "messages.0.content.1.cache_control.ttl").String())
+	require.Equal(t, 3, strings.Count(string(out), `"cache_control"`))
+}
+
 func TestClaudeOAuthNoToolsMainProfile_PreservesNormalizedDefaultMaxTokens(t *testing.T) {
-	raw := []byte(`{"model":"claude-opus-4-8","stream":true,"messages":[{"role":"user","content":"Hello"}]}`)
-	body := rewriteSystemForNonClaudeCodeWithPromptBlocks(raw, nil, "", "")
+	metadata := FormatMetadataUserID(
+		"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		"account",
+		"11111111-2222-4333-8444-555555555555",
+		claude.CLICurrentVersion,
+	)
+	body := []byte(`{"model":"claude-opus-4-8","stream":true,"metadata":{"user_id":` + strconvQuote(metadata) + `},"messages":[{"role":"user","content":"Hello"}]}`)
 	body, modelID := normalizeClaudeOAuthRequestBody(body, "claude-opus-4-8", claudeOAuthNormalizeOptions{
 		alignClaudeCodeMainRequest: true,
 	})
 	require.Equal(t, int64(64000), gjson.GetBytes(body, "max_tokens").Int())
-	billingBeforeProfile := gjson.GetBytes(body, "system.0.text").String()
 
 	out, applied := applyClaudeOAuthNoToolsMainProfile(body, modelID, true)
 	require.True(t, applied)
 	require.Equal(t, int64(64000), gjson.GetBytes(out, "max_tokens").Int())
-	require.Equal(t, billingBeforeProfile, gjson.GetBytes(out, "system.0.text").String())
+	require.Contains(t, gjson.GetBytes(out, "system.0.text").String(), "cc_version="+claude.CLICurrentVersion+".")
 }
 
 func TestClaudeOAuthNoToolsMainCandidate(t *testing.T) {
@@ -194,10 +269,10 @@ func TestClaudeOAuthNoToolsMainCandidate(t *testing.T) {
 			want:  true,
 		},
 		{
-			name:  "other model is rejected",
+			name:  "other supported model is accepted",
 			body:  base,
 			model: "claude-sonnet-4-6",
-			want:  false,
+			want:  true,
 		},
 		{
 			name:  "non streaming is rejected",
@@ -302,10 +377,6 @@ func TestClaudeOAuthNoToolsMainProfile_ForwardKeepsGenericPathForInverseCandidat
 		body string
 	}{
 		{
-			name: "other model",
-			body: `{"model":"claude-sonnet-4-6","stream":true,"messages":[{"role":"user","content":"Hello"}]}`,
-		},
-		{
 			name: "non streaming",
 			body: `{"model":"claude-opus-4-8","stream":false,"messages":[{"role":"user","content":"Hello"}]}`,
 		},
@@ -341,7 +412,7 @@ func TestClaudeOAuthNoToolsMainProfile_ForwardKeepsGenericPathForInverseCandidat
 			require.Equal(t, claudeCodeSystemPromptExpansion, gjson.GetBytes(out, "system.2.text").String())
 			require.False(t, gjson.GetBytes(out, "system.1.cache_control").Exists())
 			require.Equal(t, claude.DefaultCacheControlTTL, gjson.GetBytes(out, "system.2.cache_control.ttl").String())
-			require.NotContains(t, string(out), claudeOAuthNoToolsMainExpansion)
+			require.NotContains(t, string(out), "CWD: "+claudeCode208DefaultVirtualCWD)
 		})
 	}
 }
@@ -359,11 +430,12 @@ func TestClaudeOAuthNoToolsMainProfile_ForwardOverridesMessageCacheRewriteTTL(t 
 
 	content := gjson.GetBytes(out, "messages.0.content")
 	require.True(t, content.IsArray())
-	require.Len(t, content.Array(), 1)
-	require.Equal(t, "text", content.Get("0.type").String())
-	require.Equal(t, "Hello", content.Get("0.text").String())
-	require.Equal(t, "ephemeral", content.Get("0.cache_control.type").String())
-	require.Equal(t, cacheTTLTarget1h, content.Get("0.cache_control.ttl").String())
+	require.Len(t, content.Array(), 2)
+	require.Contains(t, content.Get("0.text").String(), "<system-reminder>")
+	require.Equal(t, "text", content.Get("1.type").String())
+	require.Equal(t, "Hello", content.Get("1.text").String())
+	require.Equal(t, "ephemeral", content.Get("1.cache_control.type").String())
+	require.Equal(t, cacheTTLTarget1h, content.Get("1.cache_control.ttl").String())
 }
 
 func TestClaudeOAuthNoToolsMainProfile_ForwardDoesNotOverrideCustomSystemSettings(t *testing.T) {
@@ -375,7 +447,7 @@ func TestClaudeOAuthNoToolsMainProfile_ForwardDoesNotOverrideCustomSystemSetting
 		}, "curl/8.4.0")
 		require.Equal(t, "administrator custom expansion", gjson.GetBytes(out, "system.2.text").String())
 		require.False(t, gjson.GetBytes(out, "system.1.cache_control").Exists())
-		require.NotContains(t, string(out), claudeOAuthNoToolsMainExpansion)
+		require.NotContains(t, string(out), "CWD: "+claudeCode208DefaultVirtualCWD)
 	})
 
 	t.Run("custom blocks", func(t *testing.T) {
@@ -390,7 +462,7 @@ func TestClaudeOAuthNoToolsMainProfile_ForwardDoesNotOverrideCustomSystemSetting
 		require.Len(t, system.Array(), 2)
 		require.Equal(t, "administrator first block", system.Get("0.text").String())
 		require.Equal(t, "administrator second block", system.Get("1.text").String())
-		require.NotContains(t, string(out), claudeOAuthNoToolsMainExpansion)
+		require.NotContains(t, string(out), "CWD: "+claudeCode208DefaultVirtualCWD)
 	})
 }
 
@@ -403,9 +475,9 @@ func TestClaudeOAuthNoToolsMainProfile_ForwardSkipsRealClaudeCode(t *testing.T) 
 	)
 	body := []byte(`{"model":"claude-opus-4-8","max_tokens":1024,"stream":true,"metadata":{"user_id":` + strconvQuote(metadataUserID) + `},"messages":[{"role":"user","content":"Hello"}]}`)
 
-	out := forwardClaudeOAuthNoToolsProfileBodyForTest(t, body, map[string]string{}, "claude-cli/2.1.161 (external, cli)")
+	out := forwardClaudeOAuthNoToolsProfileBodyForTest(t, body, map[string]string{}, "claude-cli/2.1.208 (external, cli)")
 	require.False(t, gjson.GetBytes(out, "system").Exists())
-	require.NotContains(t, string(out), claudeOAuthNoToolsMainExpansion)
+	require.NotContains(t, string(out), "CWD: "+claudeCode208DefaultVirtualCWD)
 }
 
 func forwardClaudeOAuthNoToolsProfileBodyForTest(t *testing.T, body []byte, settings map[string]string, userAgent string) []byte {
@@ -499,6 +571,9 @@ func TestBuildUpstreamRequest_MimicSessionHeaders(t *testing.T) {
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
 	c.Request.Header.Set("User-Agent", "curl/8.4.0")
+	c.Request.Header.Set(claudeCode208CWDHeader, "/private/repo")
+	c.Request.Header.Set(claudeCode208LanguageHeader, "zh-CN")
+	c.Request.Header.Set(claudeCode208Context1MHeader, "true")
 
 	cache := &identityCacheStub{fingerprint: &Fingerprint{
 		ClientID:                "account-device-123",
@@ -545,15 +620,30 @@ func TestBuildUpstreamRequest_MimicSessionHeaders(t *testing.T) {
 	)
 
 	require.NoError(t, err)
-	require.Empty(t, getHeaderRaw(req.Header, "x-client-request-id"))
+	_, requestIDErr := uuid.Parse(getHeaderRaw(req.Header, "x-client-request-id"))
+	require.NoError(t, requestIDErr)
 	require.Empty(t, getHeaderRaw(req.Header, "x-stainless-helper-method"))
+	require.Empty(t, getHeaderRaw(req.Header, claudeCode208CWDHeader))
+	require.Empty(t, getHeaderRaw(req.Header, claudeCode208LanguageHeader))
+	require.Empty(t, getHeaderRaw(req.Header, claudeCode208Context1MHeader))
 	parsedUserID := ParseMetadataUserID(gjson.GetBytes(outBody, "metadata.user_id").String())
 	require.NotNil(t, parsedUserID)
-	require.True(t, gjson.Valid(gjson.GetBytes(outBody, "metadata.user_id").String()), "the final 2.1.161 request must retain JSON metadata format")
+	require.True(t, gjson.Valid(gjson.GetBytes(outBody, "metadata.user_id").String()), "the final 2.1.208 request must retain JSON metadata format")
 	require.Equal(t, "account-claude-device", parsedUserID.DeviceID)
 	require.Equal(t, parsedUserID.SessionID, getHeaderRaw(req.Header, "x-claude-code-session-id"))
 	require.Equal(t, claude.DefaultHeaders["User-Agent"], getHeaderRaw(req.Header, "User-Agent"))
-	require.Equal(t, claude.ClaudeCodeOAuthMainMimicryBetas(), parseAnthropicBetaHeader(getHeaderRaw(req.Header, "anthropic-beta")))
+	require.Equal(t, claude.ClaudeCodeOAuthBetasForRequest(
+		claude.ClaudeCodeRequestMain,
+		"claude-opus-4-8",
+		claude.ClaudeCodeRequestFeatures{
+			Context1M:           true,
+			Thinking:            true,
+			ContextManagement:   true,
+			Effort:              true,
+			MidConversationRole: true,
+			Advisor:             true,
+		},
+	), parseAnthropicBetaHeader(getHeaderRaw(req.Header, "anthropic-beta")))
 	require.Equal(t, "clear_thinking_20251015", gjson.GetBytes(outBody, "context_management.edits.0.type").String())
 }
 
@@ -602,7 +692,7 @@ func TestBuildUpstreamRequest_MimicUsesMacOSAndFinalBillingVersion(t *testing.T)
 	)
 
 	require.NoError(t, err)
-	require.Contains(t, billingSystemText(outBody), "cc_version=2.1.161.")
+	require.Contains(t, billingSystemText(outBody), "cc_version=2.1.208.")
 	require.Contains(t, billingSystemText(outBody), "cc_entrypoint=cli;")
 	require.Contains(t, billingSystemText(outBody), "cch=")
 	require.NotContains(t, billingSystemText(outBody), claudeCodeCCHPlaceholder)
@@ -615,7 +705,8 @@ func TestBuildUpstreamRequest_MimicUsesMacOSAndFinalBillingVersion(t *testing.T)
 	require.NotNil(t, parsedUserID)
 	require.Equal(t, originalClientID, parsedUserID.DeviceID)
 	require.Equal(t, "account-456", parsedUserID.AccountUUID)
-	require.Empty(t, getHeaderRaw(req.Header, "x-client-request-id"))
+	_, requestIDErr := uuid.Parse(getHeaderRaw(req.Header, "x-client-request-id"))
+	require.NoError(t, requestIDErr)
 	require.Empty(t, getHeaderRaw(req.Header, "x-stainless-helper-method"))
 }
 
@@ -668,8 +759,83 @@ func TestBuildUpstreamRequest_MimicMaskedSessionHeaderUsesFinalMetadata(t *testi
 	require.Equal(t, "account-789", parsedUserID.AccountUUID)
 	require.Equal(t, maskedSessionID, parsedUserID.SessionID)
 	require.Equal(t, maskedSessionID, getHeaderRaw(req.Header, "x-claude-code-session-id"))
-	require.Empty(t, getHeaderRaw(req.Header, "x-client-request-id"))
+	_, requestIDErr := uuid.Parse(getHeaderRaw(req.Header, "x-client-request-id"))
+	require.NoError(t, requestIDErr)
 	require.Empty(t, getHeaderRaw(req.Header, "x-stainless-helper-method"))
+}
+
+func TestBuildUpstreamRequest_MimicCustomRelayOmitsDirectOnlyArtifacts(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	cache := &identityCacheStub{fingerprint: &Fingerprint{
+		ClientID:  "relay-device",
+		UserAgent: claude.DefaultHeaders["User-Agent"],
+		UpdatedAt: time.Now().Unix(),
+	}}
+	svc := &GatewayService{
+		cfg:             &config.Config{},
+		identityService: NewIdentityService(cache),
+	}
+	account := &Account{
+		ID:       790,
+		Platform: PlatformAnthropic,
+		Type:     AccountTypeOAuth,
+		Extra: map[string]any{
+			"account_uuid":            "account-relay",
+			"custom_base_url_enabled": true,
+			"custom_base_url":         "https://relay.example.com",
+		},
+	}
+	metadataUserID := FormatMetadataUserID(
+		"relay-device",
+		"account-relay",
+		"11111111-2222-4333-8444-555555555555",
+		claude.CLICurrentVersion,
+	)
+	body := []byte(`{
+		"model":"claude-opus-4-8",
+		"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.208.abc; cc_entrypoint=cli; cch=12345;"}],
+		"metadata":{"user_id":` + strconvQuote(metadataUserID) + `},
+		"messages":[{"role":"user","content":"Hello"}]
+	}`)
+
+	req, outBody, err := svc.buildUpstreamRequest(
+		context.Background(), c, account, body,
+		"synthetic-token", "oauth", "claude-opus-4-8", true, true,
+	)
+
+	require.NoError(t, err)
+	require.Equal(t, "relay.example.com", req.URL.Hostname())
+	require.Empty(t, getHeaderRaw(req.Header, "x-client-request-id"))
+	require.NotContains(t, billingSystemText(outBody), "cch=")
+	require.Equal(t,
+		ParseMetadataUserID(gjson.GetBytes(outBody, "metadata.user_id").String()).SessionID,
+		getHeaderRaw(req.Header, "x-claude-code-session-id"),
+	)
+}
+
+func TestApplyClaudeCodeMimicHeadersUsesRequestRetryCount(t *testing.T) {
+	ctx := withClaudeCodeRetryCount(context.Background(), 3)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, claudeAPIURL, nil)
+	require.NoError(t, err)
+
+	applyClaudeCodeMimicHeaders(req)
+
+	require.Equal(t, "3", getHeaderRaw(req.Header, "x-stainless-retry-count"))
+}
+
+func TestClaudeCodeBodyUsesCacheTTLInspectsCacheControlFieldsOnly(t *testing.T) {
+	require.True(t, claudeCodeBodyUsesCacheTTL(
+		[]byte(`{"system":[{"type":"text","text":"cached","cache_control":{"type":"ephemeral","ttl":"1h"}}]}`),
+		"1h",
+	))
+	require.False(t, claudeCodeBodyUsesCacheTTL(
+		[]byte(`{"messages":[{"role":"user","content":"literal text: \"ttl\":\"1h\""}]}`),
+		"1h",
+	))
 }
 
 func TestBuildUpstreamRequest_MimicRejectsMissingMetadataSession(t *testing.T) {

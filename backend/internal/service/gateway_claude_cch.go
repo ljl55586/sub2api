@@ -15,8 +15,22 @@ const claudeCodeCCHPlaceholder = "cch=00000"
 
 var (
 	claudeCodeBillingCCHFieldRe   = regexp.MustCompile(`\bcch=[^;]*;`)
+	claudeCodeBillingCCHSegmentRe = regexp.MustCompile(`\s+cch=[^;]*;`)
 	claudeCodeBillingEntrypointRe = regexp.MustCompile(`\bcc_entrypoint=[^;]*;`)
 )
+
+func stripClaudeCodeCCH(body []byte) []byte {
+	billingIndex, billingText, ok := findClaudeCodeBillingSystemBlock(body)
+	if !ok || !claudeCodeBillingCCHSegmentRe.MatchString(billingText) {
+		return body
+	}
+	nextText := claudeCodeBillingCCHSegmentRe.ReplaceAllString(billingText, "")
+	next, ok := setJSONValueBytes(body, fmt.Sprintf("system.%d.text", billingIndex), nextText)
+	if !ok {
+		return body
+	}
+	return next
+}
 
 // finalizeClaudeCodeCCH applies Claude Code's native client-attestation step to
 // exact finalized JSON bytes. It first normalizes the billing token to the

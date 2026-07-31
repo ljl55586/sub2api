@@ -134,7 +134,7 @@ func TestClaudeOAuthIncomingContainsRuntimeHistory_DifferentAnchorStillRequiresH
 	require.False(t, claudeOAuthIncomingContainsRuntimeHistory(incoming, stored))
 }
 
-func TestPrepareClaudeOAuthRuntime_ConcurrentTurnCannotOverwriteTranscript(t *testing.T) {
+func TestPrepareClaudeOAuthRuntime_ConcurrentTurnIsRejected(t *testing.T) {
 	store := newCompanionClaimStoreForTest()
 	svc := &GatewayService{cache: store}
 	body := []byte(`{"messages":[{"role":"user","content":"same conversation"}]}`)
@@ -146,7 +146,7 @@ func TestPrepareClaudeOAuthRuntime_ConcurrentTurnCannotOverwriteTranscript(t *te
 	require.True(t, turn1.Claimed)
 
 	turn2, hydrated, err := svc.prepareClaudeOAuthRuntime(context.Background(), nil, second, 79, "device-a", body)
-	require.NoError(t, err)
+	require.ErrorIs(t, err, errClaudeOAuthRuntimeTurnBusy)
 	require.NotNil(t, turn2)
 	require.False(t, turn2.Claimed)
 	require.Equal(t, turn1.SessionID, turn2.SessionID)
@@ -255,6 +255,36 @@ func TestClaudeOAuthStreamContentCollector_PreservesThinkingSignatureAndToolInpu
 	require.Equal(t, "signed", gjson.GetBytes(content, "0.signature").String())
 	require.Equal(t, "Read", gjson.GetBytes(content, "1.name").String())
 	require.Equal(t, "a.go", gjson.GetBytes(content, "1.input.file_path").String())
+}
+
+func TestFinalizeClaudeOAuthRuntimeMessagesStripsWireOnlyReminderAndCache(t *testing.T) {
+	reminder := buildClaudeCode208SystemReminder(claudeCode208SessionFacts{CurrentDate: "2026-07-29"})
+	body, err := json.Marshal(map[string]any{
+		"messages": []map[string]any{{
+			"role": "user",
+			"content": []map[string]any{
+				{"type": "text", "text": reminder},
+				{
+					"type":          "text",
+					"text":          "human question",
+					"cache_control": map[string]any{"type": "ephemeral", "ttl": "1h"},
+				},
+			},
+		}},
+	})
+	require.NoError(t, err)
+	turn := &claudeOAuthRuntimeTurn{Claimed: true}
+
+	require.NoError(t, finalizeClaudeOAuthRuntimeRequestMessages(turn, body))
+	require.NotContains(t, string(turn.RequestMessages), "system-reminder")
+	require.NotContains(t, string(turn.RequestMessages), "cache_control")
+	require.Equal(t, "human question", gjson.GetBytes(turn.RequestMessages, "0.content.0.text").String())
+
+	nextBody := []byte(`{"messages":[{"role":"user","content":"human question"},{"role":"user","content":"next question"}]}`)
+	hydrated, _, err := hydrateClaudeOAuthRuntimeTranscript(nextBody, turn.RequestMessages)
+	require.NoError(t, err)
+	require.Len(t, gjson.GetBytes(hydrated, "messages").Array(), 2)
+	require.Equal(t, "next question", gjson.GetBytes(hydrated, "messages.1.content").String())
 }
 
 func mustParseClaudeOAuthRuntimeRequest(t *testing.T, body []byte) *ParsedRequest {

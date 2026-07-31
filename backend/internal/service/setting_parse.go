@@ -737,7 +737,7 @@ func (s *SettingService) parseSettings(settings map[string]string) *SystemSettin
 
 	// Gateway forwarding behavior (defaults: fingerprint=true, metadata_passthrough=false,
 	// legacy cch_signing=false, claude_oauth_system_prompt_injection=true).
-	// CCH itself is mandatory in the atomic 2.1.161 mimic profile; the stored
+	// CCH itself is mandatory in the atomic 2.1.208 mimic profile; the stored
 	// legacy setting no longer controls wire behavior.
 	if v, ok := settings[SettingKeyEnableFingerprintUnification]; ok && v != "" {
 		result.EnableFingerprintUnification = v == "true"

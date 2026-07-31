@@ -454,7 +454,7 @@ const (
 	SettingKeyEnableFingerprintUnification = "enable_fingerprint_unification"
 	// SettingKeyEnableMetadataPassthrough 是否透传客户端原始 metadata.user_id（默认 false）
 	SettingKeyEnableMetadataPassthrough = "enable_metadata_passthrough"
-	// SettingKeyEnableCCHSigning 已废弃（no-op）：2.1.161 原子 profile 必须始终按其
+	// SettingKeyEnableCCHSigning 已废弃（no-op）：2.1.208 原子 profile 必须始终按其
 	// 固定 seed 签名 CCH，不能独立关闭并制造混合版本请求。保留该 key 仅为配置向后兼容。
 	SettingKeyEnableCCHSigning = "enable_cch_signing"
 	// SettingKeyEnableClaudeOAuthSystemPromptInjection 是否对 Claude OAuth mimic 路径注入 Claude Code system blocks（默认 true）

@@ -406,7 +406,7 @@ func TestGatewayServiceForward_UpstreamApprovalHonorsDelayAndCompanionFailuresFa
 	})
 }
 
-func TestGatewayServiceForward_UpstreamApprovalWithoutCompanionsIsMainOnly(t *testing.T) {
+func TestGatewayServiceForward_UpstreamApprovalWithoutQuotaIncludesEligibleTitle(t *testing.T) {
 	svc, c, account, _, upstream := newClaudeOAuthCompanionForwardHarness(t)
 	approvalDir := t.TempDir()
 	svc.claudeUpstreamApproval = &claudeUpstreamApprovalGate{
@@ -416,6 +416,7 @@ func TestGatewayServiceForward_UpstreamApprovalWithoutCompanionsIsMainOnly(t *te
 	}
 	c.Request.Header.Set(claudeUpstreamApprovalTokenHeader, "approval-secret")
 	c.Request.Header.Set(claudeUpstreamApprovalIDHeader, "sonnet-turn")
+	c.Request.Header.Del(claudeOAuthSessionInitHeader)
 	parsed := newClaudeOAuthCompanionParsedRequest(
 		t,
 		"claude-sonnet-4-6",
@@ -438,14 +439,21 @@ func TestGatewayServiceForward_UpstreamApprovalWithoutCompanionsIsMainOnly(t *te
 		filepath.Join(approvalDir, "sonnet-turn-s01.preview.json"),
 	)
 	require.Equal(t, 0, upstream.Count())
-	require.Len(t, preview.Requests, 1)
-	require.Equal(t, "main", preview.Requests[0].Kind)
+	require.Len(t, preview.Requests, 2)
+	require.Equal(t, []string{"title", "main"}, []string{
+		preview.Requests[0].Kind,
+		preview.Requests[1].Kind,
+	})
 
 	writeClaudeUpstreamApprovalMarker(t, filepath.Join(approvalDir, "sonnet-turn-s01.approve"))
 	outcome := <-done
 	require.NoError(t, outcome.err)
 	require.NotNil(t, outcome.result)
-	require.Equal(t, 1, upstream.Count())
+	require.Equal(t, 2, upstream.Count())
+	require.Equal(t, []string{"title", "main"}, []string{
+		upstream.Snapshot()[0].kind,
+		upstream.Snapshot()[1].kind,
+	})
 }
 
 func waitForClaudeUpstreamApprovalPreview(

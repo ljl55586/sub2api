@@ -138,7 +138,7 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 	}
 
 	body := parsed.Body.Bytes()
-	titleCandidateTextBeforeMimic := extractLastUserText(body)
+	titleCandidateTextBeforeMimic := ""
 	replaceBody := func(next []byte) error {
 		if err := parsed.ReplaceBody(next); err != nil {
 			return fmt.Errorf("rewrite request body: %w", err)
@@ -212,6 +212,18 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 			body,
 		)
 		if runtimeErr != nil {
+			if errors.Is(runtimeErr, errClaudeOAuthRuntimeTurnBusy) {
+				if c != nil {
+					c.JSON(http.StatusConflict, gin.H{
+						"type": "error",
+						"error": gin.H{
+							"type":    "claude_session_busy",
+							"message": "This Claude session already has an active main turn",
+						},
+					})
+				}
+				return nil, runtimeErr
+			}
 			logger.LegacyPrintf("service.gateway", "Claude OAuth runtime unavailable; falling back to request-local history: account_id=%d error=%v", account.ID, runtimeErr)
 		} else if runtimeTurn != nil {
 			oauthRuntimeTurn = runtimeTurn
@@ -229,6 +241,7 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 			}
 		}
 	}
+	titleCandidateTextBeforeMimic = extractClaudeOAuthTitleTranscript(body)
 
 	if shouldMimicClaudeCode {
 		// The normalizer removes tool_choice when tools is empty. Preserve the
@@ -244,12 +257,19 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 		systemRewritten := false
 		systemPrompt := ""
 		systemPromptBlocks := ""
+		useClaudeCode208SimpleProfile := false
 		if !strings.Contains(strings.ToLower(reqModel), "haiku") {
 			systemRaw, _ := parsed.SystemValue()
 			systemPromptInjectionEnabled, configuredSystemPrompt, configuredSystemPromptBlocks := s.claudeOAuthSystemPromptInjectionSettings(ctx)
 			systemPrompt = configuredSystemPrompt
 			systemPromptBlocks = configuredSystemPromptBlocks
-			if systemPromptInjectionEnabled {
+			useClaudeCode208SimpleProfile = systemPromptInjectionEnabled &&
+				profileCandidateBeforeNormalize &&
+				isClaudeCode208DirectOAuthAccount(account) &&
+				!metadataPassthroughEnabled &&
+				strings.TrimSpace(systemPrompt) == "" &&
+				strings.TrimSpace(systemPromptBlocks) == ""
+			if systemPromptInjectionEnabled && !useClaudeCode208SimpleProfile {
 				if err := replaceBody(rewriteSystemForNonClaudeCodeWithPromptBlocks(body, systemRaw, systemPrompt, systemPromptBlocks)); err != nil {
 					return nil, err
 				}
@@ -287,32 +307,45 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 			return nil, err
 		}
 
-		// D/E/F: 可选 messages cache 策略 + 工具名混淆 + tools[-1] 断点
-		// 与 forward_as_chat_completions / forward_as_responses 路径对齐，
-		// 原生 /v1/messages 路径也走同一套可配置字段级改写。
-		if err := replaceBody(s.rewriteMessageCacheControlIfEnabled(ctx, body)); err != nil {
-			return nil, err
-		}
-		if profileCandidateBeforeNormalize {
-			useDefaultSystemBlocks := systemRewritten &&
-				strings.TrimSpace(systemPrompt) == "" &&
-				strings.TrimSpace(systemPromptBlocks) == ""
-			if profiledBody, applied := applyClaudeOAuthNoToolsMainProfile(body, reqModel, useDefaultSystemBlocks); applied {
+		if useClaudeCode208SimpleProfile {
+			startedAt := time.Time{}
+			if oauthRuntimeTurn != nil && oauthRuntimeTurn.StartedAtUnix > 0 {
+				startedAt = time.Unix(oauthRuntimeTurn.StartedAtUnix, 0)
+			}
+			facts := resolveClaudeCode208SessionFacts(c, account, startedAt)
+			if profiledBody, applied := applyClaudeOAuthNoToolsMainProfileWithFacts(body, reqModel, true, facts); applied {
 				if err := replaceBody(profiledBody); err != nil {
 					return nil, err
 				}
-			}
-		}
-		if rw := buildToolNameRewriteFromBody(body); rw != nil {
-			if err := replaceBody(applyToolNameRewriteToBody(body, rw)); err != nil {
-				return nil, err
-			}
-			if c != nil {
-				c.Set(toolNameRewriteKey, rw)
+				caps := claude.ResolveClaudeCodeModelCapabilities(reqModel)
+				reqModel = caps.APIModelID()
+				parsed.Model = reqModel
+				if c != nil {
+					c.Set(claudeCode208Context1MKey, resolveClaudeCode208Context1M(c, originalModel))
+					c.Set(claudeCode208SimpleProfileKey, true)
+				}
+			} else {
+				return nil, fmt.Errorf("build Claude Code 2.1.208 SIMPLE no-tools request")
 			}
 		} else {
-			if err := replaceBody(applyToolsLastCacheBreakpoint(body)); err != nil {
+			// Legacy/custom prompt path retains its opt-in cache and tool
+			// compatibility behavior. It must not run after the 2.1.208 SIMPLE
+			// assembler because that would add a second cache marker or mutate
+			// the canonical no-tools body.
+			if err := replaceBody(s.rewriteMessageCacheControlIfEnabled(ctx, body)); err != nil {
 				return nil, err
+			}
+			if rw := buildToolNameRewriteFromBody(body); rw != nil {
+				if err := replaceBody(applyToolNameRewriteToBody(body, rw)); err != nil {
+					return nil, err
+				}
+				if c != nil {
+					c.Set(toolNameRewriteKey, rw)
+				}
+			} else {
+				if err := replaceBody(applyToolsLastCacheBreakpoint(body)); err != nil {
+					return nil, err
+				}
 			}
 		}
 	}
@@ -433,6 +466,12 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 		}
 	}
 
+	if oauthRuntimeTurn != nil && oauthRuntimeTurn.Claimed {
+		if err := finalizeClaudeOAuthRuntimeRequestMessages(oauthRuntimeTurn, body); err != nil {
+			return nil, fmt.Errorf("finalize Claude OAuth runtime messages: %w", err)
+		}
+	}
+
 	// 重试循环
 	var resp *http.Response
 	lastWireBody := body
@@ -443,6 +482,7 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 		var startupMainReady <-chan struct{}
 		// 构建上游请求（每次重试需要重新构建，因为请求体需要重新读取）
 		upstreamCtx, releaseUpstreamCtx := detachStreamUpstreamContext(ctx, reqStream)
+		upstreamCtx = withClaudeCodeRetryCount(upstreamCtx, attempt-1)
 		upstreamReq, wireBody, err := s.buildUpstreamRequest(upstreamCtx, c, account, body, token, tokenType, reqModel, reqStream, shouldMimicClaudeCode)
 		releaseUpstreamCtx()
 		if err != nil {
@@ -606,6 +646,7 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 
 					filteredBody := FilterThinkingBlocksForRetry(body, reqModel)
 					retryCtx, releaseRetryCtx := detachStreamUpstreamContext(ctx, reqStream)
+					retryCtx = withClaudeCodeRetryCount(retryCtx, attempt)
 					retryReq, retryWireBody, buildErr := s.buildUpstreamRequest(retryCtx, c, account, filteredBody, token, tokenType, reqModel, reqStream, shouldMimicClaudeCode)
 					releaseRetryCtx()
 					if buildErr == nil {
@@ -647,6 +688,7 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 									logger.LegacyPrintf("service.gateway", "Account %d: signature retry still failing and looks tool-related, retrying with tool blocks downgraded", account.ID)
 									filteredBody2 := FilterSignatureSensitiveBlocksForRetry(body, reqModel)
 									retryCtx2, releaseRetryCtx2 := detachStreamUpstreamContext(ctx, reqStream)
+									retryCtx2 = withClaudeCodeRetryCount(retryCtx2, attempt+1)
 									retryReq2, retryWireBody2, buildErr2 := s.buildUpstreamRequest(retryCtx2, c, account, filteredBody2, token, tokenType, reqModel, reqStream, shouldMimicClaudeCode)
 									releaseRetryCtx2()
 									if buildErr2 == nil {
@@ -726,6 +768,7 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 					if applied && time.Since(retryStart) < maxRetryElapsed {
 						logger.LegacyPrintf("service.gateway", "Account %d: detected budget_tokens constraint error, retrying with rectified budget (budget_tokens=%d, max_tokens=%d)", account.ID, BudgetRectifyBudgetTokens, BudgetRectifyMaxTokens)
 						budgetRetryCtx, releaseBudgetRetryCtx := detachStreamUpstreamContext(ctx, reqStream)
+						budgetRetryCtx = withClaudeCodeRetryCount(budgetRetryCtx, attempt)
 						budgetRetryReq, budgetWireBody, buildErr := s.buildUpstreamRequest(budgetRetryCtx, c, account, rectifiedBody, token, tokenType, reqModel, reqStream, shouldMimicClaudeCode)
 						releaseBudgetRetryCtx()
 						if buildErr == nil {

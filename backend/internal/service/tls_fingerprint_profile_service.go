@@ -190,8 +190,10 @@ func (s *TLSFingerprintProfileService) ResolveTLSProfile(account *Account) *tlsf
 			return p
 		}
 	}
-	// TLS 启用但无绑定 profile → 空 Profile → dialer 使用内置默认值
-	return &tlsfingerprint.Profile{Name: "Built-in Default (Node.js 24.x)"}
+	// The 2.1.208 compatibility profile currently reuses the verified Node 24
+	// ClientHello parameters. The explicit provisional name prevents operators
+	// from mistaking it for a fully captured 2.1.208 Bun/native HTTP profile.
+	return tlsfingerprint.ClaudeCode21208CompatibilityProfile()
 }
 
 // --- 缓存管理 ---
