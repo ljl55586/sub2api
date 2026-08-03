@@ -128,6 +128,36 @@ docker compose -f docker-compose.local.yml logs -f sub2api
 
 **Recommendation:** Use `docker-compose.local.yml` (deployed by `docker-deploy.sh`) for easier data management and migration.
 
+### Optional OpenAI Request Capture
+
+Set the following value in `.env` only while troubleshooting:
+
+```bash
+SUB2API_OPENAI_REQUEST_CAPTURE_DIR=/app/data/logs/openai-request-capture
+```
+
+Recreate the application container so it receives the environment variable:
+
+```bash
+docker compose up -d --no-deps --force-recreate sub2api
+```
+
+The capture directory contains separate JSONL files for downstream and upstream
+requests. A new pair is opened every hour in the container timezone:
+
+```text
+openai-downstream-YYYYMMDD-HH.jsonl
+openai-upstream-YYYYMMDD-HH.jsonl
+```
+
+Each line contains one HTTP request or WebSocket request frame, including
+timestamp, request ID, URL, redacted headers, body SHA-256, body length, and the
+JSON body. Non-JSON bodies are stored as base64. Authorization, API key, proxy
+authorization, and cookie headers are redacted. Request bodies may still contain
+prompts, tool arguments, images, or other sensitive application data. Disable
+the variable and recreate the app after collecting the required evidence;
+retention and deletion are operator responsibilities.
+
 ### How Auto-Setup Works
 
 When using Docker Compose with `AUTO_SETUP=true`:
