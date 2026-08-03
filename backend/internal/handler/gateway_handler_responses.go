@@ -58,6 +58,7 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 		h.responsesErrorResponse(c, http.StatusBadRequest, "invalid_request_error", "Request body is empty")
 		return
 	}
+	h.gatewayService.CaptureDownstreamRequest(c, body)
 
 	setOpsRequestContext(c, "", false)
 

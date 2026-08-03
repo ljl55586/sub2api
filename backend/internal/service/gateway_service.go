@@ -728,6 +728,7 @@ type GatewayService struct {
 	channelService        *ChannelService
 	resolver              *ModelPricingResolver
 	compositeResolver     *CompositeRouteResolver
+	requestCapture        *claudeRequestCapture
 	debugGatewayBodyFile  atomic.Pointer[os.File] // non-nil when SUB2API_DEBUG_GATEWAY_BODY is set
 	tlsFPProfileService   *TLSFingerprintProfileService
 	balanceNotifyService  *BalanceNotifyService
@@ -799,6 +800,7 @@ func NewGatewayService(
 		channelService:        channelService,
 		resolver:              resolver,
 		compositeResolver:     compositeResolver,
+		requestCapture:        newClaudeRequestCaptureFromEnv(),
 		balanceNotifyService:  balanceNotifyService,
 		userPlatformQuotaRepo: userPlatformQuotaRepo,
 	}
