@@ -58,6 +58,7 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 		h.chatCompletionsErrorResponse(c, http.StatusBadRequest, "invalid_request_error", "Request body is empty")
 		return
 	}
+	h.gatewayService.CaptureDownstreamRequest(c, body)
 
 	setOpsRequestContext(c, "", false)
 
