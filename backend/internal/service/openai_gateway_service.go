@@ -411,6 +411,7 @@ type OpenAIGatewayService struct {
 	balanceNotifyService  *BalanceNotifyService
 	settingService        *SettingService
 	userPlatformQuotaRepo UserPlatformQuotaRepository
+	requestCapture        *openAIRequestCapture
 	liveAttestation       liveattestation.Provider
 	liveAttestationCipher SecretEncryptor
 
@@ -508,6 +509,7 @@ func NewOpenAIGatewayService(
 		balanceNotifyService:  balanceNotifyService,
 		settingService:        settingService,
 		userPlatformQuotaRepo: userPlatformQuotaRepo,
+		requestCapture:        newOpenAIRequestCaptureFromEnv(),
 		liveAttestation:       liveattestation.NewProvider(),
 		liveAttestationCipher: newLiveAttestationCipher(cfg),
 		responseHeaderFilter:  compileResponseHeaderFilter(cfg),
