@@ -325,6 +325,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		return nil, err
 	}
 
+	s.captureOpenAIUpstreamWebSocket(ctx, wsURL, wsHeaders, payloadAsJSONBytes(payload), account)
 	if err := lease.WriteJSONWithContextTimeout(ctx, payload, s.openAIWSWriteTimeout()); err != nil {
 		lease.MarkBroken()
 		logOpenAIWSModeInfo(
