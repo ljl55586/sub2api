@@ -4,6 +4,7 @@ package config
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"math"
@@ -924,6 +925,9 @@ type GatewayConfig struct {
 	// ForcedCodexInstructionsTemplate: 启动时从模板文件读取并缓存的模板内容。
 	// 该字段不直接参与配置反序列化，仅用于请求热路径避免重复读盘。
 	ForcedCodexInstructionsTemplate string `mapstructure:"-"`
+	// CurlCodexProfile: 将显式 opt-in 的通用 HTTP/curl Responses 请求规范化为
+	// 自洽的 Codex upstream 请求。默认关闭，避免改变现有 passthrough 行为。
+	CurlCodexProfile GatewayCurlCodexProfileConfig `mapstructure:"curl_codex_profile"`
 	// OpenAIPassthroughAllowTimeoutHeaders: OpenAI 透传模式是否放行客户端超时头
 	// 关闭（默认）可避免 x-stainless-timeout 等头导致上游提前断流。
 	OpenAIPassthroughAllowTimeoutHeaders bool `mapstructure:"openai_passthrough_allow_timeout_headers"`
@@ -1018,6 +1022,31 @@ type GatewayConfig struct {
 	// UserMessageQueue: 用户消息串行队列配置
 	// 对 role:"user" 的真实用户消息实施账号级串行化 + RPM 自适应延迟
 	UserMessageQueue UserMessageQueueConfig `mapstructure:"user_message_queue"`
+}
+
+// GatewayCurlCodexProfileConfig controls the opt-in curl/generic HTTP to Codex
+// request profile. Agent mode is capability-gated because advertising tools to
+// the model is only safe when the caller can execute the resulting tool loop.
+type GatewayCurlCodexProfileConfig struct {
+	Enabled                 bool   `mapstructure:"enabled"`
+	RequireOptInHeader      bool   `mapstructure:"require_opt_in_header"`
+	DefaultMode             string `mapstructure:"default_mode"`
+	DefaultModel            string `mapstructure:"default_model"`
+	DefaultReasoningEffort  string `mapstructure:"default_reasoning_effort"`
+	DefaultReasoningContext string `mapstructure:"default_reasoning_context"`
+	UserAgent               string `mapstructure:"user_agent"`
+	// ToolsTemplateFile overrides the direct/top-level tool schema used by
+	// non-Responses-Lite models such as GPT-5.5.
+	ToolsTemplateFile string `mapstructure:"tools_template_file"`
+	// ResponsesLiteToolsTemplateFile overrides the outer Code Mode tools that
+	// GPT-5.6 models carry in input.additional_tools.
+	ResponsesLiteToolsTemplateFile string `mapstructure:"responses_lite_tools_template_file"`
+	DeveloperContextFile           string `mapstructure:"developer_context_file"`
+	EnableRemoteCompactionV2       bool   `mapstructure:"enable_remote_compaction_v2"`
+	RequireToolLoopCapability      bool   `mapstructure:"require_tool_loop_capability"`
+	ToolsTemplate                  []byte `mapstructure:"-"`
+	ResponsesLiteToolsTemplate     []byte `mapstructure:"-"`
+	DeveloperContext               string `mapstructure:"-"`
 }
 
 type GatewayLiveConfig struct {
@@ -1773,6 +1802,60 @@ func load(allowMissingJWTSecret bool) (*Config, error) {
 		}
 		cfg.Gateway.ForcedCodexInstructionsTemplate = string(content)
 	}
+	curlProfile := &cfg.Gateway.CurlCodexProfile
+	curlProfile.DefaultMode = strings.ToLower(strings.TrimSpace(curlProfile.DefaultMode))
+	if curlProfile.DefaultMode != "text" && curlProfile.DefaultMode != "agent" {
+		return nil, fmt.Errorf("gateway.curl_codex_profile.default_mode must be text or agent")
+	}
+	curlProfile.DefaultModel = strings.TrimSpace(curlProfile.DefaultModel)
+	if curlProfile.Enabled && curlProfile.DefaultModel == "" {
+		return nil, fmt.Errorf("gateway.curl_codex_profile.default_model must not be empty when enabled")
+	}
+	curlProfile.DefaultReasoningEffort = strings.ToLower(strings.TrimSpace(curlProfile.DefaultReasoningEffort))
+	switch curlProfile.DefaultReasoningEffort {
+	case "low", "medium", "high", "xhigh":
+	default:
+		return nil, fmt.Errorf("gateway.curl_codex_profile.default_reasoning_effort must be low, medium, high, or xhigh")
+	}
+	curlProfile.DefaultReasoningContext = strings.ToLower(strings.TrimSpace(curlProfile.DefaultReasoningContext))
+	switch curlProfile.DefaultReasoningContext {
+	case "all_turns", "current_turn":
+	default:
+		return nil, fmt.Errorf("gateway.curl_codex_profile.default_reasoning_context must be all_turns or current_turn")
+	}
+	curlProfile.UserAgent = strings.TrimSpace(curlProfile.UserAgent)
+	curlProfile.ToolsTemplateFile = strings.TrimSpace(curlProfile.ToolsTemplateFile)
+	if curlProfile.ToolsTemplateFile != "" {
+		content, err := os.ReadFile(curlProfile.ToolsTemplateFile)
+		if err != nil {
+			return nil, fmt.Errorf("read curl codex tools template %q: %w", curlProfile.ToolsTemplateFile, err)
+		}
+		var tools []json.RawMessage
+		if err := json.Unmarshal(content, &tools); err != nil || len(tools) == 0 {
+			return nil, fmt.Errorf("curl codex tools template %q must be a non-empty JSON array", curlProfile.ToolsTemplateFile)
+		}
+		curlProfile.ToolsTemplate = content
+	}
+	curlProfile.ResponsesLiteToolsTemplateFile = strings.TrimSpace(curlProfile.ResponsesLiteToolsTemplateFile)
+	if curlProfile.ResponsesLiteToolsTemplateFile != "" {
+		content, err := os.ReadFile(curlProfile.ResponsesLiteToolsTemplateFile)
+		if err != nil {
+			return nil, fmt.Errorf("read curl codex responses lite tools template %q: %w", curlProfile.ResponsesLiteToolsTemplateFile, err)
+		}
+		var tools []json.RawMessage
+		if err := json.Unmarshal(content, &tools); err != nil || len(tools) == 0 {
+			return nil, fmt.Errorf("curl codex responses lite tools template %q must be a non-empty JSON array", curlProfile.ResponsesLiteToolsTemplateFile)
+		}
+		curlProfile.ResponsesLiteToolsTemplate = content
+	}
+	curlProfile.DeveloperContextFile = strings.TrimSpace(curlProfile.DeveloperContextFile)
+	if curlProfile.DeveloperContextFile != "" {
+		content, err := os.ReadFile(curlProfile.DeveloperContextFile)
+		if err != nil {
+			return nil, fmt.Errorf("read curl codex developer context %q: %w", curlProfile.DeveloperContextFile, err)
+		}
+		curlProfile.DeveloperContext = string(content)
+	}
 
 	// 兼容旧键 gateway.openai_ws.sticky_previous_response_ttl_seconds。
 	// 新键未配置（<=0）时回退旧键；新键优先。
@@ -2227,6 +2310,18 @@ func setDefaults() {
 	viper.SetDefault("gateway.force_codex_cli", false)
 	viper.SetDefault("gateway.disable_codex_originator_normalization", false)
 	viper.SetDefault("gateway.codex_image_generation_bridge_enabled", false)
+	viper.SetDefault("gateway.curl_codex_profile.enabled", false)
+	viper.SetDefault("gateway.curl_codex_profile.require_opt_in_header", true)
+	viper.SetDefault("gateway.curl_codex_profile.default_mode", "text")
+	viper.SetDefault("gateway.curl_codex_profile.default_model", "gpt-5.6-sol")
+	viper.SetDefault("gateway.curl_codex_profile.default_reasoning_effort", "high")
+	viper.SetDefault("gateway.curl_codex_profile.default_reasoning_context", "all_turns")
+	viper.SetDefault("gateway.curl_codex_profile.user_agent", "")
+	viper.SetDefault("gateway.curl_codex_profile.tools_template_file", "")
+	viper.SetDefault("gateway.curl_codex_profile.responses_lite_tools_template_file", "")
+	viper.SetDefault("gateway.curl_codex_profile.developer_context_file", "")
+	viper.SetDefault("gateway.curl_codex_profile.enable_remote_compaction_v2", false)
+	viper.SetDefault("gateway.curl_codex_profile.require_tool_loop_capability", true)
 	viper.SetDefault("gateway.openai_passthrough_allow_timeout_headers", false)
 	viper.SetDefault("gateway.openai_compact_model", "gpt-5.4")
 	viper.SetDefault("gateway.live.max_session_duration_seconds", 3600)

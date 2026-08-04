@@ -64,6 +64,14 @@ var instructionsGPT52 string
 //go:embed instructions_gpt5_5.txt
 var instructionsGPT55 string
 
+// instructionsGPT56Codex0145 is the exact main developer prompt emitted by
+// Codex CLI 0.145.0 for the GPT-5.6 Responses Lite request shape. Keep it
+// versioned: the CLI prompt is a client/runtime asset, not a model-global
+// default that should silently change unrelated gateway paths.
+//
+//go:embed instructions_gpt5_6_codex_0_145.txt
+var instructionsGPT56Codex0145 string
+
 // latestCodexInstructions 返回当前已知最新版本的 Codex base instructions，
 // 当前为 GPT-5.5；若 5.5 prompt 意外为空则回退到 DefaultInstructions 保证非空。
 func latestCodexInstructions() string {
@@ -98,4 +106,17 @@ func CodexBaseInstructionsForModel(model string) string {
 		}
 	}
 	return latestCodexInstructions()
+}
+
+// CodexCLI0145BaseInstructionsForModel returns the prompt used by the curl
+// Codex 0.145 compatibility profile. GPT-5.6 uses the exact captured 0.145.0
+// CLI prompt; other models retain the existing model-aware fallback logic.
+func CodexCLI0145BaseInstructionsForModel(model string) string {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if strings.HasPrefix(m, "gpt-5.6") {
+		if v := strings.TrimSpace(instructionsGPT56Codex0145); v != "" {
+			return instructionsGPT56Codex0145
+		}
+	}
+	return CodexBaseInstructionsForModel(model)
 }

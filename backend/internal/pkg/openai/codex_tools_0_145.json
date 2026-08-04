@@ -1,0 +1,399 @@
+[
+  {
+    "description": "Runs a command in a PTY, returning output or a session ID for ongoing interaction.",
+    "name": "exec_command",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "cmd": {
+          "description": "Shell command to execute.",
+          "type": "string"
+        },
+        "justification": {
+          "description": "User-facing approval question for `require_escalated`; omit otherwise.",
+          "type": "string"
+        },
+        "login": {
+          "description": "True runs the shell with -l/-i semantics; false disables them. Defaults to true.",
+          "type": "boolean"
+        },
+        "max_output_tokens": {
+          "description": "Output token budget. Defaults to 10000 tokens; larger requests may be capped by policy.",
+          "type": "number"
+        },
+        "prefix_rule": {
+          "description": "Reusable approval prefix for `cmd`, only with `sandbox_permissions: \"require_escalated\"`; for example [\"git\", \"pull\"].",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "sandbox_permissions": {
+          "description": "Per-command sandbox override. Defaults to `use_default`; use `require_escalated` for unsandboxed execution.",
+          "enum": [
+            "use_default",
+            "require_escalated"
+          ],
+          "type": "string"
+        },
+        "shell": {
+          "description": "Shell binary to launch. Defaults to the user's default shell.",
+          "type": "string"
+        },
+        "tty": {
+          "description": "True allocates a PTY for the command; false or omitted uses plain pipes.",
+          "type": "boolean"
+        },
+        "workdir": {
+          "description": "Working directory for the command. Defaults to the turn cwd.",
+          "type": "string"
+        },
+        "yield_time_ms": {
+          "description": "Wait before yielding output. Defaults to 10000 ms; effective range is 250-30000 ms.",
+          "type": "number"
+        }
+      },
+      "required": [
+        "cmd"
+      ],
+      "type": "object"
+    },
+    "strict": false,
+    "type": "function"
+  },
+  {
+    "description": "Writes characters to an existing unified exec session and returns recent output.",
+    "name": "write_stdin",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "chars": {
+          "description": "Bytes to write to stdin. Defaults to empty, which polls without writing.",
+          "type": "string"
+        },
+        "max_output_tokens": {
+          "description": "Output token budget. Defaults to 10000 tokens; larger requests may be capped by policy.",
+          "type": "number"
+        },
+        "session_id": {
+          "description": "Identifier of the running unified exec session.",
+          "type": "number"
+        },
+        "yield_time_ms": {
+          "description": "Wait before yielding output. Non-empty writes default to 250 ms and cap at 30000 ms; empty polls wait 5000-300000 ms by default.",
+          "type": "number"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "strict": false,
+    "type": "function"
+  },
+  {
+    "description": "Lists resources provided by MCP servers. Resources allow servers to share data that provides context to language models, such as files, database schemas, or application-specific information. Prefer resources over web search when possible.",
+    "name": "list_mcp_resources",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "cursor": {
+          "description": "Opaque cursor from a previous list_mcp_resources call; omit for the first page.",
+          "type": "string"
+        },
+        "server": {
+          "description": "MCP server name. Omit to list resources from every configured server.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "strict": false,
+    "type": "function"
+  },
+  {
+    "description": "Lists resource templates provided by MCP servers. Parameterized resource templates allow servers to share data that takes parameters and provides context to language models, such as files, database schemas, or application-specific information. Prefer resource templates over web search when possible.",
+    "name": "list_mcp_resource_templates",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "cursor": {
+          "description": "Opaque cursor from a previous list_mcp_resource_templates call; omit for the first page.",
+          "type": "string"
+        },
+        "server": {
+          "description": "MCP server name. Omit to list resource templates from every configured server.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "strict": false,
+    "type": "function"
+  },
+  {
+    "description": "Read a specific resource from an MCP server given the server name and resource URI.",
+    "name": "read_mcp_resource",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "server": {
+          "description": "MCP server name exactly as configured. Must match the 'server' field returned by list_mcp_resources.",
+          "type": "string"
+        },
+        "uri": {
+          "description": "Resource URI to read. Must be one of the URIs returned by list_mcp_resources.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "server",
+        "uri"
+      ],
+      "type": "object"
+    },
+    "strict": false,
+    "type": "function"
+  },
+  {
+    "description": "Updates the task plan.\nProvide an optional explanation and a list of plan items, each with a step and status.\nAt most one step can be in_progress at a time.\n",
+    "name": "update_plan",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "explanation": {
+          "description": "Optional explanation for this plan update.",
+          "type": "string"
+        },
+        "plan": {
+          "description": "The list of steps",
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "status": {
+                "description": "Step status.",
+                "enum": [
+                  "pending",
+                  "in_progress",
+                  "completed"
+                ],
+                "type": "string"
+              },
+              "step": {
+                "description": "Task step text.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "step",
+              "status"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "plan"
+      ],
+      "type": "object"
+    },
+    "strict": false,
+    "type": "function"
+  },
+  {
+    "description": "Request user input for one to three short questions and wait for the response. Set autoResolutionMs, from 60000 to 240000 milliseconds, only when the question is useful but non-blocking and continuing with best judgment is acceptable if the user does not answer; omit it when explicit user input is required. This tool is only available in Plan mode.",
+    "name": "request_user_input",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "autoResolutionMs": {
+          "description": "Optional auto-resolution window in milliseconds, from 60000 to 240000. Include this only when the question is useful but non-blocking and continuing with best judgment is acceptable if the user does not answer; omit it when explicit user input is required before continuing. Use 60000 for lightly helpful context and up to 240000 when the answer would materially unblock better work.",
+          "type": "number"
+        },
+        "questions": {
+          "description": "Questions to show the user. Prefer 1 and do not exceed 3",
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "header": {
+                "description": "Short header label shown in the UI (12 or fewer chars).",
+                "type": "string"
+              },
+              "id": {
+                "description": "Stable identifier for mapping answers (snake_case).",
+                "type": "string"
+              },
+              "options": {
+                "description": "Provide 2-3 mutually exclusive choices. Put the recommended option first and suffix its label with \"(Recommended)\". Do not include an \"Other\" option in this list; the client will add a free-form \"Other\" option automatically.",
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "description": {
+                      "description": "One short sentence explaining impact/tradeoff if selected.",
+                      "type": "string"
+                    },
+                    "label": {
+                      "description": "User-facing label (1-5 words).",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "label",
+                    "description"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "question": {
+                "description": "Single-sentence prompt shown to the user.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "header",
+              "question",
+              "options"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "questions"
+      ],
+      "type": "object"
+    },
+    "strict": false,
+    "type": "function"
+  },
+  {
+    "description": "The `apply_patch` tool can be used to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.",
+    "format": {
+      "definition": "start: begin_patch hunk+ end_patch\nbegin_patch: \"*** Begin Patch\" LF\nend_patch: \"*** End Patch\" LF?\n\nhunk: add_hunk | delete_hunk | update_hunk\nadd_hunk: \"*** Add File: \" filename LF add_line+\ndelete_hunk: \"*** Delete File: \" filename LF\nupdate_hunk: \"*** Update File: \" filename LF change_move? change?\n\nfilename: /(.+)/\nadd_line: \"+\" /(.*)/ LF -> line\n\nchange_move: \"*** Move to: \" filename LF\nchange: (change_context | change_line)+ eof_line?\nchange_context: (\"@@\" | \"@@ \" /(.+)/) LF\nchange_line: (\"+\" | \"-\" | \" \") /(.*)/ LF\neof_line: \"*** End of File\" LF\n\n%import common.LF\n",
+      "syntax": "lark",
+      "type": "grammar"
+    },
+    "name": "apply_patch",
+    "type": "custom"
+  },
+  {
+    "description": "View a local image file from the filesystem when visual inspection is needed. Use this for images already available on disk.",
+    "name": "view_image",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "detail": {
+          "description": "Image detail level. Defaults to `high`; use `original` to preserve exact resolution.",
+          "enum": [
+            "high",
+            "original"
+          ],
+          "type": "string"
+        },
+        "path": {
+          "description": "Local filesystem path to an image file.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "strict": false,
+    "type": "function"
+  },
+  {
+    "description": "Get the current goal for this thread, including status, budgets, token and elapsed-time usage, and remaining token budget.",
+    "name": "get_goal",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "strict": false,
+    "type": "function"
+  },
+  {
+    "description": "Create a goal only when explicitly requested by the user or system/developer instructions; do not infer goals from ordinary tasks.\nSet token_budget only when an explicit token budget is requested. Fails if an unfinished goal exists; use update_goal only for status.",
+    "name": "create_goal",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "objective": {
+          "description": "Required. The concrete objective to start pursuing. This starts a new active goal when no goal exists or replaces the current goal when it is complete.",
+          "type": "string"
+        },
+        "token_budget": {
+          "description": "Positive token budget for the new goal. Omit unless explicitly requested.",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "objective"
+      ],
+      "type": "object"
+    },
+    "strict": false,
+    "type": "function"
+  },
+  {
+    "description": "Update the existing goal.\nUse this tool only to mark the goal achieved or genuinely blocked.\nSet status to `complete` only when the objective has actually been achieved and no required work remains.\nSet status to `blocked` only when the same blocking condition has repeated for at least three consecutive goal turns, counting the original/user-triggered turn and any automatic continuations, and the agent cannot make meaningful progress without user input or an external-state change.\nIf the user resumes a goal that was previously marked `blocked`, treat the resumed run as a fresh blocked audit. If the same blocking condition then repeats for at least three consecutive resumed goal turns, set status to `blocked` again.\nOnce the blocked threshold is satisfied, do not keep reporting that you are still blocked while leaving the goal active; set status to `blocked`.\nDo not use `blocked` merely because the work is hard, slow, uncertain, incomplete, or would benefit from clarification.\nDo not mark a goal complete merely because its budget is nearly exhausted or because you are stopping work.\nYou cannot use this tool to pause, resume, budget-limit, or usage-limit a goal; those status changes are controlled by the user or system.\nWhen marking a budgeted goal achieved with status `complete`, report the final token usage from the tool result to the user.",
+    "name": "update_goal",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "description": "Required. Set to `complete` only when the objective is achieved and no required work remains. Set to `blocked` only after the same blocking condition has recurred for at least three consecutive goal turns and the agent is at an impasse. After a previously blocked goal is resumed, the resumed run starts a fresh blocked audit.",
+          "enum": [
+            "complete",
+            "blocked"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "type": "object"
+    },
+    "strict": false,
+    "type": "function"
+  },
+  {
+    "description": "# Tool discovery\n\nSearches over deferred tool metadata with BM25 and exposes matching tools for the next model call.\n\nYou have access to tools from the following sources:\n- Multi-agent tools: Spawn and manage sub-agents.\nSome of the tools may not have been provided to you upfront, and you should use this tool (`tool_search`) to search for the required tools. For MCP tool discovery, always use `tool_search` instead of `list_mcp_resources` or `list_mcp_resource_templates`.",
+    "execution": "client",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "limit": {
+          "description": "Maximum number of tools to return. Defaults to 8.",
+          "type": "number"
+        },
+        "query": {
+          "description": "Search query for deferred tools.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    },
+    "type": "tool_search"
+  },
+  {
+    "external_web_access": false,
+    "search_content_types": [
+      "text",
+      "image"
+    ],
+    "type": "web_search"
+  }
+]

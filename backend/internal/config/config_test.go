@@ -738,6 +738,86 @@ func TestLoadForcedCodexInstructionsTemplate(t *testing.T) {
 	require.Equal(t, "server-prefix\n\n{{ .ExistingInstructions }}", cfg.Gateway.ForcedCodexInstructionsTemplate)
 }
 
+func TestLoadCurlCodexProfileAssets(t *testing.T) {
+	resetViperWithJWTSecret(t)
+
+	tempDir := t.TempDir()
+	toolsPath := filepath.Join(tempDir, "codex-tools.json")
+	liteToolsPath := filepath.Join(tempDir, "codex-lite-tools.json")
+	developerPath := filepath.Join(tempDir, "developer-context.md")
+	configPath := filepath.Join(tempDir, "config.yaml")
+	require.NoError(t, os.WriteFile(toolsPath, []byte(`[{"type":"function","name":"shell"}]`), 0o644))
+	require.NoError(t, os.WriteFile(liteToolsPath, []byte(`[{"type":"custom","name":"exec"}]`), 0o644))
+	require.NoError(t, os.WriteFile(developerPath, []byte("truthful deployment context"), 0o644))
+	configYAML := fmt.Sprintf(`gateway:
+  curl_codex_profile:
+    enabled: true
+    require_opt_in_header: true
+    default_mode: agent
+    default_model: gpt-5.6-sol
+    default_reasoning_effort: high
+    default_reasoning_context: all_turns
+    tools_template_file: %q
+    responses_lite_tools_template_file: %q
+    developer_context_file: %q
+    enable_remote_compaction_v2: true
+    require_tool_loop_capability: true
+`, filepath.ToSlash(toolsPath), filepath.ToSlash(liteToolsPath), filepath.ToSlash(developerPath))
+	require.NoError(t, os.WriteFile(configPath, []byte(configYAML), 0o644))
+	t.Setenv("DATA_DIR", tempDir)
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	profile := cfg.Gateway.CurlCodexProfile
+	require.True(t, profile.Enabled)
+	require.Equal(t, "agent", profile.DefaultMode)
+	require.Equal(t, "gpt-5.6-sol", profile.DefaultModel)
+	require.Equal(t, "high", profile.DefaultReasoningEffort)
+	require.Equal(t, "all_turns", profile.DefaultReasoningContext)
+	require.JSONEq(t, `[{"type":"function","name":"shell"}]`, string(profile.ToolsTemplate))
+	require.JSONEq(t, `[{"type":"custom","name":"exec"}]`, string(profile.ResponsesLiteToolsTemplate))
+	require.Equal(t, "truthful deployment context", profile.DeveloperContext)
+	require.True(t, profile.EnableRemoteCompactionV2)
+}
+
+func TestLoadCurlCodexProfileRejectsInvalidToolsTemplate(t *testing.T) {
+	resetViperWithJWTSecret(t)
+
+	tempDir := t.TempDir()
+	toolsPath := filepath.Join(tempDir, "codex-tools.json")
+	configPath := filepath.Join(tempDir, "config.yaml")
+	require.NoError(t, os.WriteFile(toolsPath, []byte(`{"not":"an array"}`), 0o644))
+	configYAML := fmt.Sprintf(`gateway:
+  curl_codex_profile:
+    enabled: true
+    tools_template_file: %q
+`, filepath.ToSlash(toolsPath))
+	require.NoError(t, os.WriteFile(configPath, []byte(configYAML), 0o644))
+	t.Setenv("DATA_DIR", tempDir)
+
+	_, err := Load()
+	require.ErrorContains(t, err, "must be a non-empty JSON array")
+}
+
+func TestLoadCurlCodexProfileRejectsInvalidResponsesLiteToolsTemplate(t *testing.T) {
+	resetViperWithJWTSecret(t)
+
+	tempDir := t.TempDir()
+	toolsPath := filepath.Join(tempDir, "codex-lite-tools.json")
+	configPath := filepath.Join(tempDir, "config.yaml")
+	require.NoError(t, os.WriteFile(toolsPath, []byte(`{"not":"an array"}`), 0o644))
+	configYAML := fmt.Sprintf(`gateway:
+  curl_codex_profile:
+    enabled: true
+    responses_lite_tools_template_file: %q
+`, filepath.ToSlash(toolsPath))
+	require.NoError(t, os.WriteFile(configPath, []byte(configYAML), 0o644))
+	t.Setenv("DATA_DIR", tempDir)
+
+	_, err := Load()
+	require.ErrorContains(t, err, "responses lite tools template")
+}
+
 func TestLoadDefaultSecurityToggles(t *testing.T) {
 	resetViperWithJWTSecret(t)
 

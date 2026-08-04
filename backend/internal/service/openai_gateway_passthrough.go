@@ -36,6 +36,20 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 	reqStream bool,
 	startTime time.Time,
 ) (*OpenAIForwardResult, error) {
+	curlCodexMode, curlCodexEnabled, profileErr := s.resolveCurlCodexProfile(c)
+	if profileErr != nil {
+		writeCurlCodexProfileError(c, profileErr)
+		return nil, profileErr
+	}
+	if curlCodexEnabled && (account == nil || account.Type != AccountTypeOAuth) {
+		profileErr = &curlCodexProfileError{
+			status:  http.StatusBadRequest,
+			message: "curl Codex profile requires an OpenAI OAuth passthrough account",
+		}
+		writeCurlCodexProfileError(c, profileErr)
+		return nil, profileErr
+	}
+
 	upstreamPassthroughModel := ""
 	if isOpenAIResponsesCompactPath(c) {
 		compactMappedModel := resolveOpenAICompactForwardModel(account, reqModel)
@@ -51,7 +65,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 	}
 
 	if account != nil && account.Type == AccountTypeOAuth {
-		if rejectReason := detectOpenAIPassthroughInstructionsRejectReason(reqModel, body); rejectReason != "" {
+		if rejectReason := detectOpenAIPassthroughInstructionsRejectReason(reqModel, body); !curlCodexEnabled && rejectReason != "" {
 			rejectMsg := "OpenAI codex passthrough requires a non-empty instructions field"
 			MarkOpsClientBusinessLimited(c, OpsClientBusinessLimitedReasonLocalPolicyDenied)
 			logOpenAIPassthroughInstructionsRejected(ctx, c, account, reqModel, rejectReason, body)
@@ -63,7 +77,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 			})
 			return nil, fmt.Errorf("openai passthrough rejected before upstream: %s", rejectReason)
 		}
-		if isOpenAICodexModel(reqModel) && !gjson.GetBytes(body, "instructions").Exists() {
+		if !curlCodexEnabled && isOpenAICodexModel(reqModel) && !gjson.GetBytes(body, "instructions").Exists() {
 			nextBody, setErr := sjson.SetBytes(body, "instructions", defaultCodexSynthInstructions(reqModel))
 			if setErr != nil {
 				return nil, fmt.Errorf("set passthrough codex instructions: %w", setErr)
@@ -77,6 +91,14 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		}
 		if normalized {
 			body = normalizedBody
+		}
+		if curlCodexEnabled {
+			profiledBody, err := s.applyCurlCodexProfile(c, account, body, curlCodexMode)
+			if err != nil {
+				writeCurlCodexProfileError(c, err)
+				return nil, err
+			}
+			body = profiledBody
 		}
 		reqStream = gjson.GetBytes(body, "stream").Bool()
 	}
@@ -337,6 +359,7 @@ func (s *OpenAIGatewayService) buildUpstreamRequestOpenAIPassthrough(
 	body []byte,
 	token string,
 ) (*http.Request, error) {
+	curlCodexState, curlCodexEnabled := curlCodexProfileStateFromContext(c)
 	targetURL := openaiPlatformAPIURL
 	switch account.Type {
 	case AccountTypeOAuth:
@@ -398,6 +421,12 @@ func (s *OpenAIGatewayService) buildUpstreamRequestOpenAIPassthrough(
 		// 先保存客户端原始值，再做 compact 补充，避免后续统一隔离时读到已处理的值。
 		clientSessionID := strings.TrimSpace(req.Header.Get("session_id"))
 		clientConversationID := strings.TrimSpace(req.Header.Get("conversation_id"))
+		if curlCodexEnabled {
+			// A single full UUID is the source of truth for the body and both
+			// isolated upstream session headers. Ignore contradictory inbound IDs.
+			clientSessionID = curlCodexState.SessionID
+			clientConversationID = curlCodexState.SessionID
+		}
 		if isOpenAIResponsesCompactPath(c) {
 			req.Header.Set("accept", "application/json")
 			if req.Header.Get("version") == "" {
@@ -446,12 +475,23 @@ func (s *OpenAIGatewayService) buildUpstreamRequestOpenAIPassthrough(
 	// 浏览器型 UA 兜底：仅 OAuth（ChatGPT 内部接口）账号生效，若最终 user-agent 仍为浏览器
 	// （Chrome/Firefox/Safari/Edge 等），替换为后台配置的 Codex UA，避免 Cloudflare 触发 JS 质询。
 	s.overrideBrowserUserAgent(ctx, account, req)
+	if curlCodexEnabled {
+		// Seed the paired profile identity before the common OAuth
+		// pairing/normalization pass.
+		req.Header.Set("user-agent", curlCodexState.UserAgent)
+		req.Header.Set("originator", curlCodexState.Originator)
+	}
 
 	// 终态收口：originator 必须与最终 User-Agent 首段配套且为官方身份，非官方 UA 整体回退为
 	// 默认 Codex CLI 身份（承接原「非 Codex UA 安全兜底」，并修复其把 codex-tui 等官方 UA 改写为
 	// codex_cli_rs 造成的 originator 错配 404），详见 issue #3901。
 	if account.Type == AccountTypeOAuth {
 		enforceCodexIdentityHeaders(req.Header)
+	}
+	if curlCodexEnabled {
+		if err := applyCurlCodexProfileHeaders(c, req, getAPIKeyIDFromContext(c), curlCodexState); err != nil {
+			return nil, err
+		}
 	}
 
 	if req.Header.Get("content-type") == "" {

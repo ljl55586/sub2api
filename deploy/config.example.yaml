@@ -313,6 +313,59 @@ gateway:
   # Docker 用户可将宿主机文件挂载到 /app/data/codex-instructions.md.tmpl，
   # 然后把本字段指向该路径。
   forced_codex_instructions_template_file: ""
+  # Opt-in normalization for generic HTTP/curl requests sent through an OpenAI
+  # OAuth passthrough account. Disabled by default and never inferred merely
+  # from User-Agent, so existing clients keep their current semantics.
+  # 通用 HTTP/curl 请求对齐 Codex upstream 的显式配置；默认关闭，不会仅凭 UA 自动启用。
+  curl_codex_profile:
+    enabled: false
+    # When true, callers must send X-Sub2API-Codex-Profile: text|agent.
+    # true 时，调用方必须显式发送 X-Sub2API-Codex-Profile: text|agent。
+    # Agent callers must also declare only capabilities they truly implement.
+    # GPT-5.6 Code Mode requires at least:
+    # X-Sub2API-Codex-Capabilities: tool-loop,encrypted-reasoning,code-mode-exec,async-wait
+    # Add interactive-input when the client can pause and collect user input;
+    # add multi-agent only when it implements the collaboration namespace.
+    # GPT-5.5 direct tools use direct-tools instead of code-mode-exec/async-wait.
+    # Add remote-compaction-v2 only when the caller can preserve that state.
+    # To continue a session, send back the X-Sub2API-Codex-Session-Id returned
+    # by the previous response.
+    require_opt_in_header: true
+    default_mode: "text"
+    # Used only when the curl body omits the corresponding value.
+    # 仅当 curl body 未提供对应字段时使用。
+    default_model: "gpt-5.6-sol"
+    default_reasoning_effort: "high"
+    default_reasoning_context: "all_turns"
+    # Keep empty to reproduce the captured Codex CLI 0.145.0 Mac/VS Code
+    # identity. Set explicitly when a different official identity is required.
+    # 留空时复现捕获到的 Codex CLI 0.145.0 Mac/VS Code UA；如需其他官方身份请显式覆盖。
+    user_agent: ""
+    # Optional JSON array overriding the embedded GPT-5.5-style direct/top-level
+    # agent tool schema.
+    # 可选：覆盖 GPT-5.5 风格顶层 direct tools 的 JSON 数组文件。
+    tools_template_file: ""
+    # Optional JSON array overriding the GPT-5.6 Responses Lite outer Code Mode
+    # tools carried by input.additional_tools.
+    # 可选：覆盖 GPT-5.6 Responses Lite 中 input.additional_tools 的外层工具。
+    responses_lite_tools_template_file: ""
+    # Optional truthful developer context text supplied by the deployment.
+    # 可选：由部署方提供、内容真实的 developer context 文本文件。
+    developer_context_file: ""
+    # A caller that has a real local executor may additionally send a private
+    # sub2api_codex_context object in the request body. It is consumed locally
+    # and removed before forwarding. Supported fields are sandbox (none or
+    # seatbelt), workspaces, developer_messages (array of arrays of input-text
+    # blocks), and environment_context. Do not submit invented permissions,
+    # tools, skills, workspace paths, git state, or sandbox capabilities.
+    # 具备真实本地执行器的调用方还可在 body 中提交私有
+    # sub2api_codex_context；该对象只用于构造 Codex 上下文，转发前会删除。
+    # 支持 sandbox（none/seatbelt）、workspaces、developer_messages（二维文本
+    # 数组）和 environment_context。不得伪造权限、工具、skills、工作区或 git 状态。
+    # Inject remote_compaction_v2 only when both this switch and the caller's
+    # remote-compaction-v2 capability are present.
+    enable_remote_compaction_v2: false
+    require_tool_loop_capability: true
   # OpenAI 透传模式是否放行客户端超时头（如 x-stainless-timeout）
   # 默认 false：过滤超时头，降低上游提前断流风险。
   openai_passthrough_allow_timeout_headers: false
