@@ -57,6 +57,71 @@ Generate requests without accessing the API:
   --dry-run --min-delay 1 --max-delay 2
 ```
 
+## Two-turn interactive upstream review
+
+Use review mode when you want exactly two real API requests and need to inspect
+the final sub2api-style upstream request before each send:
+
+```bash
+./tools/codex-loadtest/run.sh \
+  https://sub2api.example.com/v1/responses \
+  sk-your-sub2api-key \
+  --review-two-turns \
+  --output-dir /absolute/new/review-output-directory
+```
+
+Review mode forces one session and two turns, disables the separate preflight,
+and skips the random delay. Before turn 1, it invokes an opt-in Go test that
+runs the production OAuth passthrough and curl Codex profile builders
+in-process against a recorder. No network request occurs during preview. The
+script saves the complete request body and redacted headers, prints their paths,
+and sends nothing unless the user types uppercase `YES`.
+
+After turn 1 is approved and completed, the script uses the real assistant SSE
+message to build turn 2, runs the same offline upstream preview again, and
+writes `prefix-report.json`. Turn 2 is blocked automatically unless all of the
+following are true:
+
+- the deployed gateway returns the expected `X-Sub2API-Codex-Session-Id`;
+- both turns use the same `prompt_cache_key`;
+- the complete first upstream `input` is the exact prefix of the second;
+- `model`, `reasoning`, `text`, `store`, `stream`, and the optional
+  `max_output_tokens` are unchanged.
+
+Per-turn review files are:
+
+```text
+sessions/<session-id>/turn-001/
+  request.json
+  upstream-preview.json
+  upstream-body.json
+  upstream-preview-build.log
+  review-decision.json
+  response.sse                 # only after approval and send
+
+sessions/<session-id>/turn-002/
+  request.json
+  upstream-preview.json
+  upstream-body.json
+  upstream-preview-build.log
+  prefix-report.json
+  review-decision.json
+  response.sse                 # only after approval and send
+```
+
+The preview subprocess does not inherit the real API key, and Authorization is
+redacted in `upstream-preview.json`. It uses a synthetic OAuth account so it can
+remain offline; account/device IDs, timestamps, and turn IDs are preview values.
+The body transformation, CLI prompt, input history, cache key, request field
+order, URL, and Codex profile headers are produced by the current checkout's
+production Go code. A separately deployed sub2api instance can still differ if
+it runs other source code or has deployment-specific developer context.
+
+Review mode requires the Go toolchain and this repository checkout. It cannot
+be combined with `--dry-run`, multiple scenarios, more than one session, or a
+turn count other than two. Declining turn 1 sends zero requests; declining turn
+2 sends only turn 1.
+
 Pass `--scenario path/to/scenario.json` more than once to run different topics
 in parallel. `--sessions` overrides the `sessions` value in every selected
 scenario, and `--turns` limits the number of questions used.

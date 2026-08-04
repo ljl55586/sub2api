@@ -29,8 +29,14 @@ from urllib.parse import urlparse
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parents[1]
+BACKEND_DIR = REPO_ROOT / "backend"
 DEFAULT_SCENARIO = SCRIPT_DIR / "scenarios" / "database-indexes.json"
 API_KEY_ENV = "SUB2API_LOADTEST_API_KEY"
+REVIEW_REQUEST_ENV = "SUB2API_CODEX_LOADTEST_REVIEW_REQUEST"
+REVIEW_OUTPUT_ENV = "SUB2API_CODEX_LOADTEST_REVIEW_OUTPUT"
+REVIEW_SESSION_ENV = "SUB2API_CODEX_LOADTEST_REVIEW_SESSION_ID"
+REVIEW_GO_TEST = "^TestBuildCurlCodexLoadtestUpstreamPreview$"
 CACHE_WARNING_THRESHOLD = 0.80
 DEFAULT_MODEL = "gpt-5.6-sol"
 DEFAULT_REASONING_EFFORT = "high"
@@ -223,6 +229,146 @@ def append_completed_turn(
         history.append(message("user", "input_text", next_question))
     if history[: len(previous)] != previous:
         raise LoadTestError("conversation invariant failed: a prior input item was modified")
+
+
+def json_digest(value: Any) -> str:
+    encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def build_upstream_preview(
+    request_path: Path,
+    session_id: str,
+    turn_dir: Path,
+) -> Tuple[Dict[str, Any], Path]:
+    """Run the production Go request builder in-process without networking."""
+    if not (BACKEND_DIR / "go.mod").is_file():
+        raise LoadTestError(f"cannot locate backend Go module at {BACKEND_DIR}")
+    preview_path = turn_dir / "upstream-preview.json"
+    build_log_path = turn_dir / "upstream-preview-build.log"
+    environment = os.environ.copy()
+    # The preview uses a synthetic account and never needs the real API key.
+    # Do not leak the key into the Go test process or its diagnostic output.
+    environment.pop(API_KEY_ENV, None)
+    environment[REVIEW_REQUEST_ENV] = str(request_path.resolve())
+    environment[REVIEW_OUTPUT_ENV] = str(preview_path.resolve())
+    environment[REVIEW_SESSION_ENV] = session_id
+    command = [
+        "go",
+        "test",
+        "./internal/service",
+        "-run",
+        REVIEW_GO_TEST,
+        "-count=1",
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=str(BACKEND_DIR),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            timeout=180,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise LoadTestError("review mode requires the Go toolchain in PATH") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise LoadTestError("upstream preview builder timed out after 180 seconds") from exc
+
+    build_log = completed.stdout + completed.stderr
+    build_log_path.write_text(build_log, encoding="utf-8")
+    if completed.returncode != 0:
+        tail = build_log[-2000:].strip()
+        raise LoadTestError(f"upstream preview builder failed (rc={completed.returncode}): {tail}")
+    if not preview_path.is_file():
+        raise LoadTestError("upstream preview builder succeeded without producing its output file")
+    try:
+        preview = json.loads(preview_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise LoadTestError(f"cannot read upstream preview: {exc}") from exc
+    if not isinstance(preview, dict) or not isinstance(preview.get("body"), dict):
+        raise LoadTestError("upstream preview is missing a JSON request body")
+    write_json(turn_dir / "upstream-body.json", preview["body"])
+    return preview, preview_path
+
+
+def build_prefix_report(first_preview: Dict[str, Any], second_preview: Dict[str, Any]) -> Dict[str, Any]:
+    first_body = first_preview.get("body")
+    second_body = second_preview.get("body")
+    if not isinstance(first_body, dict) or not isinstance(second_body, dict):
+        raise LoadTestError("upstream preview body must be an object")
+    first_input = first_body.get("input")
+    second_input = second_body.get("input")
+    if not isinstance(first_input, list) or not isinstance(second_input, list):
+        raise LoadTestError("upstream preview input must be an array")
+    prefix_slice = second_input[: len(first_input)]
+    stable_fields = {
+        key: first_body.get(key) == second_body.get(key)
+        for key in (
+            "model",
+            "reasoning",
+            "text",
+            "store",
+            "stream",
+            "prompt_cache_key",
+            "max_output_tokens",
+        )
+    }
+    exact_prefix = len(second_input) >= len(first_input) and prefix_slice == first_input
+    return {
+        "prompt_cache_key_equal": stable_fields["prompt_cache_key"],
+        "first_input_is_exact_prefix": exact_prefix,
+        "all_cache_invariants_pass": exact_prefix and all(stable_fields.values()),
+        "first_input_items": len(first_input),
+        "second_input_items": len(second_input),
+        "new_input_items": copy.deepcopy(second_input[len(first_input) :]),
+        "first_input_sha256": json_digest(first_input),
+        "second_prefix_sha256": json_digest(prefix_slice),
+        "stable_fields_equal": stable_fields,
+    }
+
+
+def review_and_confirm(
+    turn_number: int,
+    preview: Dict[str, Any],
+    preview_path: Path,
+    prefix_report: Optional[Dict[str, Any]],
+    prefix_report_path: Optional[Path],
+) -> bool:
+    body = preview["body"]
+    print("", flush=True)
+    print("=" * 72, flush=True)
+    print(f"REVIEW REQUIRED: turn {turn_number} has NOT been sent", flush=True)
+    print(f"Method/URL: {preview.get('method')} {preview.get('url')}", flush=True)
+    print(f"Body bytes: {preview.get('body_bytes')}  SHA-256: {preview.get('body_sha256')}", flush=True)
+    print(f"Model: {body.get('model')}", flush=True)
+    print(f"Prompt cache key: {body.get('prompt_cache_key')}", flush=True)
+    print(f"Input items: {len(body.get('input', []))}", flush=True)
+    print(f"Exact redacted upstream preview: {preview_path}", flush=True)
+    print(f"Upstream body only: {preview_path.parent / 'upstream-body.json'}", flush=True)
+    if prefix_report is not None:
+        print(f"Prefix report: {prefix_report_path}", flush=True)
+        print(
+            "First upstream input is exact second-turn prefix: "
+            f"{prefix_report['first_input_is_exact_prefix']}",
+            flush=True,
+        )
+        print(
+            f"Cache invariants all pass: {prefix_report['all_cache_invariants_pass']}",
+            flush=True,
+        )
+        print(
+            f"Input items: {prefix_report['first_input_items']} -> {prefix_report['second_input_items']}",
+            flush=True,
+        )
+    print("Inspect the files above now. Authorization is redacted; the request body is complete.", flush=True)
+    try:
+        answer = input(f"Type YES to send turn {turn_number}; anything else stops: ")
+    except EOFError:
+        return False
+    return answer.strip() == "YES"
 
 
 def choose_delay(rng: random.Random, minimum: int, maximum: int) -> int:
@@ -708,6 +854,8 @@ def run_worker(args: argparse.Namespace) -> int:
     turns = args.turns if args.turns is not None else len(scenario.questions)
     if turns < 1 or turns > len(scenario.questions):
         raise LoadTestError(f"turns must be between 1 and {len(scenario.questions)} for {scenario.name}")
+    if args.review_two_turns and turns != 2:
+        raise LoadTestError("review worker requires exactly two turns")
     if not args.session_id or not args.session_dir or args.session_index is None or args.worker_seed is None:
         raise LoadTestError("worker arguments are incomplete")
     try:
@@ -725,6 +873,7 @@ def run_worker(args: argparse.Namespace) -> int:
     history = initial_history(scenario)
     completed_turns = 0
     failed = False
+    previous_upstream_preview: Optional[Dict[str, Any]] = None
 
     write_json(
         session_dir / "session.json",
@@ -736,6 +885,7 @@ def run_worker(args: argparse.Namespace) -> int:
             "turns": turns,
             "seed": args.worker_seed,
             "dry_run": args.dry_run,
+            "review_two_turns": args.review_two_turns,
             "started_at": utc_now(),
         },
     )
@@ -743,21 +893,124 @@ def run_worker(args: argparse.Namespace) -> int:
 
     for question_index in range(turns):
         turn_number = question_index + 1
+        turn_dir = session_dir / f"turn-{turn_number:03d}"
         body = build_request_body(scenario, args.session_id, history, args.max_output_tokens)
         if "tools" in body or "tool_choice" in body or "parallel_tool_calls" in body:
             raise LoadTestError("text profile request must not advertise tools")
-        event, assistant, _ = execute_turn(
+        preview: Optional[Dict[str, Any]] = None
+        preview_path: Optional[Path] = None
+        prefix_report: Optional[Dict[str, Any]] = None
+        prefix_report_path: Optional[Path] = None
+        if args.review_two_turns:
+            turn_dir.mkdir(parents=True, exist_ok=True)
+            request_path = turn_dir / "request.json"
+            write_json(request_path, body)
+            preview, preview_path = build_upstream_preview(
+                request_path,
+                args.session_id,
+                turn_dir,
+            )
+            if previous_upstream_preview is not None:
+                prefix_report = build_prefix_report(previous_upstream_preview, preview)
+                prefix_report_path = turn_dir / "prefix-report.json"
+                write_json(prefix_report_path, prefix_report)
+                if not prefix_report["all_cache_invariants_pass"]:
+                    write_json(
+                        turn_dir / "review-decision.json",
+                        {
+                            "approved": False,
+                            "reason": "cache prefix invariant failed",
+                            "decided_at": utc_now(),
+                            "preview_body_sha256": preview.get("body_sha256"),
+                        },
+                    )
+                    raise LoadTestError(
+                        f"turn {turn_number} upstream cache prefix invariant failed; request was not sent"
+                    )
+            approved = review_and_confirm(
+                turn_number,
+                preview,
+                preview_path,
+                prefix_report,
+                prefix_report_path,
+            )
+            write_json(
+                turn_dir / "review-decision.json",
+                {
+                    "approved": approved,
+                    "reason": "user approved" if approved else "user declined or input closed",
+                    "decided_at": utc_now(),
+                    "preview_body_sha256": preview.get("body_sha256"),
+                },
+            )
+            if not approved:
+                failed = True
+                event = {
+                    "event": "turn",
+                    "status": "failed",
+                    "sent": False,
+                    "started_at": utc_now(),
+                    "finished_at": utc_now(),
+                    "elapsed_seconds": 0.0,
+                    "curl_returncode": None,
+                    "http_status": None,
+                    "curl_metrics": {},
+                    "usage": {
+                        "input_tokens": None,
+                        "output_tokens": None,
+                        "cached_tokens": None,
+                        "cache_write_tokens": None,
+                    },
+                    "sse_terminal_type": None,
+                    "sse_event_count": 0,
+                    "error": "review declined before send",
+                    "session_id": args.session_id,
+                    "session_index": args.session_index,
+                    "scenario": scenario.name,
+                    "turn": turn_number,
+                    "question": scenario.questions[question_index],
+                    "planned_wait_seconds": None,
+                    "cache_hit": None,
+                    "paths": {
+                        "request": str(request_path),
+                        "upstream_preview": str(preview_path),
+                        "prefix_report": str(prefix_report_path) if prefix_report_path else None,
+                    },
+                }
+                append_jsonl(events_path, event)
+                print(
+                    f"[{scenario.name} session-{args.session_index}] turn {turn_number} was not sent",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                break
+        event, assistant, response_headers = execute_turn(
             args.api_url,
             api_key,
             args.session_id,
             body,
-            session_dir / f"turn-{turn_number:03d}",
+            turn_dir,
             args.dry_run,
             turn_number,
         )
+        event["sent"] = not args.dry_run
+        if args.review_two_turns and event["status"] == "completed":
+            returned_session = response_headers.get("x-sub2api-codex-session-id")
+            if returned_session != args.session_id:
+                event["status"] = "failed"
+                event["error"] = (
+                    "review request did not receive the expected X-Sub2API-Codex-Session-Id; "
+                    "verify the deployed gateway has curl_codex_profile enabled"
+                )
+                assistant = None
+        if preview_path is not None:
+            event["paths"]["upstream_preview"] = str(preview_path)
+            event["paths"]["upstream_body"] = str(turn_dir / "upstream-body.json")
+        if prefix_report_path is not None:
+            event["paths"]["prefix_report"] = str(prefix_report_path)
         wait_seconds: Optional[int] = None
         if event["status"] in {"completed", "dry_run"} and turn_number < turns:
-            wait_seconds = choose_delay(rng, args.min_delay, args.max_delay)
+            wait_seconds = 0 if args.review_two_turns else choose_delay(rng, args.min_delay, args.max_delay)
         event.update(
             {
                 "event": "turn",
@@ -793,6 +1046,8 @@ def run_worker(args: argparse.Namespace) -> int:
         )
         next_question = scenario.questions[question_index + 1] if turn_number < turns else None
         append_completed_turn(history, assistant, next_question)
+        if preview is not None:
+            previous_upstream_preview = preview
         if wait_seconds is not None and not args.dry_run:
             time.sleep(wait_seconds)
 
@@ -922,10 +1177,17 @@ def build_summary(
             }
         )
 
-    completed_events = [event for event in all_events if event.get("status") in {"completed", "dry_run"}]
-    failed_events = [event for event in all_events if event.get("status") == "failed"]
+    # A declined review is a session failure but not an attempted HTTP request.
+    # Dry-run turns still count as generated requests in dry-run summaries.
+    request_events = [
+        event
+        for event in all_events
+        if event.get("status") == "dry_run" or event.get("sent") is not False
+    ]
+    completed_events = [event for event in request_events if event.get("status") in {"completed", "dry_run"}]
+    failed_events = [event for event in request_events if event.get("status") == "failed"]
     http_statuses: Dict[str, int] = {}
-    for event in all_events:
+    for event in request_events:
         status = event.get("http_status")
         if status is not None:
             key = str(status)
@@ -961,7 +1223,7 @@ def build_summary(
                 f"Post-warmup cache hit rate {cache_hit_rate:.1%} is below the {cache_threshold:.0%} warning threshold."
             )
 
-    attempted = len(all_events)
+    attempted = len(request_events)
     successful = len(completed_events)
     summary = {
         "run_dir": str(run_dir),
@@ -1090,6 +1352,14 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", help="exact output directory for this run")
     parser.add_argument("--dry-run", action="store_true", help="generate all request files without calling curl")
     parser.add_argument("--skip-preflight", action="store_true")
+    parser.add_argument(
+        "--review-two-turns",
+        action="store_true",
+        help=(
+            "run exactly one two-turn session; before each send, build and save the final "
+            "redacted upstream request with production Go code and require typing YES"
+        ),
+    )
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--session-id", help=argparse.SUPPRESS)
     parser.add_argument("--session-index", type=int, help=argparse.SUPPRESS)
@@ -1135,6 +1405,8 @@ def controller_worker_command(
     ]
     if args.dry_run:
         command.append("--dry-run")
+    if args.review_two_turns:
+        command.append("--review-two-turns")
     if args.max_output_tokens is not None:
         command.extend(["--max-output-tokens", str(args.max_output_tokens)])
     return command
@@ -1162,6 +1434,12 @@ def run_controller(args: argparse.Namespace) -> int:
         raise LoadTestError("--sessions must be positive")
     if args.max_output_tokens is not None and args.max_output_tokens < 1:
         raise LoadTestError("--max-output-tokens must be positive")
+    if args.review_two_turns and args.dry_run:
+        raise LoadTestError("--review-two-turns cannot be combined with --dry-run")
+    if args.review_two_turns and args.sessions not in {None, 1}:
+        raise LoadTestError("--review-two-turns always uses exactly one session")
+    if args.review_two_turns and args.turns not in {None, 2}:
+        raise LoadTestError("--review-two-turns always uses exactly two turns")
     api_key = os.environ.get(API_KEY_ENV, "")
     if not args.dry_run and not api_key:
         raise LoadTestError(
@@ -1169,11 +1447,13 @@ def run_controller(args: argparse.Namespace) -> int:
         )
 
     scenario_paths = [Path(path) for path in (args.scenario or [str(DEFAULT_SCENARIO)])]
+    if args.review_two_turns and len(scenario_paths) != 1:
+        raise LoadTestError("--review-two-turns requires exactly one scenario")
     scenarios = [load_scenario(path) for path in scenario_paths]
     scenario_runtime: List[Tuple[Scenario, int, int]] = []
     for scenario in scenarios:
-        session_count = args.sessions if args.sessions is not None else scenario.sessions
-        turns = args.turns if args.turns is not None else len(scenario.questions)
+        session_count = 1 if args.review_two_turns else (args.sessions if args.sessions is not None else scenario.sessions)
+        turns = 2 if args.review_two_turns else (args.turns if args.turns is not None else len(scenario.questions))
         if turns < 1 or turns > len(scenario.questions):
             raise LoadTestError(f"--turns must be between 1 and {len(scenario.questions)} for {scenario.name}")
         scenario_runtime.append((scenario, session_count, turns))
@@ -1193,7 +1473,8 @@ def run_controller(args: argparse.Namespace) -> int:
         "started_at": utc_now(),
         "base_seed": base_seed,
         "dry_run": args.dry_run,
-        "preflight_enabled": not args.skip_preflight and not args.dry_run,
+        "preflight_enabled": not args.skip_preflight and not args.dry_run and not args.review_two_turns,
+        "review_two_turns": args.review_two_turns,
         "min_delay_seconds": args.min_delay,
         "max_delay_seconds": args.max_delay,
         "model": DEFAULT_MODEL,
@@ -1207,15 +1488,16 @@ def run_controller(args: argparse.Namespace) -> int:
             {
                 "name": scenario.name,
                 "path": scenario.source_path,
-                "sessions": args.sessions if args.sessions is not None else scenario.sessions,
+                "sessions": session_count,
                 "available_turns": len(scenario.questions),
+                "selected_turns": turns,
             }
-            for scenario, _, _ in scenario_runtime
+            for scenario, session_count, turns in scenario_runtime
         ],
     }
     write_json(output_dir / "run.json", run_metadata)
 
-    if not args.skip_preflight and not args.dry_run:
+    if not args.skip_preflight and not args.dry_run and not args.review_two_turns:
         print("Running preflight request...", flush=True)
         run_preflight(args.api_url, api_key, output_dir, args.max_output_tokens)
         print("Preflight succeeded.", flush=True)

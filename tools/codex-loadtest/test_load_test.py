@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import copy
 import json
 import os
 import random
@@ -11,7 +12,7 @@ import unittest
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from unittest import mock
 
 
@@ -190,6 +191,34 @@ class LoadTestUnitTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertTrue(all(60 <= value <= 300 for value in first))
 
+    def test_upstream_prefix_report_checks_exact_input_and_stable_fields(self) -> None:
+        first = {
+            "body": {
+                "model": "gpt-5.6-sol",
+                "input": [{"role": "developer", "content": "stable"}, {"role": "user", "content": "q1"}],
+                "reasoning": {"effort": "high", "context": "all_turns"},
+                "text": {"verbosity": "low"},
+                "store": False,
+                "stream": True,
+                "prompt_cache_key": "session-1",
+            }
+        }
+        second = copy.deepcopy(first)
+        second["body"]["input"].extend(
+            [{"role": "assistant", "content": "a1"}, {"role": "user", "content": "q2"}]
+        )
+        report = load_test.build_prefix_report(first, second)
+        self.assertTrue(report["first_input_is_exact_prefix"])
+        self.assertTrue(report["all_cache_invariants_pass"])
+        self.assertEqual(report["first_input_sha256"], report["second_prefix_sha256"])
+        self.assertEqual(2, len(report["new_input_items"]))
+
+        changed = copy.deepcopy(second)
+        changed["body"]["input"][0]["content"] = "changed"
+        bad_report = load_test.build_prefix_report(first, changed)
+        self.assertFalse(bad_report["first_input_is_exact_prefix"])
+        self.assertFalse(bad_report["all_cache_invariants_pass"])
+
     def test_parse_completed_sse_and_usage(self) -> None:
         terminal = {
             "type": "response.completed",
@@ -362,6 +391,9 @@ class LoadTestIntegrationTests(unittest.TestCase):
         sessions: int,
         turns: int,
         skip_preflight: bool,
+        extra_args: Optional[List[str]] = None,
+        stdin_text: Optional[str] = None,
+        timeout: int = 30,
     ) -> subprocess.CompletedProcess[str]:
         command = [
             sys.executable,
@@ -384,6 +416,8 @@ class LoadTestIntegrationTests(unittest.TestCase):
         ]
         if skip_preflight:
             command.append("--skip-preflight")
+        if extra_args:
+            command.extend(extra_args)
         environment = os.environ.copy()
         environment[load_test.API_KEY_ENV] = "integration-secret-key"
         return subprocess.run(
@@ -391,8 +425,9 @@ class LoadTestIntegrationTests(unittest.TestCase):
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            input=stdin_text,
             env=environment,
-            timeout=30,
+            timeout=timeout,
             check=False,
         )
 
@@ -456,6 +491,100 @@ class LoadTestIntegrationTests(unittest.TestCase):
             summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
             self.assertEqual(1, summary["requests"]["failed"])
             self.assertEqual({"429": 1}, summary["requests"]["http_statuses"])
+
+    def test_review_two_turns_previews_confirms_and_sends_exactly_two_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, FakeServer() as fake:
+            root = Path(temp_dir)
+            scenario_path = root / "scenario.json"
+            output_dir = root / "run"
+            write_scenario(scenario_path, sessions=4, questions=3)
+            completed = self.run_controller(
+                fake.url,
+                scenario_path,
+                output_dir,
+                1,
+                2,
+                False,
+                extra_args=["--review-two-turns"],
+                stdin_text="YES\nYES\n",
+                timeout=90,
+            )
+
+            self.assertEqual(0, completed.returncode, msg=completed.stdout + "\n" + completed.stderr)
+            self.assertEqual(2, completed.stdout.count("REVIEW REQUIRED"))
+            self.assertIn("First upstream input is exact second-turn prefix: True", completed.stdout)
+            with FakeResponsesHandler.lock:
+                records = list(FakeResponsesHandler.records)
+            self.assertEqual(2, len(records), "review mode must not add a preflight or extra requests")
+
+            run_metadata = json.loads((output_dir / "run.json").read_text(encoding="utf-8"))
+            summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertFalse(run_metadata["preflight_enabled"])
+            self.assertTrue(run_metadata["review_two_turns"])
+            self.assertEqual(2, summary["requests"]["attempted"])
+            self.assertEqual(2, summary["requests"]["successful"])
+
+            workers = json.loads((output_dir / "workers.json").read_text(encoding="utf-8"))
+            self.assertEqual(1, len(workers))
+            session_dir = Path(workers[0]["session_dir"])
+            first_preview = json.loads(
+                (session_dir / "turn-001" / "upstream-preview.json").read_text(encoding="utf-8")
+            )
+            second_preview = json.loads(
+                (session_dir / "turn-002" / "upstream-preview.json").read_text(encoding="utf-8")
+            )
+            report = json.loads(
+                (session_dir / "turn-002" / "prefix-report.json").read_text(encoding="utf-8")
+            )
+            first_input = first_preview["body"]["input"]
+            second_input = second_preview["body"]["input"]
+            self.assertEqual(first_input, second_input[: len(first_input)])
+            self.assertTrue(report["all_cache_invariants_pass"])
+            self.assertTrue(report["prompt_cache_key_equal"])
+            self.assertEqual("assistant", report["new_input_items"][0]["role"])
+            self.assertEqual("user", report["new_input_items"][1]["role"])
+            for turn in ("turn-001", "turn-002"):
+                decision = json.loads(
+                    (session_dir / turn / "review-decision.json").read_text(encoding="utf-8")
+                )
+                self.assertTrue(decision["approved"])
+
+            for path in output_dir.rglob("*"):
+                if path.is_file():
+                    self.assertNotIn("integration-secret-key", path.read_text(encoding="utf-8", errors="replace"))
+
+    def test_review_two_turns_decline_sends_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, FakeServer() as fake:
+            root = Path(temp_dir)
+            scenario_path = root / "scenario.json"
+            output_dir = root / "run"
+            write_scenario(scenario_path, sessions=1, questions=2)
+            completed = self.run_controller(
+                fake.url,
+                scenario_path,
+                output_dir,
+                1,
+                2,
+                False,
+                extra_args=["--review-two-turns"],
+                stdin_text="NO\n",
+                timeout=60,
+            )
+
+            self.assertEqual(1, completed.returncode, msg=completed.stdout + "\n" + completed.stderr)
+            with FakeResponsesHandler.lock:
+                records = list(FakeResponsesHandler.records)
+            self.assertEqual([], records)
+            summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(0, summary["requests"]["attempted"])
+            workers = json.loads((output_dir / "workers.json").read_text(encoding="utf-8"))
+            session_dir = Path(workers[0]["session_dir"])
+            decision = json.loads(
+                (session_dir / "turn-001" / "review-decision.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(decision["approved"])
+            self.assertTrue((session_dir / "turn-001" / "upstream-preview.json").is_file())
+            self.assertFalse((session_dir / "turn-001" / "response.sse").exists())
 
 
 if __name__ == "__main__":
