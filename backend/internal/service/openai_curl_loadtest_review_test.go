@@ -121,7 +121,8 @@ func TestBuildCurlCodexLoadtestUpstreamPreview(t *testing.T) {
 	require.NoError(t, json.Unmarshal(upstream.lastBody, &finalBody))
 	require.NotContains(t, finalBody, "tools")
 	require.NotContains(t, finalBody, "tool_choice")
-	require.NotContains(t, finalBody, "parallel_tool_calls")
+	// Responses Lite (gpt-5.6) requires parallel_tool_calls:false to be present.
+	require.Equal(t, false, finalBody["parallel_tool_calls"])
 	require.Equal(t, sessionID, finalBody["prompt_cache_key"])
 
 	sum := sha256.Sum256(upstream.lastBody)
