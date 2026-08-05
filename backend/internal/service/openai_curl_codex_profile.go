@@ -347,7 +347,16 @@ func (s *OpenAIGatewayService) applyCurlCodexProfile(
 	} else {
 		delete(reqBody, "tools")
 		delete(reqBody, "tool_choice")
-		delete(reqBody, "parallel_tool_calls")
+		// chatgpt's Responses Lite endpoint rejects the request when parallel_tool_calls
+		// is absent while X-OpenAI-Internal-Codex-Responses-Lite is set
+		// ("X-OpenAI-Internal-Codex-Responses-Lite requires `parallel_tool_calls` to be false").
+		// Text mode carries no tools but still rides the Responses Lite envelope, so keep
+		// the explicit false the upstream requires instead of deleting the field.
+		if responsesLite {
+			reqBody["parallel_tool_calls"] = false
+		} else {
+			delete(reqBody, "parallel_tool_calls")
+		}
 	}
 
 	reasoning, err := resolveCurlCodexReasoning(
@@ -974,7 +983,14 @@ func validateCurlCodexProfileBody(reqBody map[string]any, state *curlCodexProfil
 		if _, hasChoice := reqBody["tool_choice"]; hasChoice {
 			return fmt.Errorf("curl Codex profile invariant: text mode advertises tool choice")
 		}
-		if _, hasParallel := reqBody["parallel_tool_calls"]; hasParallel {
+		// chatgpt's Responses Lite endpoint requires parallel_tool_calls:false to be present
+		// (gpt-5.6 rides Responses Lite). Non-Responses-Lite text mode (e.g. gpt-5.5) must
+		// still omit it entirely.
+		if state.ResponsesLite {
+			if reqBody["parallel_tool_calls"] != false {
+				return fmt.Errorf("curl Codex profile invariant: Responses Lite text mode requires parallel_tool_calls=false")
+			}
+		} else if _, hasParallel := reqBody["parallel_tool_calls"]; hasParallel {
 			return fmt.Errorf("curl Codex profile invariant: text mode advertises parallel tool calls")
 		}
 	}

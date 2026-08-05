@@ -273,6 +273,32 @@ func TestCurlCodexTextProfileDoesNotAdvertiseUnsupportedCapabilities(t *testing.
 	require.Equal(t, "text/event-stream", upstreamReq.Header.Get("Accept"))
 }
 
+func TestCurlCodexTextProfileKeepsParallelToolCallsFalseForResponsesLite(t *testing.T) {
+	// chatgpt's Responses Lite endpoint requires parallel_tool_calls:false to be present
+	// when X-OpenAI-Internal-Codex-Responses-Lite is set; absence yields
+	// "X-OpenAI-Internal-Codex-Responses-Lite requires `parallel_tool_calls` to be false."
+	// gpt-5.6 rides Responses Lite, so text mode must keep the explicit false even though
+	// it advertises no tools.
+	service := newCurlCodexProfileTestService(curlCodexProfileText, true)
+	body := []byte(`{
+		"model":"gpt-5.6-sol",
+		"instructions":"Answer in one sentence.",
+		"input":[{"type":"message","role":"user","content":"hello"}],
+		"reasoning":{"effort":"high"}
+	}`)
+	c, _ := newCurlCodexProfileTestContext(t, body, curlCodexProfileText, "")
+
+	profiled, err := service.applyCurlCodexProfile(c, curlCodexProfileTestAccount(), body, curlCodexProfileText)
+	require.NoError(t, err)
+	var decoded map[string]any
+	require.NoError(t, json.Unmarshal(profiled, &decoded))
+	require.Contains(t, decoded, "parallel_tool_calls")
+	require.Equal(t, false, decoded["parallel_tool_calls"])
+	// text mode still carries no tools and no tool_choice.
+	require.NotContains(t, decoded, "tools")
+	require.NotContains(t, decoded, "tool_choice")
+}
+
 func TestCurlCodexAgentProfileKeepsDirectToolsForGPT55(t *testing.T) {
 	service := newCurlCodexProfileTestService(curlCodexProfileAgent, false)
 	body := []byte(`{"model":"gpt-5.5","input":"hello","reasoning":{"effort":"high"}}`)
@@ -337,7 +363,8 @@ func TestCurlCodexTextProfileUsesResponsesLiteWithoutAdvertisingTools(t *testing
 	require.NotContains(t, decoded, "instructions")
 	require.NotContains(t, decoded, "tools")
 	require.NotContains(t, decoded, "tool_choice")
-	require.NotContains(t, decoded, "parallel_tool_calls")
+	// Responses Lite (gpt-5.6) requires parallel_tool_calls:false to be present.
+	require.Equal(t, false, decoded["parallel_tool_calls"])
 	additionalItems, _, _, err := curlCodexAdditionalToolsState(decoded)
 	require.NoError(t, err)
 	require.Zero(t, additionalItems)
