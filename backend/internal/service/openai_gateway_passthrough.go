@@ -685,6 +685,8 @@ func (s *OpenAIGatewayService) handleErrorResponsePassthrough(
 	}
 	setOpsUpstreamError(c, resp.StatusCode, upstreamMsg, upstreamDetail)
 	logOpenAIInstructionsRequiredDebug(ctx, c, account, resp.StatusCode, upstreamMsg, requestBody, body)
+	// DEBUG: surface chatgpt's raw upstream 4xx body so the rejection reason is visible.
+	logger.LegacyPrintf("service.openai_gateway", "[OpenAI passthrough] upstream %d raw body: account=%d body=%s", resp.StatusCode, account.ID, truncateString(string(body), 2048))
 	// 错误体虽不会原样透传，运行态账号状态仍需更新，避免粘性路由继续复用
 	// 刚被限流的账号。cyber 例外：不冷却账号。
 	if !cyberHit {
