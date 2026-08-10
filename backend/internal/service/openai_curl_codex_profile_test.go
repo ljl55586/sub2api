@@ -105,7 +105,7 @@ func TestCurlCodexAgentProfileBuildsCoherentUpstreamRequest(t *testing.T) {
 	require.Equal(t, "text/event-stream", upstreamReq.Header.Get("Accept"))
 	require.Equal(t, curlCodexProfileDefaultUserAgent, upstreamReq.Header.Get("User-Agent"))
 	require.Equal(t, "codex_cli_rs", upstreamReq.Header.Get("Originator"))
-	require.Equal(t, "responses=experimental", upstreamReq.Header.Get("OpenAI-Beta"))
+	require.NotContains(t, upstreamReq.Header.Get("OpenAI-Beta"), "responses=experimental")
 	require.Equal(t, "remote_compaction_v2", upstreamReq.Header.Get("X-Codex-Beta-Features"))
 	require.Equal(t, metadata["x-codex-turn-metadata"], upstreamReq.Header.Get("X-Codex-Turn-Metadata"))
 	require.Equal(t, metadata["x-codex-window-id"], upstreamReq.Header.Get("X-Codex-Window-Id"))

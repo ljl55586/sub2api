@@ -1033,7 +1033,6 @@ func applyCurlCodexProfileHeaders(c *gin.Context, req *http.Request, apiKeyID in
 	}
 	req.Header.Set("accept", "text/event-stream")
 	req.Header.Set("content-type", "application/json")
-	req.Header.Set("openai-beta", "responses=experimental")
 	req.Header.Set("originator", state.Originator)
 	req.Header.Set("user-agent", state.UserAgent)
 	req.Header.Set("session_id", isolateOpenAISessionID(apiKeyID, state.SessionID))
@@ -1068,7 +1067,7 @@ func validateCurlCodexProfileHeaders(headers http.Header, apiKeyID int64, state 
 	isolated := isolateOpenAISessionID(apiKeyID, state.SessionID)
 	checks := map[string]string{
 		"accept": "text/event-stream", "originator": state.Originator,
-		"user-agent": state.UserAgent, "openai-beta": "responses=experimental",
+		"user-agent": state.UserAgent,
 		"session_id": isolated, "conversation_id": isolated,
 		"x-codex-turn-metadata": state.TurnMetadata, "x-codex-window-id": state.WindowID,
 	}
