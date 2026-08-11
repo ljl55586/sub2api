@@ -725,11 +725,20 @@ const buildDefaultTodayStats = (): WindowStats => ({
 
 const accountSupportsBatchUsage = (account: Account) => {
   if (account.platform === 'anthropic') {
-    return account.type === 'oauth' || account.type === 'setup-token'
+    return (
+      account.type === 'oauth' ||
+      account.type === 'setup-token' ||
+      (account.type === 'apikey' && account.credentials?.glm_coding_plan_usage_enabled === true)
+    )
   }
   if (account.platform === 'gemini') return true
   if (account.platform === 'antigravity') return account.type === 'oauth'
-  if (account.platform === 'openai') return account.type === 'oauth'
+  if (account.platform === 'openai') {
+    return (
+      account.type === 'oauth' ||
+      (account.type === 'apikey' && account.credentials?.glm_coding_plan_usage_enabled === true)
+    )
+  }
   if (account.platform === 'grok') return account.type === 'oauth'
   return false
 }

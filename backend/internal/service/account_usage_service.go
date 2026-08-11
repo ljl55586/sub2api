@@ -104,6 +104,12 @@ type antigravityUsageCache struct {
 	timestamp time.Time
 }
 
+type glmCodingUsageCache struct {
+	usage     *UsageInfo
+	err       error
+	timestamp time.Time
+}
+
 const (
 	apiCacheTTL             = 3 * time.Minute
 	apiErrorCacheTTL        = 1 * time.Minute        // 负缓存 TTL：429 等错误缓存 1 分钟
@@ -125,6 +131,8 @@ type UsageCache struct {
 	antigravityFlight singleflight.Group // 防止同一 Antigravity 账号的并发请求击穿缓存
 	openAIProbeCache  sync.Map           // accountID -> time.Time
 	grokProbeCache    sync.Map           // accountID -> last billing probe attempt
+	glmCodingCache    sync.Map           // accountID -> *glmCodingUsageCache
+	glmCodingFlight   singleflight.Group // prevent duplicate team quota requests per account
 }
 
 // NewUsageCache 创建 UsageCache 实例
@@ -299,6 +307,7 @@ type AccountUsageService struct {
 	grokQuotaFetcher        *GrokQuotaFetcher
 	grokQuotaService        *GrokQuotaService
 	openAIQuotaService      *OpenAIQuotaService
+	glmCodingUsageFetcher   GLMCodingUsageFetcher
 	cache                   *UsageCache
 	identityCache           IdentityCache
 	tlsFPProfileService     *TLSFingerprintProfileService
@@ -365,6 +374,10 @@ func (s *AccountUsageService) getUsageForAccount(ctx context.Context, account *A
 			s.tryClearRecoverableAccountError(ctx, account)
 		}
 		return usage, err
+	}
+
+	if account.IsGLMCodingPlanUsageEnabled() {
+		return s.getGLMCodingPlanUsage(ctx, account, forceProbe)
 	}
 
 	if account.Platform == PlatformGemini {
@@ -485,14 +498,15 @@ func (s *AccountUsageService) getUsageForAccount(ctx context.Context, account *A
 		return usage, nil
 	}
 
-	// API Key账号不支持usage查询
+	// Other API Key accounts do not expose a supported usage endpoint.
 	return nil, fmt.Errorf("account type %s does not support usage query", account.Type)
 }
 
 // GetUsage 获取账号使用量
 // OAuth账号: 调用Anthropic API获取真实数据（需要profile scope），API响应缓存10分钟，窗口统计缓存1分钟
 // Setup Token账号: 根据session_window推算5h窗口，7d数据不可用（没有profile scope）
-// API Key账号: 不支持usage查询
+// GLM Coding Plan API Key账号: 复用 API Key 查询智谱团队用量
+// 其他 API Key账号: 不支持usage查询
 func (s *AccountUsageService) GetUsage(ctx context.Context, accountID int64, force ...bool) (*UsageInfo, error) {
 	forceProbe := len(force) > 0 && force[0]
 

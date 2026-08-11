@@ -188,6 +188,50 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
     expect(createAccountMock.mock.calls[0]?.[0]?.upstream_billing_probe_enabled).toBe(true)
   })
 
+  it('stores GLM Coding Plan team context while reusing the account API key', async () => {
+    const wrapper = mountModal()
+    await selectButtonByText(wrapper, 'OpenAI')
+    await selectButtonByText(wrapper, 'API Key')
+    await wrapper.get('form#create-account-form input[type="text"]').setValue('GLM team')
+    await wrapper.get('form#create-account-form input[type="password"]').setValue('glm-coding-key')
+    await wrapper.get('[data-testid="glm-coding-usage-toggle"]').trigger('click')
+    await wrapper.get('input[placeholder="org-..."]').setValue('org-test')
+    await wrapper.get('input[placeholder="proj_..."]').setValue('proj-test')
+    await wrapper.get('form#create-account-form').trigger('submit.prevent')
+    await flushPromises()
+
+    const credentials = createAccountMock.mock.calls[0]?.[0]?.credentials
+    expect(credentials).toMatchObject({
+      api_key: 'glm-coding-key',
+      glm_coding_plan_usage_enabled: true,
+      bigmodel_organization: 'org-test',
+      bigmodel_project: 'proj-test'
+    })
+  })
+
+  it('allows GLM Coding Plan usage on Anthropic-compatible API-key accounts', async () => {
+    const wrapper = mountModal()
+    await selectButtonByText(wrapper, 'admin.accounts.claudeConsole')
+    await wrapper.get('form#create-account-form input[type="text"]').setValue('GLM Anthropic')
+    await wrapper.get('form#create-account-form input[type="password"]').setValue('glm-anthropic-key')
+    await wrapper.get('[data-testid="glm-coding-usage-toggle"]').trigger('click')
+    await wrapper.get('input[placeholder="org-..."]').setValue('org-anthropic')
+    await wrapper.get('input[placeholder="proj_..."]').setValue('proj-anthropic')
+    await wrapper.get('form#create-account-form').trigger('submit.prevent')
+    await flushPromises()
+
+    expect(createAccountMock.mock.calls[0]?.[0]).toMatchObject({
+      platform: 'anthropic',
+      type: 'apikey',
+      credentials: {
+        api_key: 'glm-anthropic-key',
+        glm_coding_plan_usage_enabled: true,
+        bigmodel_organization: 'org-anthropic',
+        bigmodel_project: 'proj-anthropic'
+      }
+    })
+  })
+
   it('waits for the initial upstream billing probe before refreshing the account list', async () => {
     let resolveProbe: (() => void) | undefined
     probeUpstreamBillingMock.mockImplementationOnce(
