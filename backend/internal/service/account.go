@@ -88,6 +88,12 @@ type OpenAIEndpointCapability string
 const openAILongContextBillingEnabledKey = "openai_long_context_billing_enabled"
 
 const (
+	glmCodingPlanUsageEnabledCredentialKey = "glm_coding_plan_usage_enabled"
+	bigModelOrganizationCredentialKey      = "bigmodel_organization"
+	bigModelProjectCredentialKey           = "bigmodel_project"
+)
+
+const (
 	OpenAIEndpointCapabilityChatCompletions OpenAIEndpointCapability = "chat_completions"
 	OpenAIEndpointCapabilityEmbeddings      OpenAIEndpointCapability = "embeddings"
 	OpenAIEndpointCapabilityAlphaSearch     OpenAIEndpointCapability = "alpha_search"
@@ -1239,6 +1245,32 @@ func (a *Account) IsAPIKeyOrBedrock() bool {
 
 func (a *Account) IsOpenAI() bool {
 	return a.Platform == PlatformOpenAI
+}
+
+// IsGLMCodingPlanUsageEnabled reports whether this OpenAI-compatible API-key
+// account should query the BigModel team Coding Plan usage endpoint. The
+// explicit flag avoids treating every account whose base_url happens to point
+// at BigModel as a Coding Plan account.
+func (a *Account) IsGLMCodingPlanUsageEnabled() bool {
+	if a == nil ||
+		(a.Platform != PlatformOpenAI && a.Platform != PlatformAnthropic) ||
+		a.Type != AccountTypeAPIKey ||
+		a.Credentials == nil {
+		return false
+	}
+	v, ok := a.Credentials[glmCodingPlanUsageEnabledCredentialKey]
+	if !ok {
+		return false
+	}
+	switch value := v.(type) {
+	case bool:
+		return value
+	case string:
+		enabled, err := strconv.ParseBool(strings.TrimSpace(value))
+		return err == nil && enabled
+	default:
+		return false
+	}
 }
 
 func (a *Account) IsOpenAILongContextBillingEnabled() bool {

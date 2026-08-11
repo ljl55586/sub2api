@@ -78,6 +78,41 @@
           <p class="input-hint">{{ t('admin.accounts.leaveEmptyToKeep') }}</p>
         </div>
 
+        <div
+          v-if="account.platform === 'openai' || account.platform === 'anthropic'"
+          class="border-t border-gray-200 pt-4 dark:border-dark-600"
+        >
+          <div class="flex items-center justify-between gap-4">
+            <div>
+              <label class="input-label mb-0">{{ t('admin.accounts.openai.glmCodingUsage') }}</label>
+              <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                {{ t('admin.accounts.openai.glmCodingUsageDesc') }}
+              </p>
+            </div>
+            <Toggle v-model="glmCodingPlanUsageEnabled" data-testid="glm-coding-usage-toggle" />
+          </div>
+          <div v-if="glmCodingPlanUsageEnabled" class="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <div>
+              <label class="input-label">{{ t('admin.accounts.openai.bigmodelOrganization') }}</label>
+              <input
+                v-model="bigmodelOrganization"
+                type="text"
+                class="input font-mono"
+                placeholder="org-..."
+              />
+            </div>
+            <div>
+              <label class="input-label">{{ t('admin.accounts.openai.bigmodelProject') }}</label>
+              <input
+                v-model="bigmodelProject"
+                type="text"
+                class="input font-mono"
+                placeholder="proj_..."
+              />
+            </div>
+          </div>
+        </div>
+
         <!-- Model Restriction Section (不适用于 Antigravity) -->
         <div v-if="account.platform !== 'antigravity'" class="border-t border-gray-200 pt-4 dark:border-dark-600">
           <label class="input-label">{{ t('admin.accounts.modelRestriction') }}</label>
@@ -2811,6 +2846,9 @@ interface TempUnschedRuleForm {
 const submitting = ref(false)
 const editBaseUrl = ref('https://api.anthropic.com')
 const editApiKey = ref('')
+const glmCodingPlanUsageEnabled = ref(false)
+const bigmodelOrganization = ref('')
+const bigmodelProject = ref('')
 // Bedrock credentials
 const editBedrockAccessKeyId = ref('')
 const editBedrockSecretAccessKey = ref('')
@@ -3374,6 +3412,14 @@ const syncFormFromAccount = (newAccount: Account | null) => {
 
   // Load intercept warmup requests setting (applies to all account types)
   const credentials = newAccount.credentials as Record<string, unknown> | undefined
+  glmCodingPlanUsageEnabled.value =
+    (newAccount.platform === 'openai' || newAccount.platform === 'anthropic') &&
+    newAccount.type === 'apikey' &&
+    credentials?.glm_coding_plan_usage_enabled === true
+  bigmodelOrganization.value =
+    typeof credentials?.bigmodel_organization === 'string' ? credentials.bigmodel_organization.trim() : ''
+  bigmodelProject.value =
+    typeof credentials?.bigmodel_project === 'string' ? credentials.bigmodel_project.trim() : ''
   interceptWarmupRequests.value = credentials?.intercept_warmup_requests === true
   autoPauseOnExpired.value = newAccount.auto_pause_on_expired === true
   editVertexProjectId.value = ''
@@ -4287,6 +4333,24 @@ const handleSubmit = async () => {
         }
       } else if (currentCredentials.model_mapping) {
         newCredentials.model_mapping = currentCredentials.model_mapping
+      }
+      if (props.account.platform === 'openai' || props.account.platform === 'anthropic') {
+        if (
+          glmCodingPlanUsageEnabled.value &&
+          (!bigmodelOrganization.value.trim() || !bigmodelProject.value.trim())
+        ) {
+          appStore.showError(t('admin.accounts.openai.glmCodingUsageContextRequired'))
+          return
+        }
+        if (glmCodingPlanUsageEnabled.value) {
+          newCredentials.glm_coding_plan_usage_enabled = true
+          newCredentials.bigmodel_organization = bigmodelOrganization.value.trim()
+          newCredentials.bigmodel_project = bigmodelProject.value.trim()
+        } else {
+          delete newCredentials.glm_coding_plan_usage_enabled
+          delete newCredentials.bigmodel_organization
+          delete newCredentials.bigmodel_project
+        }
       }
       if (props.account.platform === 'openai') {
         applyOpenAIEndpointCapabilities(newCredentials)

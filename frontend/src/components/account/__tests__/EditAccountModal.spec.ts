@@ -316,6 +316,55 @@ describe('EditAccountModal', () => {
     authIsSimpleMode.value = true
   })
 
+  it('keeps GLM Coding Plan team usage settings when editing an API-key account', async () => {
+    const account = buildAccount()
+    account.credentials = {
+      ...account.credentials,
+      glm_coding_plan_usage_enabled: true,
+      bigmodel_organization: 'org-test',
+      bigmodel_project: 'proj-test'
+    }
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+
+    const wrapper = mountModal(account)
+    expect((wrapper.get('input[placeholder="org-..."]').element as HTMLInputElement).value).toBe('org-test')
+    expect((wrapper.get('input[placeholder="proj_..."]').element as HTMLInputElement).value).toBe('proj-test')
+
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    expect(updateAccountMock.mock.calls[0]?.[1]?.credentials).toMatchObject({
+      glm_coding_plan_usage_enabled: true,
+      bigmodel_organization: 'org-test',
+      bigmodel_project: 'proj-test'
+    })
+  })
+
+  it('keeps GLM Coding Plan usage settings for Anthropic-compatible accounts', async () => {
+    const account = buildAccount()
+    account.platform = 'anthropic'
+    account.credentials = {
+      ...account.credentials,
+      base_url: 'https://example.test/anthropic',
+      glm_coding_plan_usage_enabled: true,
+      bigmodel_organization: 'org-anthropic',
+      bigmodel_project: 'proj-anthropic'
+    }
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+
+    const wrapper = mountModal(account)
+    expect((wrapper.get('input[placeholder="org-..."]').element as HTMLInputElement).value).toBe('org-anthropic')
+    expect((wrapper.get('input[placeholder="proj_..."]').element as HTMLInputElement).value).toBe('proj-anthropic')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    expect(updateAccountMock.mock.calls[0]?.[1]?.credentials).toMatchObject({
+      glm_coding_plan_usage_enabled: true,
+      bigmodel_organization: 'org-anthropic',
+      bigmodel_project: 'proj-anthropic'
+    })
+  })
+
   it('reopening the same account rehydrates the OpenAI whitelist from props', async () => {
     const account = buildAccount()
     updateAccountMock.mockReset()

@@ -113,6 +113,63 @@ describe('AccountUsageCell', () => {
     expect(getUsage).not.toHaveBeenCalled()
   })
 
+  it.each(['openai', 'anthropic'] as const)(
+    '%s GLM Coding Plan API-key accounts render the unified 5h and 7d windows',
+    async (platform) => {
+    getUsage.mockResolvedValue({
+      source: 'active',
+      updated_at: '2026-08-11T06:00:00Z',
+      five_hour: {
+        utilization: 3,
+        resets_at: '2026-08-11T10:42:45Z',
+        remaining_seconds: 16965,
+        used_requests: 470,
+        limit_requests: 15000
+      },
+      seven_day: {
+        utilization: 1,
+        resets_at: '2026-08-17T02:51:38Z',
+        remaining_seconds: 506498,
+        used_requests: 470,
+        limit_requests: 66000
+      }
+    })
+
+    const wrapper = mount(AccountUsageCell, {
+      props: {
+        account: makeAccount({
+          id: platform === 'openai' ? 9101 : 9102,
+          platform,
+          type: 'apikey',
+          credentials: {
+            glm_coding_plan_usage_enabled: true,
+            bigmodel_organization: 'org-test',
+            bigmodel_project: 'proj-test'
+          }
+        })
+      },
+      global: {
+        stubs: {
+          UsageProgressBar: {
+            props: ['label', 'utilization', 'resetsAt'],
+            template: '<div class="usage-bar">{{ label }}|{{ utilization }}|{{ resetsAt }}</div>'
+          },
+          OpenAIQuotaResetCell: {
+            template: '<div data-test="openai-reset">reset</div>'
+          },
+          AccountQuotaInfo: true
+        }
+      }
+    })
+
+    await flushPromises()
+    expect(getUsage).toHaveBeenCalledWith(platform === 'openai' ? 9101 : 9102)
+    expect(wrapper.text()).toContain('5h|3|2026-08-11T10:42:45Z')
+    expect(wrapper.text()).toContain('7d|1|2026-08-17T02:51:38Z')
+    expect(wrapper.find('[data-test="openai-reset"]').exists()).toBe(false)
+    }
+  )
+
   it('Antigravity 图片用量会聚合新旧 image 模型', async () => {
     getUsage.mockResolvedValue({
       antigravity_quota: {

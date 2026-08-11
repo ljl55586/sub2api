@@ -1157,6 +1157,41 @@
           <p v-if="apiKeyHint" class="input-hint">{{ apiKeyHint }}</p>
         </div>
 
+        <div
+          v-if="form.platform === 'openai' || form.platform === 'anthropic'"
+          class="border-t border-gray-200 pt-4 dark:border-dark-600"
+        >
+          <div class="flex items-center justify-between gap-4">
+            <div>
+              <label class="input-label mb-0">{{ t('admin.accounts.openai.glmCodingUsage') }}</label>
+              <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                {{ t('admin.accounts.openai.glmCodingUsageDesc') }}
+              </p>
+            </div>
+            <Toggle v-model="glmCodingPlanUsageEnabled" data-testid="glm-coding-usage-toggle" />
+          </div>
+          <div v-if="glmCodingPlanUsageEnabled" class="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <div>
+              <label class="input-label">{{ t('admin.accounts.openai.bigmodelOrganization') }}</label>
+              <input
+                v-model="bigmodelOrganization"
+                type="text"
+                class="input font-mono"
+                placeholder="org-..."
+              />
+            </div>
+            <div>
+              <label class="input-label">{{ t('admin.accounts.openai.bigmodelProject') }}</label>
+              <input
+                v-model="bigmodelProject"
+                type="text"
+                class="input font-mono"
+                placeholder="proj_..."
+              />
+            </div>
+          </div>
+        </div>
+
         <!-- 上游倍率自动探测：全部 API-key 平台可用（所在区块已限定 apikey 类型） -->
         <div
           class="flex items-center justify-between gap-4 border-t border-gray-200 pt-4 dark:border-dark-600"
@@ -3733,6 +3768,9 @@ const accountCategory = ref<'oauth-based' | 'apikey' | 'bedrock' | 'service_acco
 const addMethod = ref<AddMethod>('oauth') // For oauth-based: 'oauth' or 'setup-token'
 const apiKeyBaseUrl = ref('https://api.anthropic.com')
 const apiKeyValue = ref('')
+const glmCodingPlanUsageEnabled = ref(false)
+const bigmodelOrganization = ref('')
+const bigmodelProject = ref('')
 const upstreamBillingAutoProbeEnabled = ref(true)
 
 const syncPreviewCredentials = computed(() => {
@@ -4230,6 +4268,9 @@ watch(
           : newPlatform === 'grok'
             ? 'https://api.x.ai/v1'
             : 'https://api.anthropic.com'
+    glmCodingPlanUsageEnabled.value = false
+    bigmodelOrganization.value = ''
+    bigmodelProject.value = ''
     // Clear model-related settings
     allowedModels.value = []
     modelMappings.value = []
@@ -4672,6 +4713,9 @@ const resetForm = () => {
   addMethod.value = 'oauth'
   apiKeyBaseUrl.value = 'https://api.anthropic.com'
   apiKeyValue.value = ''
+  glmCodingPlanUsageEnabled.value = false
+  bigmodelOrganization.value = ''
+  bigmodelProject.value = ''
   upstreamBillingAutoProbeEnabled.value = true
   editQuotaLimit.value = null
   editQuotaDailyLimit.value = null
@@ -5104,6 +5148,14 @@ const handleSubmit = async () => {
     appStore.showError(t('admin.accounts.pleaseEnterApiKey'))
     return
   }
+  if (
+    (form.platform === 'openai' || form.platform === 'anthropic') &&
+    glmCodingPlanUsageEnabled.value &&
+    (!bigmodelOrganization.value.trim() || !bigmodelProject.value.trim())
+  ) {
+    appStore.showError(t('admin.accounts.openai.glmCodingUsageContextRequired'))
+    return
+  }
 
   // Determine default base URL based on platform
   const defaultBaseUrl =
@@ -5130,6 +5182,14 @@ const handleSubmit = async () => {
     if (modelMapping) {
       credentials.model_mapping = modelMapping
     }
+  }
+  if (
+    (form.platform === 'openai' || form.platform === 'anthropic') &&
+    glmCodingPlanUsageEnabled.value
+  ) {
+    credentials.glm_coding_plan_usage_enabled = true
+    credentials.bigmodel_organization = bigmodelOrganization.value.trim()
+    credentials.bigmodel_project = bigmodelProject.value.trim()
   }
   if (form.platform === 'openai') {
     applyOpenAIEndpointCapabilities(credentials)
