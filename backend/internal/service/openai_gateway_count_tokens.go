@@ -39,16 +39,16 @@ type openAIInputTokensCountPrepared struct {
 	UpstreamModel   string
 }
 
-// EstimateGrokCountTokens estimates an Anthropic-compatible count_tokens request
-// locally. Grok does not expose a compatible token-counting endpoint, so this
-// path deliberately avoids account selection, credentials, and upstream calls.
-func EstimateGrokCountTokens(body []byte) (int, error) {
+// EstimateAnthropicInputTokens estimates an Anthropic-compatible request
+// locally with the repository's o200k/cl100k approximation. Callers routing to
+// a non-OpenAI tokenizer family must calibrate this estimate before enforcement.
+func EstimateAnthropicInputTokens(body []byte) (int, error) {
 	var anthropicReq apicompat.AnthropicRequest
 	if err := json.Unmarshal(body, &anthropicReq); err != nil {
-		return 0, fmt.Errorf("parse anthropic count_tokens request: %w", err)
+		return 0, fmt.Errorf("parse anthropic token count request: %w", err)
 	}
 	if strings.TrimSpace(anthropicReq.Model) == "" {
-		return 0, fmt.Errorf("parse anthropic count_tokens request: model is required")
+		return 0, fmt.Errorf("parse anthropic token count request: model is required")
 	}
 
 	responsesReq, err := apicompat.AnthropicToResponses(&anthropicReq)
@@ -64,12 +64,19 @@ func EstimateGrokCountTokens(body []byte) (int, error) {
 		ToolChoice:   responsesReq.ToolChoice,
 	})
 	if err != nil {
-		return 0, fmt.Errorf("estimate grok input tokens: %w", err)
+		return 0, fmt.Errorf("estimate anthropic input tokens: %w", err)
 	}
 	if estimated < openAIInputTokensFallbackMinimum {
 		estimated = openAIInputTokensFallbackMinimum
 	}
 	return estimated, nil
+}
+
+// EstimateGrokCountTokens estimates an Anthropic-compatible count_tokens request
+// locally. Grok does not expose a compatible token-counting endpoint, so this
+// path deliberately avoids account selection, credentials, and upstream calls.
+func EstimateGrokCountTokens(body []byte) (int, error) {
+	return EstimateAnthropicInputTokens(body)
 }
 
 // ForwardCountTokensAsAnthropic bridges Anthropic /v1/messages/count_tokens to

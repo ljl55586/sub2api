@@ -950,6 +950,9 @@ type GatewayConfig struct {
 	OpenAIProxyStreamCircuit GatewayOpenAIProxyStreamCircuitConfig `mapstructure:"openai_proxy_stream_circuit"`
 	// ImageConcurrency: 图片生成独立并发限制配置（默认关闭）
 	ImageConcurrency ImageConcurrencyConfig `mapstructure:"image_concurrency"`
+	// TokenCountProbe: Claude Desktop/Agent SDK max_tokens=1 输入 Token 探针处理配置。
+	// 默认关闭；shadow 仅识别和估算，enforce 会在账号调度前返回本地响应。
+	TokenCountProbe GatewayTokenCountProbeConfig `mapstructure:"token_count_probe"`
 
 	// HTTP 上游连接池配置（性能优化：支持高并发场景调优）
 	// MaxIdleConns: 所有主机的最大空闲连接总数
@@ -1029,6 +1032,27 @@ type GatewayConfig struct {
 
 	// Grok: Grok/xAI gateway scheduling and free-tier soft-gate settings.
 	Grok GatewayGrokConfig `mapstructure:"grok"`
+}
+
+const (
+	TokenCountProbeModeOff     = "off"
+	TokenCountProbeModeShadow  = "shadow"
+	TokenCountProbeModeEnforce = "enforce"
+)
+
+// GatewayTokenCountProbeConfig controls interception of Claude Desktop's
+// max_tokens=1 token-count fallback requests sent through /v1/messages.
+type GatewayTokenCountProbeConfig struct {
+	// Mode: off/shadow/enforce. Unknown values fail closed to off.
+	Mode string `mapstructure:"mode"`
+	// ModelPrefixes limits interception to requested model prefixes.
+	ModelPrefixes []string `mapstructure:"model_prefixes"`
+	// SafetyMarginPercent adds a conservative margin to local estimates.
+	SafetyMarginPercent int `mapstructure:"safety_margin_percent"`
+	// CacheTTLSeconds controls the in-process normalized-payload estimate cache.
+	CacheTTLSeconds int `mapstructure:"cache_ttl_seconds"`
+	// CacheMaxEntries bounds the in-process cache; <=0 disables caching.
+	CacheMaxEntries int `mapstructure:"cache_max_entries"`
 }
 
 // GatewayGrokConfig holds Grok-specific gateway scheduling knobs.
@@ -2345,6 +2369,11 @@ func setDefaults() {
 	viper.SetDefault("gateway.openai_response_header_timeout", 0)
 	viper.SetDefault("gateway.openai_first_output_timeout_seconds", 0)
 	viper.SetDefault("gateway.openai_high_effort_first_output_timeout_seconds", 0)
+	viper.SetDefault("gateway.token_count_probe.mode", TokenCountProbeModeOff)
+	viper.SetDefault("gateway.token_count_probe.model_prefixes", []string{"glm-"})
+	viper.SetDefault("gateway.token_count_probe.safety_margin_percent", 10)
+	viper.SetDefault("gateway.token_count_probe.cache_ttl_seconds", 3600)
+	viper.SetDefault("gateway.token_count_probe.cache_max_entries", 2048)
 	viper.SetDefault("gateway.log_upstream_error_body", true)
 	viper.SetDefault("gateway.log_upstream_error_body_max_bytes", 2048)
 	viper.SetDefault("gateway.inject_beta_for_apikey", false)

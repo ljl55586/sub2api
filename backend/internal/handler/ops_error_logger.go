@@ -1249,7 +1249,11 @@ func isCountTokensRequest(c *gin.Context) bool {
 	if c == nil || c.Request == nil || c.Request.URL == nil {
 		return false
 	}
-	return strings.Contains(c.Request.URL.Path, "/count_tokens")
+	if strings.Contains(c.Request.URL.Path, "/count_tokens") {
+		return true
+	}
+	isProbe, ok := service.IsTokenCountProbeRequestFromContext(c.Request.Context())
+	return ok && isProbe
 }
 
 func applyOpsLatencyFieldsFromContext(c *gin.Context, entry *service.OpsInsertErrorLogInput) {

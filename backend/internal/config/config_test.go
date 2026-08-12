@@ -831,6 +831,56 @@ func TestLoadCurlCodexProfileRejectsInvalidResponsesLiteToolsTemplate(t *testing
 	require.ErrorContains(t, err, "responses lite tools template")
 }
 
+// TestCurlCodexProfileEnabledFromEnv reproduces the env-binding gap: the
+// curl_codex_profile keys only had SetDefault, so GATEWAY_CURL_CODEX_PROFILE_ENABLED
+// was silently dropped during viper.Unmarshal and the profile never activated.
+func TestCurlCodexProfileEnabledFromEnv(t *testing.T) {
+	resetViperWithJWTSecret(t)
+
+	t.Setenv("GATEWAY_CURL_CODEX_PROFILE_ENABLED", "true")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	require.True(t, cfg.Gateway.CurlCodexProfile.Enabled, "GATEWAY_CURL_CODEX_PROFILE_ENABLED=true must enable the profile")
+}
+
+// TestCurlCodexProfileEnvOverridesExplicitConfigFalse is the real deployment
+// scenario: config.yaml (often copied from config.example.yaml) explicitly sets
+// curl_codex_profile.enabled: false, and the operator turns it on via env.
+// Viper's AutomaticEnv does not override an explicitly-set config-file value
+// during Unmarshal, so the profile stayed disabled.
+func TestCurlCodexProfileEnvOverridesExplicitConfigFalse(t *testing.T) {
+	resetViperWithJWTSecret(t)
+
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "config.yaml")
+	require.NoError(t, os.WriteFile(configPath, []byte("gateway:\n  curl_codex_profile:\n    enabled: false\n"), 0o644))
+	t.Setenv("DATA_DIR", tempDir)
+	t.Setenv("GATEWAY_CURL_CODEX_PROFILE_ENABLED", "true")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	require.True(t, cfg.Gateway.CurlCodexProfile.Enabled, "env=true must override config file's enabled:false")
+}
+
+// TestCurlCodexProfileEnvWithGatewaySectionNoCurlCodex reproduces the actual
+// server state: /app/data/config.yaml has a gateway: section but does NOT
+// mention curl_codex_profile, while the operator enables it via env. Viper can
+// drop the default+env for a nested key whose parent map is file-provided.
+func TestCurlCodexProfileEnvWithGatewaySectionNoCurlCodex(t *testing.T) {
+	resetViperWithJWTSecret(t)
+
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "config.yaml")
+	require.NoError(t, os.WriteFile(configPath, []byte("gateway:\n  session_idle_timeout_minutes: 5\n"), 0o644))
+	t.Setenv("DATA_DIR", tempDir)
+	t.Setenv("GATEWAY_CURL_CODEX_PROFILE_ENABLED", "true")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	require.True(t, cfg.Gateway.CurlCodexProfile.Enabled, "env=true must enable the profile even when gateway section omits it")
+}
+
 func TestLoadDefaultSecurityToggles(t *testing.T) {
 	resetViperWithJWTSecret(t)
 

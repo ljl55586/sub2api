@@ -55,6 +55,7 @@ type GatewayHandler struct {
 	userMsgQueueHelper        *UserMsgQueueHelper
 	maxAccountSwitches        int
 	maxAccountSwitchesGemini  int
+	tokenCountProbeCache      *tokenCountProbeEstimateCache
 	cfg                       *config.Config
 	settingService            *service.SettingService
 }
@@ -112,6 +113,7 @@ func NewGatewayHandler(
 		userMsgQueueHelper:        umqHelper,
 		maxAccountSwitches:        maxAccountSwitches,
 		maxAccountSwitchesGemini:  maxAccountSwitchesGemini,
+		tokenCountProbeCache:      newTokenCountProbeEstimateCache(),
 		cfg:                       cfg,
 		settingService:            settingService,
 	}
@@ -213,6 +215,57 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 	if decision := h.checkSecurityAudit(c, reqLog, apiKey, subject, service.ContentModerationProtocolAnthropicMessages, reqModel, body); decision != nil && !decision.AllowNextStage {
 		h.anthropicSecurityAuditError(c, decision)
 		return
+	}
+
+	// Claude Desktop third-party mode falls back to max_tokens=1 /messages
+	// requests to measure input tokens. Handle high-confidence probes before
+	// user/account concurrency and account selection so they cannot exhaust the
+	// upstream pool. Estimator failures deliberately fail open to normal routing.
+	if mode := h.tokenCountProbeModeForModel(reqModel); mode != config.TokenCountProbeModeOff {
+		probe := detectClaudeDesktopTokenCountProbe(c.Request, body)
+		if probe.Candidate {
+			sessionKey := strconv.FormatInt(apiKey.ID, 10) + ":" + probe.SessionID
+			now := time.Now()
+			if probe.Matched {
+				h.tokenCountProbeCache.markProbeSession(sessionKey, now)
+			} else if h.tokenCountProbeCache.isProbeSessionActive(sessionKey, now) {
+				probe.Matched = true
+				probe.Reason = "session_correlated"
+			}
+		}
+		if probe.Matched {
+			ctx := service.WithIsTokenCountProbeRequest(c.Request.Context(), true)
+			c.Request = c.Request.WithContext(ctx)
+			estimated, source, estimateErr := h.estimateTokenCountProbe(body)
+			if estimateErr != nil {
+				reqLog.Warn("gateway.token_count_probe_estimate_failed",
+					zap.String("probe_reason", probe.Reason),
+					zap.String("probe_mode", mode),
+					zap.Error(estimateErr),
+				)
+			} else {
+				reqLog.Info("gateway.token_count_probe_detected",
+					zap.String("probe_reason", probe.Reason),
+					zap.String("probe_mode", mode),
+					zap.String("estimate_source", source),
+					zap.Int("estimated_input_tokens", estimated),
+				)
+				if mode == config.TokenCountProbeModeEnforce {
+					subscription, _ := middleware2.GetSubscriptionFromContext(c)
+					if err := h.billingCacheService.CheckBillingEligibility(c.Request.Context(), apiKey.User, apiKey, apiKey.Group, subscription, service.QuotaPlatform(c.Request.Context(), apiKey)); err != nil {
+						reqLog.Info("gateway.token_count_probe_billing_eligibility_check_failed", zap.Error(err))
+						status, code, message, retryAfter := billingErrorDetails(err)
+						if retryAfter > 0 {
+							c.Header("Retry-After", strconv.Itoa(retryAfter))
+						}
+						h.errorResponse(c, status, code, message)
+						return
+					}
+					sendTokenCountProbeResponse(c, reqModel, estimated)
+					return
+				}
+			}
+		}
 	}
 
 	// Track if we've started streaming (for error handling)

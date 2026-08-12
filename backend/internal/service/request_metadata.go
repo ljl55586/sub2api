@@ -13,6 +13,7 @@ var requestMetadataKey = requestMetadataContextKey{}
 
 type RequestMetadata struct {
 	IsMaxTokensOneHaikuRequest *bool
+	IsTokenCountProbeRequest   *bool
 	ThinkingEnabled            *bool
 	PrefetchedStickyAccountID  *int64
 	PrefetchedStickyGroupID    *int64
@@ -77,6 +78,16 @@ func WithIsMaxTokensOneHaikuRequest(ctx context.Context, value bool, bridgeOldKe
 	})
 }
 
+// WithIsTokenCountProbeRequest marks a /messages request that is semantically
+// a token-count fallback probe. It intentionally has no legacy ctxkey bridge:
+// only ops classification and the local interception path consume it.
+func WithIsTokenCountProbeRequest(ctx context.Context, value bool) context.Context {
+	return updateRequestMetadata(ctx, false, func(md *RequestMetadata) {
+		v := value
+		md.IsTokenCountProbeRequest = &v
+	}, nil)
+}
+
 func WithThinkingEnabled(ctx context.Context, value bool, bridgeOldKeys bool) context.Context {
 	return updateRequestMetadata(ctx, bridgeOldKeys, func(md *RequestMetadata) {
 		v := value
@@ -126,6 +137,13 @@ func IsMaxTokensOneHaikuRequestFromContext(ctx context.Context) (bool, bool) {
 	if value, ok := ctx.Value(ctxkey.IsMaxTokensOneHaikuRequest).(bool); ok {
 		requestMetadataFallbackIsMaxTokensOneHaikuTotal.Add(1)
 		return value, true
+	}
+	return false, false
+}
+
+func IsTokenCountProbeRequestFromContext(ctx context.Context) (bool, bool) {
+	if md := metadataFromContext(ctx); md != nil && md.IsTokenCountProbeRequest != nil {
+		return *md.IsTokenCountProbeRequest, true
 	}
 	return false, false
 }
