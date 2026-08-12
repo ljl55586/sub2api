@@ -953,6 +953,8 @@ type GatewayConfig struct {
 	// TokenCountProbe: Claude Desktop/Agent SDK max_tokens=1 输入 Token 探针处理配置。
 	// 默认关闭；shadow 仅识别和估算，enforce 会在账号调度前返回本地响应。
 	TokenCountProbe GatewayTokenCountProbeConfig `mapstructure:"token_count_probe"`
+	// InputTokenGuard: 在账号调度前估算超大 Anthropic 请求，避免已知上下文超限请求到达上游。
+	InputTokenGuard GatewayInputTokenGuardConfig `mapstructure:"input_token_guard"`
 
 	// HTTP 上游连接池配置（性能优化：支持高并发场景调优）
 	// MaxIdleConns: 所有主机的最大空闲连接总数
@@ -1053,6 +1055,24 @@ type GatewayTokenCountProbeConfig struct {
 	CacheTTLSeconds int `mapstructure:"cache_ttl_seconds"`
 	// CacheMaxEntries bounds the in-process cache; <=0 disables caching.
 	CacheMaxEntries int `mapstructure:"cache_max_entries"`
+}
+
+// GatewayInputTokenGuardConfig controls local preflight checks for requests
+// whose estimated input exceeds a configured model context window.
+type GatewayInputTokenGuardConfig struct {
+	// Mode: off/shadow/enforce. Unknown values fail closed to off.
+	Mode string `mapstructure:"mode"`
+	// ModelLimits lists exact requested model IDs (case-insensitive) and input token limits.
+	ModelLimits []GatewayInputTokenGuardModelLimit `mapstructure:"model_limits"`
+	// TolerancePercent permits estimator drift above the nominal model limit.
+	TolerancePercent int `mapstructure:"tolerance_percent"`
+	// MinBodyBytes avoids tokenizing small requests on the hot path.
+	MinBodyBytes int `mapstructure:"min_body_bytes"`
+}
+
+type GatewayInputTokenGuardModelLimit struct {
+	Model       string `mapstructure:"model"`
+	InputTokens int    `mapstructure:"input_tokens"`
 }
 
 // GatewayGrokConfig holds Grok-specific gateway scheduling knobs.
@@ -2374,6 +2394,10 @@ func setDefaults() {
 	viper.SetDefault("gateway.token_count_probe.safety_margin_percent", 10)
 	viper.SetDefault("gateway.token_count_probe.cache_ttl_seconds", 3600)
 	viper.SetDefault("gateway.token_count_probe.cache_max_entries", 2048)
+	viper.SetDefault("gateway.input_token_guard.mode", TokenCountProbeModeOff)
+	viper.SetDefault("gateway.input_token_guard.model_limits", []GatewayInputTokenGuardModelLimit{})
+	viper.SetDefault("gateway.input_token_guard.tolerance_percent", 5)
+	viper.SetDefault("gateway.input_token_guard.min_body_bytes", 262144)
 	viper.SetDefault("gateway.log_upstream_error_body", true)
 	viper.SetDefault("gateway.log_upstream_error_body_max_bytes", 2048)
 	viper.SetDefault("gateway.inject_beta_for_apikey", false)

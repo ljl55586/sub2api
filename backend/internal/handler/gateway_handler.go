@@ -268,6 +268,27 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 		}
 	}
 
+	guardResult, guardErr := h.evaluateInputTokenGuard(reqModel, body)
+	if guardErr != nil {
+		reqLog.Warn("gateway.input_token_guard_estimate_failed", zap.Error(guardErr))
+	} else if guardResult != nil {
+		reqLog.Info("gateway.input_token_guard_checked",
+			zap.String("guard_mode", guardResult.Mode),
+			zap.Int("model_input_limit", guardResult.Limit),
+			zap.Int("guard_threshold", guardResult.Threshold),
+			zap.Int("estimated_input_tokens", guardResult.EstimatedInputTokens),
+			zap.Bool("limit_exceeded", guardResult.Exceeded),
+		)
+		if guardResult.Exceeded && guardResult.Mode == config.TokenCountProbeModeEnforce {
+			service.MarkOpsClientBusinessLimited(c, service.OpsClientBusinessLimitedReasonLocalPolicyDenied)
+			h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf(
+				"Estimated input tokens (%d) exceed the context window for %s (%d tokens). Reduce or compact the conversation and try again.",
+				guardResult.EstimatedInputTokens, reqModel, guardResult.Limit,
+			))
+			return
+		}
+	}
+
 	// Track if we've started streaming (for error handling)
 	streamStarted := false
 

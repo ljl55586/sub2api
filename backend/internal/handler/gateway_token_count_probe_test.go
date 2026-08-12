@@ -57,6 +57,7 @@ func TestDetectClaudeDesktopTokenCountProbeKnownComponents(t *testing.T) {
 		{name: "baseline", content: "count", reason: "count"},
 		{name: "tools", content: "count", reason: "count", tools: []any{map[string]any{"name": "Skill", "input_schema": map[string]any{"type": "object"}}}},
 		{name: "format", content: "\n\nWhen referencing files in your responses, format them as markdown links.", reason: "response_format"},
+		{name: "communication", content: "# Communicating with the user\n\nYour text output is what the user reads.", reason: "communication_guidance"},
 		{name: "environment", content: "# Environment\n - Platform: darwin", reason: "environment"},
 		{name: "git", content: "This is the git status at the start of the conversation.\n\nCurrent branch: main", reason: "git_status"},
 		{name: "memory", content: "# Memory\nPersistent memory rules", reason: "memory"},

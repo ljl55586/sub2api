@@ -153,6 +153,43 @@ func TestGatewayService_Forward_StreamErrorWithoutUsageReturnsNilResult(t *testi
 	require.Nil(t, result, "无已观测 usage 时不应返回部分结果")
 }
 
+func TestGatewayService_Forward_TerminalStreamWithoutUsageReturnsNilResult(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	body := []byte(`{"model":"glm-5-turbo","stream":true,"messages":[{"role":"user","content":"hello"}]}`)
+	parsed, err := ParseGatewayRequest(NewRequestBodyRef(body), PlatformAnthropic)
+	require.NoError(t, err)
+
+	upstreamSSE := strings.Join([]string{
+		`event: message_start`,
+		`data: {"type":"message_start","message":{"id":"msg_1","model":"glm-5-turbo","content":[]}}`,
+		"",
+		`event: message_delta`,
+		`data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"}}`,
+		"",
+		`event: message_stop`,
+		`data: {"type":"message_stop"}`,
+		"",
+		"",
+	}, "\n")
+	upstream := &anthropicHTTPUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(upstreamSSE)),
+	}}
+	svc := newForwardPartialUsageServiceForTest(upstream)
+	account := newAnthropicOAuthAccountForPartialUsageTest()
+
+	result, err := svc.Forward(context.Background(), c, account, parsed)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "stream usage missing")
+	require.Nil(t, result, "终止流缺少 usage 时不应写入 0/0 使用记录")
+}
+
 func TestGatewayService_Forward_FailoverErrorKeepsNilResult(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

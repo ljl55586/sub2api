@@ -24,6 +24,7 @@ const (
 
 var tokenCountProbeStaticPrefixes = []string{
 	"When referencing files in your responses",
+	"# Communicating with the user",
 	"# Environment",
 	"This is the git status at the start of the conversation.",
 	"# Memory",
@@ -222,6 +223,8 @@ func tokenCountProbeReason(prefix string) string {
 		return "git_status"
 	case "When referencing files in your responses":
 		return "response_format"
+	case "# Communicating with the user":
+		return "communication_guidance"
 	case "When you use a pronoun for someone":
 		return "pronoun_guidance"
 	case "This iteration of Claude is":

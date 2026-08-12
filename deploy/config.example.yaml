@@ -223,6 +223,20 @@ gateway:
     safety_margin_percent: 10
     cache_ttl_seconds: 3600
     cache_max_entries: 2048
+  # Reject requests whose locally estimated input is clearly above a configured
+  # model context window. Start with shadow to verify estimates in logs.
+  # 对超大请求做本地 Token 预检；建议先用 shadow 对照日志，再切换 enforce。
+  input_token_guard:
+    mode: "off"
+    model_limits:
+      - model: "glm-4.7"
+        input_tokens: 200000
+      - model: "glm-5-turbo"
+        input_tokens: 200000
+      - model: "glm-5.2"
+        input_tokens: 1000000
+    tolerance_percent: 5
+    min_body_bytes: 262144
   # Max request body size in bytes (default: 256MB)
   # 请求体最大字节数（默认 256MB）
   max_body_size: 268435456

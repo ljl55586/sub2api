@@ -1000,6 +1000,17 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 		return []string{block}, string(newData), usagePatch, nil
 	}
 
+	finishSuccessfulStream := func() (*streamingResult, error) {
+		result := &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}
+		if usage.hasObservedTokens() {
+			return result, nil
+		}
+		message := "upstream stream completed without token usage"
+		setOpsUpstreamError(c, resp.StatusCode, message, "terminal SSE event received but no non-zero usage fields were present")
+		logger.LegacyPrintf("service.gateway", "Stream completed without usage: account=%d model=%s upstream_request_id=%s", account.ID, originalModel, resp.Header.Get("x-request-id"))
+		return result, errors.New("stream usage missing: terminal event received without token usage")
+	}
+
 	for {
 		select {
 		case ev, ok := <-events:
@@ -1008,11 +1019,11 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 				if !sawTerminalEvent {
 					return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}, fmt.Errorf("stream usage incomplete: missing terminal event")
 				}
-				return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}, nil
+				return finishSuccessfulStream()
 			}
 			if ev.err != nil {
 				if sawTerminalEvent {
-					return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}, nil
+					return finishSuccessfulStream()
 				}
 				// 检测 context 取消（客户端断开会导致 context 取消，进而影响上游读取）
 				if errors.Is(ev.err, context.Canceled) || errors.Is(ev.err, context.DeadlineExceeded) {
@@ -1184,12 +1195,15 @@ func (s *GatewayService) extractSSEUsagePatch(event map[string]any) *sseUsagePat
 		msg, _ := event["message"].(map[string]any)
 		usageObj, _ := msg["usage"].(map[string]any)
 		if len(usageObj) == 0 {
+			usageObj, _ = event["usage"].(map[string]any)
+		}
+		if len(usageObj) == 0 {
 			return nil
 		}
 
 		patch := &sseUsagePatch{}
 		patch.hasInputTokens = true
-		if v, ok := parseSSEUsageInt(usageObj["input_tokens"]); ok {
+		if v, ok := firstSSEUsageInt(usageObj, "input_tokens", "prompt_tokens"); ok {
 			patch.inputTokens = v
 		}
 		patch.hasCacheCreationInput = true
@@ -1215,15 +1229,19 @@ func (s *GatewayService) extractSSEUsagePatch(event map[string]any) *sseUsagePat
 	case "message_delta":
 		usageObj, _ := event["usage"].(map[string]any)
 		if len(usageObj) == 0 {
+			msg, _ := event["message"].(map[string]any)
+			usageObj, _ = msg["usage"].(map[string]any)
+		}
+		if len(usageObj) == 0 {
 			return nil
 		}
 
 		patch := &sseUsagePatch{}
-		if v, ok := parseSSEUsageInt(usageObj["input_tokens"]); ok && v > 0 {
+		if v, ok := firstSSEUsageInt(usageObj, "input_tokens", "prompt_tokens"); ok && v > 0 {
 			patch.inputTokens = v
 			patch.hasInputTokens = true
 		}
-		if v, ok := parseSSEUsageInt(usageObj["output_tokens"]); ok && v > 0 {
+		if v, ok := firstSSEUsageInt(usageObj, "output_tokens", "completion_tokens"); ok && v > 0 {
 			patch.outputTokens = v
 			patch.hasOutputTokens = true
 		}
@@ -1248,7 +1266,44 @@ func (s *GatewayService) extractSSEUsagePatch(event map[string]any) *sseUsagePat
 		return patch
 	}
 
-	return nil
+	usageObj, _ := event["usage"].(map[string]any)
+	if len(usageObj) == 0 {
+		msg, _ := event["message"].(map[string]any)
+		usageObj, _ = msg["usage"].(map[string]any)
+	}
+	if len(usageObj) == 0 {
+		return nil
+	}
+	patch := &sseUsagePatch{}
+	if v, ok := firstSSEUsageInt(usageObj, "input_tokens", "prompt_tokens"); ok && v > 0 {
+		patch.inputTokens = v
+		patch.hasInputTokens = true
+	}
+	if v, ok := firstSSEUsageInt(usageObj, "output_tokens", "completion_tokens"); ok && v > 0 {
+		patch.outputTokens = v
+		patch.hasOutputTokens = true
+	}
+	if v, ok := parseSSEUsageInt(usageObj["cache_creation_input_tokens"]); ok && v > 0 {
+		patch.cacheCreationInputTokens = v
+		patch.hasCacheCreationInput = true
+	}
+	if v, ok := parseSSEUsageInt(usageObj["cache_read_input_tokens"]); ok && v > 0 {
+		patch.cacheReadInputTokens = v
+		patch.hasCacheReadInput = true
+	}
+	if !patch.hasInputTokens && !patch.hasOutputTokens && !patch.hasCacheCreationInput && !patch.hasCacheReadInput {
+		return nil
+	}
+	return patch
+}
+
+func firstSSEUsageInt(usageObj map[string]any, keys ...string) (int, bool) {
+	for _, key := range keys {
+		if value, ok := parseSSEUsageInt(usageObj[key]); ok {
+			return value, true
+		}
+	}
+	return 0, false
 }
 
 func mergeSSEUsagePatch(usage *ClaudeUsage, patch *sseUsagePatch) {

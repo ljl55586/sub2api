@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -53,6 +54,27 @@ func TestGatewayService_StreamingReusesScannerBufferAndStillParsesUsage(t *testi
 	require.NotNil(t, result.usage)
 	require.Equal(t, 3, result.usage.InputTokens)
 	require.Equal(t, 7, result.usage.OutputTokens)
+}
+
+func TestGatewayService_StreamingParsesUsageFromTerminalEvent(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc := newStreamingResponseTestGatewayService()
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{},
+		Body: io.NopCloser(strings.NewReader(
+			"event: message_stop\ndata: {\"type\":\"message_stop\",\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":4}}\n\n",
+		)),
+	}
+
+	result, err := svc.handleStreamingResponse(context.Background(), resp, c, &Account{ID: 1}, time.Now(), "model", "model", false)
+	require.NoError(t, err)
+	require.Equal(t, 12, result.usage.InputTokens)
+	require.Equal(t, 4, result.usage.OutputTokens)
 }
 
 func TestGatewayService_StreamingKeepaliveUsesIdleTimer(t *testing.T) {
