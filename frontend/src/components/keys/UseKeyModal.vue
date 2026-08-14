@@ -202,6 +202,7 @@ import BaseDialog from '@/components/common/BaseDialog.vue'
 import Icon from '@/components/icons/Icon.vue'
 import { useClipboard } from '@/composables/useClipboard'
 import type { GroupPlatform } from '@/types'
+import { buildCodexConfigToml, type CodexAuthMode } from '@/utils/codexConfig'
 
 interface Props {
   show: boolean
@@ -237,7 +238,6 @@ const { copyToClipboard: clipboardCopy } = useClipboard()
 const copiedIndex = ref<number | null>(null)
 const activeTab = ref<string>('unix')
 const activeClientTab = ref<string>('claude')
-type CodexAuthMode = 'legacy' | 'api-key'
 const codexAuthMode = ref<CodexAuthMode>('legacy')
 
 // Reset tabs when platform changes
@@ -714,23 +714,10 @@ function generateOpenAIFiles(baseUrl: string, apiKey: string): FileConfig[] {
   const isWindows = activeTab.value === 'windows'
   const configDir = isWindows ? '%userprofile%\\.codex' : '~/.codex'
 
-  // config.toml content
-  const configContent = `model_provider = "OpenAI"
-model = "gpt-5.5"
-review_model = "gpt-5.5"
-model_reasoning_effort = "xhigh"
-disable_response_storage = true
-network_access = "enabled"
-windows_wsl_setup_acknowledged = true
-
-[model_providers.OpenAI]
-name = "OpenAI"
-base_url = "${baseUrl}"
-wire_api = "responses"
-${generateCodexProviderAuthConfig()}
-
-[features]
-goals = true`
+  const configContent = buildCodexConfigToml({
+    baseUrl,
+    authMode: codexAuthMode.value
+  })
 
   // auth.json content
   const authContent = `{
@@ -748,15 +735,6 @@ goals = true`
       content: authContent
     }
   ]
-}
-
-function generateCodexProviderAuthConfig(): string {
-  if (codexAuthMode.value === 'api-key') {
-    return `requires_openai_auth = false
-http_headers = { "x-openai-actor-authorization" = "local-image-extension" }`
-  }
-
-  return 'requires_openai_auth = true'
 }
 
 function joinConfigPath(dir: string, file: string, windows: boolean): string {
@@ -977,25 +955,11 @@ function generateOpenAIWsFiles(baseUrl: string, apiKey: string): FileConfig[] {
   const isWindows = activeTab.value === 'windows'
   const configDir = isWindows ? '%userprofile%\\.codex' : '~/.codex'
 
-  // config.toml content with WebSocket v2
-  const configContent = `model_provider = "OpenAI"
-model = "gpt-5.5"
-review_model = "gpt-5.5"
-model_reasoning_effort = "xhigh"
-disable_response_storage = true
-network_access = "enabled"
-windows_wsl_setup_acknowledged = true
-
-[model_providers.OpenAI]
-name = "OpenAI"
-base_url = "${baseUrl}"
-wire_api = "responses"
-supports_websockets = true
-${generateCodexProviderAuthConfig()}
-
-[features]
-responses_websockets_v2 = true
-goals = true`
+  const configContent = buildCodexConfigToml({
+    baseUrl,
+    authMode: codexAuthMode.value,
+    websocket: true
+  })
 
   // auth.json content
   const authContent = `{
