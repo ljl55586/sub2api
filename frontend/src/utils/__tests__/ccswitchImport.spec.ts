@@ -13,7 +13,7 @@ function paramsFromDeeplink(deeplink: string): URLSearchParams {
 
 describe('ccswitchImport utils', () => {
   it('defaults OpenAI CC Switch imports to the current Codex model', () => {
-    expect(OPENAI_CC_SWITCH_CODEX_MODEL).toBe('gpt-5.6-sol')
+    expect(OPENAI_CC_SWITCH_CODEX_MODEL).toBe('gpt-5.5')
   })
 
   it('defaults Grok Build imports to the current Grok model', () => {
@@ -40,17 +40,6 @@ describe('ccswitchImport utils', () => {
     expect(params.get('app')).toBe('codex')
     expect(params.get('endpoint')).toBe(baseInput.baseUrl)
     expect(params.get('model')).toBe(OPENAI_CC_SWITCH_CODEX_MODEL)
-    expect(params.get('configFormat')).toBe('toml')
-    const configToml = atob(params.get('config') || '')
-    expect(configToml).toContain('model_provider = "custom"')
-    expect(configToml).toContain('model = "gpt-5.6-sol"')
-    expect(configToml).toContain('review_model = "gpt-5.5"')
-    expect(configToml).toContain('[model_providers.custom]')
-    expect(configToml).toContain('name = "Sub2API"')
-    expect(configToml).toContain(`base_url = "${baseInput.baseUrl}"`)
-    expect(configToml).toContain('requires_openai_auth = false')
-    expect(configToml).toContain('http_headers = { "x-openai-actor-authorization" = "local-image-extension" }')
-    expect(configToml).toContain('[features]\ngoals = true')
     expect(atob(params.get('usageScript') || '')).toBe(baseInput.usageScript)
   })
 

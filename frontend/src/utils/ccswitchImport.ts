@@ -1,7 +1,6 @@
 import type { GroupPlatform } from '@/types'
-import { buildCodexConfigToml, SUB2API_CODEX_MODEL } from '@/utils/codexConfig'
 
-export const OPENAI_CC_SWITCH_CODEX_MODEL = SUB2API_CODEX_MODEL
+export const OPENAI_CC_SWITCH_CODEX_MODEL = 'gpt-5.5'
 export const GROK_CC_SWITCH_MODEL = 'grok-4.5'
 
 export type CcSwitchClientType = 'claude' | 'gemini'
@@ -64,7 +63,6 @@ export function resolveCcSwitchImportConfig(
 
 export function buildCcSwitchImportDeeplink(input: CcSwitchImportDeeplinkInput): string {
   const config = resolveCcSwitchImportConfig(input.platform, input.clientType, input.baseUrl)
-  const isCodex = config.app === 'codex'
   const entries: [string, string][] = [
     ['resource', 'provider'],
     ['app', config.app],
@@ -72,31 +70,15 @@ export function buildCcSwitchImportDeeplink(input: CcSwitchImportDeeplinkInput):
     ['homepage', input.baseUrl],
     ['endpoint', config.endpoint],
     ['apiKey', input.apiKey],
-    ['configFormat', isCodex ? 'toml' : 'json'],
+    ['configFormat', 'json'],
     ['usageEnabled', 'true'],
     ['usageScript', btoa(input.usageScript)],
     ['usageAutoInterval', '30']
   ]
-
-  if (isCodex) {
-    entries.push(['config', encodeBase64Utf8(buildCodexConfigToml({
-      baseUrl: config.endpoint,
-      authMode: 'api-key'
-    }))])
-  }
 
   if (config.model) {
     entries.splice(2, 0, ['model', config.model])
   }
 
   return `ccswitch://v1/import?${new URLSearchParams(entries).toString()}`
-}
-
-function encodeBase64Utf8(value: string): string {
-  const bytes = new TextEncoder().encode(value)
-  let binary = ''
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte)
-  }
-  return btoa(binary)
 }
